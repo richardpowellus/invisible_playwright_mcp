@@ -23,10 +23,9 @@ back behind the model's back. What is left:
             `browser_open` with no arguments brings the same person back;
             `close_all()` at the end of the process.
 
-There is exactly one of these per process, because a process serves exactly
-one piece of work; `server.py` builds it from `INVISIBLE_MCP_SESSION_ID` and every
-tool goes through it. A test builds its own with a factory that launches no
-browser and installs it in the server's place.
+Normally there is one per process, built from `INVISIBLE_MCP_SESSION_ID`.
+In mcpd owner mode `owners.py` holds one ephemeral piece of work per caller.
+A test builds its own with a factory that launches no browser.
 """
 from __future__ import annotations
 
@@ -324,22 +323,7 @@ class Work:
             # start failed, and the one still holding the profile directory
             # is the one nobody has a handle to any more.
             await self._drop(role)
-            session = self._factory(**settings)
-            try:
-                await session.start()
-            except Exception as exc:
-                # ⛔ Said plainly, because the dangerous reading is "that
-                # failed, carry on". Nothing is running there now, and every
-                # later tool will repeat that it is not open rather than
-                # quietly starting a browser without the exit that was asked
-                # for.
-                with swallow("a session that did not start may have nothing to close"):
-                    await session.close()
-                raise RuntimeError(
-                    "the %s browser did NOT start: %s\n"
-                    "Nothing is browsing there, and the tools will keep failing "
-                    "until browser_open succeeds.%s"
-                    % (role, exc, _why_it_did_not_start(settings)))
+            session = await self._start(role, settings)
             self._open[role] = session
             self._launched[role] = settings
             # Opening a browser is working in it: a helper opened mid-task is
@@ -350,6 +334,20 @@ class Work:
                 self.remember()
         return "the %s browser is open. %s" % (role, plan.describe(
             settings, seed_from=seed_from, exit_note=exit_note, warnings=warnings))
+
+    async def _start(self, role: str, settings: dict) -> StealthSession:
+        session = self._factory(**settings)
+        try:
+            await session.start()
+        except Exception as exc:
+            with swallow("a session that did not start may have nothing to close"):
+                await session.close()
+            raise RuntimeError(
+                "the %s browser did NOT start: %s\n"
+                "Nothing is browsing there, and the tools will keep failing "
+                "until browser_open succeeds.%s"
+                % (role, exc, _why_it_did_not_start(settings)))
+        return session
 
     async def close(self, role: str) -> str:
         """Close one browser. Who it was is kept: `browser_open` with no
