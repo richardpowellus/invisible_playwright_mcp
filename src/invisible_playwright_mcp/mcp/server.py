@@ -1,15 +1,10 @@
 """MCP server exposing two stealth browsers, `main` and `support`.
 
-⛔ THERE IS NO SESSION CONCEPT HERE, AND THAT IS DELIBERATE - not an omission,
-and not the same claim this file made a day earlier when a session held up to
-eight named browsers. This process serves exactly ONE piece of work: the two
-fixed browsers above, and nothing a tool can enumerate, name or reach a SECOND
-one of. `INVISIBLE_MCP_SESSION_ID`, read once from the environment near the top of
-this file, decides which saved file that one piece of work persists to - set
-by whoever spawns this process, never by a tool argument, never published in
-a schema, never something a model can read or pass. A model working through
-this server cannot ask "what else is there" because there is no "else" to ask
-about.
+Normally this process serves one piece of work, persisted under
+`INVISIBLE_MCP_SESSION_ID`. With STEALTHFOX_OWNER_MODE=mcpd, trusted transport
+metadata selects a separate ephemeral main/support pair per caller. No tool
+argument can select another owner; restricted fill capabilities can delegate
+access to one generation of main.
 
 Tool names mirror the Microsoft Playwright MCP so prompts stay portable, with
 one deliberate departure: there are no tab tools. A browser here drives ONE
@@ -47,11 +42,15 @@ from __future__ import annotations
 import asyncio
 import atexit
 import os
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
-from typing import Annotated, Literal, Optional
+from contextvars import ContextVar
+from typing import Annotated, Any, Literal, Optional
 
+import anyio
 from mcp.server.fastmcp import FastMCP, Image
-from mcp.types import ToolAnnotations
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ContentBlock, ToolAnnotations
 from pydantic import Field
 
 from . import __version__, actions, plan, store
@@ -59,10 +58,21 @@ from .. import env as environment
 from ..engine import Engine
 from ..quiet import swallow
 from .work import DEFAULT_BROWSER_ID, Work
+from .owners import CapacityExhausted, IDENTITY_ERROR, Owners
+
+#: Announced in initialize only in owner mode. A credential filler requires it
+#: before typing: tool output can carry caller-chosen text (a profile path, a
+#: page title), so it cannot prove the server isolates callers; this can.
+OWNER_CAPABILITY = "stealthfox/owner-isolation"
+from .owner_transport import (
+    SessionEnded, notifications, owner_stdio, redact_sdk_logs, shutdown_on_sigterm,
+)
 # Reached by tests as `server.<name>`; the tools themselves no longer
 # read them, because the piece of work answers with them.
 from .work import MAX_BROWSERS_PER_SESSION, SUPPORT_BROWSER_ID  # noqa: F401
 
+#: In non-owner mode, where this process's piece of work comes from.
+#: The following persistence settings are not used by mcpd owners.
 #: ⛔ WHERE THIS PROCESS'S OWN PIECE OF WORK COMES FROM, AND THE ONLY PLACE
 #: THAT KNOWS IT EXISTS. Read from the environment ONCE, exactly like
 #: `STEALTHFOX_SEED` or `STEALTHFOX_PROXY` in `plan.py` - never a tool
@@ -92,6 +102,48 @@ _SESSION_ID = environment.read(environment.SESSION_ID) or store.DEFAULT_SESSION_
 #: answers with its progress instead of launching while it is not there.
 engine = Engine(binary_path=plan.engine_here().get("binary_path"))
 work = Work(_SESSION_ID, engine=engine)
+owners = Owners.from_env(engine=engine)
+_selected_work: ContextVar[Work] = ContextVar("browser_owner_work")
+
+
+def _work() -> Work:
+    if owners is None:
+        return work
+    try:
+        return _selected_work.get()
+    except LookupError:
+        raise ValueError(IDENTITY_ERROR) from None
+
+
+class BrowserMCP(FastMCP):
+    async def call_tool(self, name: str, arguments: dict[str, Any]
+                        ) -> Sequence[ContentBlock] | dict[str, Any]:
+        if owners is None:
+            return await super().call_tool(name, arguments)
+        try:
+            meta = self.get_context().request_context.meta
+        except ValueError:
+            raise ValueError(IDENTITY_ERROR) from None
+        async with owners.target(meta.model_dump() if meta else {}, name, arguments) as selected:
+            token = _selected_work.set(selected)
+            try:
+                return await super().call_tool(name, arguments)
+            except ToolError as exc:
+                if isinstance(exc.__cause__, CapacityExhausted):
+                    raise exc.__cause__ from None
+                raise
+            finally:
+                _selected_work.reset(token)
+
+    async def run_stdio_async(self) -> None:
+        if owners is None:
+            return await super().run_stdio_async()
+        redact_sdk_logs()
+        async with shutdown_on_sigterm(), owner_stdio() as (read, write):
+            async with notifications(read, self._mcp_server) as filtered:
+                await self._mcp_server.run(
+                    filtered, write, self._mcp_server.create_initialization_options(
+                        experimental_capabilities={OWNER_CAPABILITY: {"version": 1}}))
 
 
 #: Set by main(). Over stdio the SDK enters the lifespan once per process, so
@@ -118,14 +170,22 @@ async def _lifespan(_server):
     Measured on Linux, 2026-09-06: a client that closed stdin with a page open
     waited 180 s for the process and gave up; with no page it took 0.2 s.
     """
+    registry = owners
+    idle = asyncio.create_task(registry.idle_loop()) if registry is not None else None
     try:
         yield {}
     finally:
         if _close_on_lifespan_exit:
+            engine.abandon()
+        if registry is not None and idle is not None:
+            with anyio.CancelScope(shield=True):
+                registry.stopping.set()
+                await idle
+                await registry.close_all()
+        if _close_on_lifespan_exit:
             # The download too: a client that closes the server in its first
             # minute kills a download in flight, and abandoning it here is
             # what lets the core's temporary directory unwind.
-            engine.abandon()
             await work.close_all()
 
 
@@ -156,7 +216,9 @@ BEFORE ANYTHING ELSE: no other tool opens a browser, and every tool that finds
 its browser not open answers with a sentence saying so instead of working.
 With no arguments browser_open brings back the person this session already
 was; pass a seed, a proxy or a profile only to be somebody else. If a tool
-says the browser is gone, call browser_open again and carry on.
+says the browser is gone, call browser_open again and carry on."""
+
+PAGE_INSTRUCTIONS = """
 
 Drive the page the way a person would. Everything here goes
 through the real pointer and the real keyboard.
@@ -222,9 +284,29 @@ browser_close as soon as the task no longer needs it, before you give your
 answer: it costs a real browser, it is not saved, and it goes away when this
 server does. There is no third browser and no way to get one from here -
 `main` and `support` are the whole of what this gives you."""
+INSTRUCTIONS += PAGE_INSTRUCTIONS
 
 
-mcp = FastMCP("stealth", instructions=INSTRUCTIONS, lifespan=_lifespan)
+OWNER_INSTRUCTIONS = """This is a trusted mcpd owner-isolated server. Only your own
+main/support browsers are visible. Profiles are ephemeral: profile arguments
+and file: navigation are refused, and reopening does not restore cookies.
+Open a browser with browser_open before using it; no other tool opens one.
+browser_open and browser_status disclose a fill handle for your main browser;
+pass it only to a trusted credential filler. Closing/reopening revokes it.
+The process-wide browser cap includes other sessions; a refusal evicts nobody.
+
+"""
+mcp = BrowserMCP("stealth", instructions=(
+    OWNER_INSTRUCTIONS + PAGE_INSTRUCTIONS if owners is not None else INSTRUCTIONS),
+    lifespan=_lifespan)
+
+
+async def _session_ended(notification: SessionEnded) -> None:
+    if owners is not None:
+        await owners.session_ended(notification.params.sessionId)
+
+
+mcp._mcp_server.notification_handlers[SessionEnded] = _session_ended
 
 # ⛔ WHO THE CLIENT IS TALKING TO, AND WHY THIS REACHES PAST FastMCP.
 # `initialize` carries a serverInfo with a name and a version, and a client
@@ -347,7 +429,7 @@ async def browser_open(browser: Browser = None, seed: int | None = None,
     # and left in this comment where no model would ever read them. A repeated
     # sentence is not free here; it is spent out of the same 1024 characters
     # as the rules that only this tool can state.
-    return await work.open(browser or DEFAULT_BROWSER_ID, seed=seed,
+    return await _work().open(browser or DEFAULT_BROWSER_ID, seed=seed,
                            proxy=proxy, profile=profile)
 
 
@@ -360,7 +442,7 @@ async def browser_close(browser: Browser = None) -> str:
     Who it was is kept: browser_open with no arguments brings the same person
     back. To be somebody else, pass a seed, a proxy or a profile.
     """
-    return await work.close(browser or DEFAULT_BROWSER_ID)
+    return await _work().close(browser or DEFAULT_BROWSER_ID)
 
 
 @mcp.tool(annotations=_says("List the browsers", read_only=True, open_world=False))
@@ -386,7 +468,7 @@ async def browser_list() -> str:
     # which is two sources for one fact. Models read JSON from these tools
     # without trouble; `note` carries the sentence that used to be the whole
     # answer, because "there is nothing here yet" is worth saying in words.
-    return actions.json_capped(await work.listing())
+    return actions.json_capped(await _work().listing())
 
 
 # --- who is browsing ---------------------------------------------------------
@@ -403,7 +485,7 @@ async def browser_status(browser: Browser = None) -> str:
     It starts nothing: a browser that is not open, or gone, is answered with
     the sentence that says which.
     """
-    return await work.status(browser or DEFAULT_BROWSER_ID)
+    return await _work().status(browser or DEFAULT_BROWSER_ID)
 
 
 # ⛔ THE FOUR TAB TOOLS STOOD HERE AND ARE GONE (2026-09-11, owner's decision:
@@ -440,7 +522,7 @@ async def browser_navigate(url: str, wait_until: str = "domcontentloaded",
     markup is parsed. Use "load" when the page needs its images and stylesheets,
     or "networkidle" for a single-page app that fetches its content after
     load."""
-    return await work.acting(actions.navigate, url, wait_until=wait_until,
+    return await _work().acting(actions.navigate, url, wait_until=wait_until,
                              role=browser, exclusive=True)
 
 
@@ -471,7 +553,7 @@ async def browser_read_text(selector: str = "body",
     # written twice gets a GATE, not a deletion: `test_the_cap_in_the_prose_is
     # _the_cap_the_tool_uses` ties this digit to the constant, so the copy
     # cannot drift even though it stays.
-    return await work.acting(actions.read_text, selector, max_chars, role=browser)
+    return await _work().acting(actions.read_text, selector, max_chars, role=browser)
 
 
 @mcp.tool(annotations=_says("Snapshot the page", read_only=True))
@@ -503,7 +585,7 @@ async def browser_snapshot(max_chars: int = 0, browser: Browser = None) -> str:
     # once and updated once, and the copy that stays wrong is the one a model
     # reads. It also spends the 1024 characters this description is cut at on
     # evidence for a reader who is not there.
-    return await work.acting(actions.snapshot, max_chars, role=browser)
+    return await _work().acting(actions.snapshot, max_chars, role=browser)
 
 
 @mcp.tool(annotations=_says("Read the page HTML", read_only=True))
@@ -523,13 +605,13 @@ async def browser_read_html(mode: str = "form", browser: Browser = None) -> str:
     middle leaves tags that mean nothing, so it is not cut - but the answer can
     be long. Reach for browser_snapshot when you only need something to click.
     """
-    return await work.acting(actions.read_html, mode, role=browser)
+    return await _work().acting(actions.read_html, mode, role=browser)
 
 
 @mcp.tool(annotations=_says("Take a screenshot", read_only=True))
 async def browser_take_screenshot(browser: Browser = None) -> Image:
     """One screenshot of this browser's page, on demand."""
-    png = await work.acting(actions.screenshot_png, role=browser)
+    png = await _work().acting(actions.screenshot_png, role=browser)
     return Image(data=png, format="png")
 
 
@@ -549,7 +631,7 @@ async def browser_watch(browser: Browser = None) -> Image:
     # is not a schema pydantic will build - measured, five test modules
     # refuse to import. A refusal reaches a client as an error result
     # carrying the reason, which every client already handles.
-    jpeg = await work.acting(lambda session: session.watch_frame(), role=browser)
+    jpeg = await _work().acting(lambda session: session.watch_frame(), role=browser)
     return Image(data=jpeg, format="jpeg")
 
 
@@ -562,7 +644,7 @@ async def browser_click(selector: str, browser: Browser = None) -> str:
     Scrolls it into view and waits for it to be clickable. When no selector can
     describe the target, use browser_click_at with coordinates from
     browser_snapshot."""
-    return await work.acting(actions.click, selector, role=browser, exclusive=True)
+    return await _work().acting(actions.click, selector, role=browser, exclusive=True)
 
 
 @mcp.tool(annotations=_says("Click at a point", destructive=True))
@@ -585,7 +667,7 @@ async def browser_click_at(x: float, y: float, hold_seconds: float = 0.0,
     # happened, on the one tool that exists for sliders and press-and-hold
     # challenges. The floor in pyproject.toml is set accordingly. Said here and
     # not in the description above, which the API cuts at 1024 characters.
-    png = await work.acting(actions.click_at, x, y, hold_seconds, role=browser, exclusive=True)
+    png = await _work().acting(actions.click_at, x, y, hold_seconds, role=browser, exclusive=True)
     return Image(data=png, format="png")
 
 
@@ -608,7 +690,7 @@ async def browser_type(selector: str, text: str, browser: Browser = None,
     With it the value is set in one step, with trusted input and change events
     and no keystrokes. expect_input_type (e.g. "password", with expect_origin)
     also requires the field to be that type at the moment of writing."""
-    return await work.acting(actions.type_text, selector, text, expect_origin,
+    return await _work().acting(actions.type_text, selector, text, expect_origin,
                              expect_input_type, role=browser, exclusive=True)
 
 
@@ -622,14 +704,14 @@ async def browser_select_option(selector: str, value: str,
     plus arrows cannot tell you which row it landed on, and setting the value
     through browser_evaluate changes it without the page seeing a real
     interaction."""
-    return await work.acting(actions.select_option, selector, value, role=browser, exclusive=True)
+    return await _work().acting(actions.select_option, selector, value, role=browser, exclusive=True)
 
 
 @mcp.tool(annotations=_says("Press a key", destructive=True))
 async def browser_press_key(key: str, browser: Browser = None) -> str:
     """Press a key on whatever has focus: "Enter", "Tab", "Escape",
     "ArrowDown", "Control+a", or a single character."""
-    return await work.acting(actions.press_key, key, role=browser, exclusive=True)
+    return await _work().acting(actions.press_key, key, role=browser, exclusive=True)
 
 
 @mcp.tool(annotations=_says("Read the page with JavaScript", read_only=True))
@@ -650,12 +732,14 @@ async def browser_evaluate(expression: str, browser: Browser = None) -> str:
     The refusal catches the obvious spellings, not every possible one. A script
     that slips past it is still the wrong way to do the thing: report it in your
     answer rather than using it."""
-    return await work.acting(actions.evaluate, expression, role=browser)
+    return await _work().acting(actions.evaluate, expression, role=browser)
 
 
 def main() -> None:
     global _close_on_lifespan_exit
     transport = os.environ.get("STEALTHFOX_MCP_TRANSPORT", "stdio").strip().lower()
+    if owners is not None and transport != "stdio":
+        raise ValueError("mcpd owner mode requires trusted stdio, not direct HTTP clients.")
     # ⛔ BEFORE THE PROTOCOL, NOT INSIDE THE LIFESPAN. A client starts its
     # servers when the session opens, minutes before the first page, and those
     # minutes are the download's for free; the lifespan runs per client over

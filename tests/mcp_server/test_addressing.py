@@ -35,18 +35,23 @@ def _tools():
 
 
 def _reaches(node):
-    """Every `work.<attr>` a tool body touches, with the call if it is one."""
+    """Every selected-work attribute, including an invalid global-work bypass."""
     for inner in ast.walk(node):
-        if (isinstance(inner, ast.Attribute) and isinstance(inner.value, ast.Name)
-                and inner.value.id == "work"):
+        if (isinstance(inner, ast.Attribute)
+                and (_is_selected_work(inner.value)
+                     or isinstance(inner.value, ast.Name) and inner.value.id == "work")):
             yield inner.attr, inner
+
+
+def _is_selected_work(node):
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "_work" and not node.args and not node.keywords)
 
 
 def _acting_calls(node):
     for inner in ast.walk(node):
         if (isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute)
-                and isinstance(inner.func.value, ast.Name)
-                and inner.func.value.id == "work" and inner.func.attr == "acting"):
+                and _is_selected_work(inner.func.value) and inner.func.attr == "acting"):
             yield inner
 
 
@@ -71,6 +76,9 @@ def test_every_tool_that_drives_a_page_goes_through_the_funnel_and_names_its_bro
 
 def test_no_tool_reaches_past_the_funnel():
     for tool in _tools():
+        assert not any(isinstance(node, ast.Name) and node.id == "work"
+                       for node in ast.walk(tool)), (
+            "%s bypasses owner selection with the global work" % tool.name)
         for attr, _ in _reaches(tool):
             assert attr in ALLOWED, (
                 "%s reaches `work.%s`, which is not one of the five doors" % (tool.name, attr))
@@ -85,7 +93,7 @@ def test_the_tools_that_act_on_the_piece_of_work_name_a_browser_too():
             continue
         calls = [c for c in ast.walk(tool)
                  if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
-                 and isinstance(c.func.value, ast.Name) and c.func.value.id == "work"]
+                 and _is_selected_work(c.func.value)]
         assert len(calls) == 1, tool.name
         first = calls[0].args[0]
         assert isinstance(first, ast.BoolOp) and any(

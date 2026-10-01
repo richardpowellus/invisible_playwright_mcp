@@ -109,6 +109,7 @@ def test_a_tool_that_can_start_a_browser_is_not_marked_read_only():
     """
     import ast
     import inspect
+    from test_addressing import _is_selected_work
 
     src = inspect.getsource(server)
     tree = ast.parse(src)
@@ -118,8 +119,7 @@ def test_a_tool_that_can_start_a_browser_is_not_marked_read_only():
             for inner in ast.walk(node):
                 if (isinstance(inner, ast.Call)
                         and isinstance(inner.func, ast.Attribute)
-                        and isinstance(inner.func.value, ast.Name)
-                        and inner.func.value.id == "work"
+                        and _is_selected_work(inner.func.value)
                         and inner.func.attr == "open"):
                     starts.add(node.name)
     assert starts == {"browser_open"}, (

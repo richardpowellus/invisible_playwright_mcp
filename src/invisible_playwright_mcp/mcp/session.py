@@ -258,8 +258,6 @@ class StealthSession:
                 await self._context.close()
             self._context = None
         if self._ipw is not None:
-            try:
-                await self._ipw.__aexit__(None, None, None)
-            finally:
-                self._ipw = None
-                self._browser = None
+            await self._ipw.__aexit__(None, None, None)
+            self._ipw = None
+            self._browser = None

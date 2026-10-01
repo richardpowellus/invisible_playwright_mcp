@@ -154,11 +154,86 @@ between what the browser says it is and where it appears to be.
 | `STEALTHFOX_MCP_TRANSPORT` | `http` to serve over streamable HTTP instead of stdio. Default is stdio, which is what MCP clients expect. What else changes when you flip it, including the one thing that changes silently: [local or remote](local-vs-remote-mcp-server.md). |
 | `STEALTHFOX_MCP_HOST` | Bind address for the HTTP transport. Default `127.0.0.1`. |
 | `STEALTHFOX_MCP_PORT` | Port for the HTTP transport. Default `8766`. It used to be `8765`, the invisible_playwright_mcp interface's own default, so running both meant a bind error with nothing to explain it. |
+| `STEALTHFOX_OWNER_MODE` | `mcpd` enables isolated callers on trusted mcpd stdio. Unset preserves single-owner behavior. Other values and direct HTTP in owner mode are refused. |
+| `STEALTHFOX_MAX_BROWSERS` | Owner mode only: positive integer, default `2`, across all callers, including launching and closing browsers. |
+| `STEALTHFOX_OWNER_IDLE_SECONDS` | Owner mode only: positive finite seconds, default `900`, without tool activity before closing an owner's browsers. |
 | `INVISIBLE_MCP_HOME` | Where saved sessions are kept. Defaults to `%APPDATA%/invisible-playwright-mcp` on Windows, `~/Library/Application Support/invisible-playwright-mcp` on macOS and `$XDG_DATA_HOME/invisible-playwright-mcp` on Linux. A directory left by the previous name is moved onto this one the first time the command runs, once, and the move is printed. Set it to put them on another disk. |
 
 Anything a tool call says wins over these. `browser_open` can pick another
 seed, another exit or another profile for one browser; the variables are what
 a browser gets when nobody says anything.
+
+### Shared mcpd owner mode
+
+This mode requires MCP SDK 1.30 or newer. It is for a **trusted stdio child of
+mcpd**, not a directly exposed multi-user endpoint. mcpd must overwrite the whole
+`params._meta["mcpd/identity"]` object on every `tools/call`, and must drop all
+client-originated methods starting with `notifications/mcpd/` or `mcpd/`.
+The child trusts that boundary; a party that can write its stdin directly is
+the transport, not an authenticated end user.
+
+The SDK request context supplies `_meta["mcpd/identity"]["sessionId"]`.
+Missing, empty or malformed identities are refused, with no default owner.
+Every tool, including list, status and watch, selects only that owner's
+`main`/`support`. Each browser is a separate Firefox launch. Owner calls are
+serialized, while different owners may run concurrently.
+
+Profiles are newly created private directories (mode `0700`) and are removed
+after close. Saved sessions and `STEALTHFOX_PROFILE_DIR` are not read or written
+in this mode. Supplying `profile` (even `""`) is refused; leave it out.
+`browser_navigate` refuses `file:` URLs. Reopening creates a fresh profile:
+the persistence descriptions elsewhere on this page apply to non-owner mode.
+
+The global capacity includes reservations before launch and browsers still
+closing. Slots are released only after successful close and profile removal.
+A full process returns exactly:
+
+```text
+Browser capacity exhausted (N of N browsers in use across all sessions). Close one of yours with browser_close, or retry later. No browser was opened.
+```
+
+`N` is the configured limit. No other caller is evicted. A failed close retains
+its slot and is reported rather than silently freeing capacity.
+
+mcpd sends this notification when a caller ends:
+
+```json
+{"jsonrpc":"2.0","method":"notifications/mcpd/session_ended","params":{"sessionId":"the-ended-session","reason":"delete"}}
+```
+
+It closes only that owner; unknown sessions are ignored. The notification
+adapter uses the SDK's decoded stdio stream and registered notification
+handler because the SDK's standard client-notification union otherwise drops
+extension methods. The idle backstop checks at most every 30 seconds; active
+calls are not interrupted. Successful delegated calls also refresh the target's
+activity. Stdio EOF and, on Unix, SIGTERM close every owner before the event
+loop exits. Forced termination (such as SIGKILL) cannot run cleanup.
+
+Idle cleanup also removes empty owner records once no calls hold or wait for
+their lock; a later call from the same session creates a fresh record. Ended
+session tombstones retain only the latest 4096 identities, oldest evicted.
+mcpd does not route calls for ended sessions, so this cache is defence in depth.
+
+For credential filling, the owner's `browser_open` and `browser_status` return
+`fill handle: bh_...` for **main only** (32 random bytes, 43 URL-safe base64
+characters after the prefix). Pass this secret as `browser_handle` to the
+trusted credential filler. It sends the handle on each tool call in
+`params._meta["stealthfox/browser_handle"]`, together with its own mcpd identity.
+This selects the target by capability, not by the filler's owner. It permits
+only `browser_status`, `browser_evaluate`, `browser_snapshot`,
+`browser_read_html`, `browser_read_text`, `browser_type`, and
+`browser_press_key`. An explicit `browser="support"` is refused.
+
+Handle-carrying calls validate the filler's identity without allocating an
+owner record for that transport. With a valid handle, `browser_status` returns
+the exact line `fill handle: <that handle>` as an attestation to the filler.
+In non-owner mode `browser_status` never returns a `fill handle:` line, even
+if a call supplies handle metadata.
+
+Handles are compared in constant time after a hashed lookup, never logged,
+and never echoed in errors. Close, reopen, expiry and session end revoke them.
+There is no handle for `support`. Without this environment mode, metadata
+does not change routing and no fill handles are issued.
 
 ## Tools
 
@@ -207,7 +282,7 @@ tables because the answer is the same for all of them.** Leave it out and you
 get `main`, which is what a client that never mentions it has always got and
 always will.
 
-⛔ **This server has no idea any other piece of work exists.** It serves
+**In default, non-owner mode**, this server serves
 exactly one - the two browsers below, and nothing else - so there is nothing
 here to list, name, or reach a second one of: no tool takes an id for one, and
 none can ask about one that is not its own. Which piece of work this is comes
@@ -238,8 +313,9 @@ tools simply follow whichever page is live.
 ⛔ Until 0.39.0 a session could hold up to eight browsers under any names, and
 `browser_focus` chose which one unaddressed commands meant. Until 0.41.0 every
 tool also took a `session_id`, and one shared server juggled several sessions
-behind it. All three are gone: a session is `main` plus `support`, and a
-server serves exactly one session for its whole life.
+behind it. All three are gone: a session is `main` plus `support`. A default server serves
+one session for its whole life; trusted mcpd owner mode instead selects the
+session from transport metadata, never from a tool argument.
 
 ### The two browsers
 

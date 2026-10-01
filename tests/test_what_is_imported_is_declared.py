@@ -214,6 +214,6 @@ def test_a_missing_declaration_is_what_it_catches():
     the gate has seen its own failure at least once."""
     healthy = PYPROJECT.read_text(encoding="utf-8")
     assert "mcp>=" in healthy, "the requirement moved; this mutation is stale"
-    broken = tomllib.loads(healthy.replace('"mcp>=1.8,<2",\n', ""))["project"]
+    broken = tomllib.loads(healthy.replace('"mcp>=1.30,<2",\n', ""))["project"]
     assert not any(r.startswith("mcp") for r in broken["dependencies"]), (
         "the mutation did not apply, so a survivor here would say nothing")

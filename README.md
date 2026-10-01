@@ -125,6 +125,24 @@ Passing `--openrouter-key` puts the key in your shell history, and on Linux in
 the process list. `OPENROUTER_API_KEY` in the environment or in a `.env` avoids
 both.
 
+### Shared mcpd process: isolated callers
+
+Set `STEALTHFOX_OWNER_MODE=mcpd` only for a trusted mcpd stdio child. Each
+transport session gets its own `main` and `support`, with separate Firefox
+launches and private ephemeral profiles. Missing owner metadata is refused;
+without this variable the existing single-owner behavior is unchanged.
+
+`STEALTHFOX_MAX_BROWSERS` defaults to **2 across all callers**, including
+launches and closes in progress. A full process refuses opens without evicting
+anyone. `STEALTHFOX_OWNER_IDLE_SECONDS` defaults to **900**; idle browsers,
+ended sessions and process shutdown close their browsers and remove profiles.
+Persistent `profile` arguments and `file:` navigation are refused in this mode.
+
+The owner's `browser_open` and `browser_status` disclose a generation-bound
+**fill handle** for `main`, for delegation to a trusted credential filler.
+Treat it as a secret; closing/reopening revokes it. See
+[owner-mode configuration and the transport trust boundary](docs/mcp-server.md#shared-mcpd-owner-mode).
+
 ## The wiki: AI browser-agent guides
 
 The reading room around the agent lives in the

@@ -136,3 +136,21 @@ async def test_usable_means_started_and_not_closed_here():
 
     await s.close()
     assert s.is_usable() is False
+
+
+async def test_failed_engine_close_retains_the_engine_for_retry():
+    class Engine:
+        attempts = 0
+
+        async def __aexit__(self, *args):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("close failed")
+
+    session = StealthSession()
+    engine = session._ipw = Engine()
+    with pytest.raises(RuntimeError, match="close failed"):
+        await session.close()
+    assert session._ipw is engine
+    await session.close()
+    assert engine.attempts == 2 and session._ipw is None
