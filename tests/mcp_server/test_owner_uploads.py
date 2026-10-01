@@ -27,6 +27,7 @@ class _Uploading(_Recording):
 
 @pytest.fixture
 async def owners(monkeypatch, tmp_path):
+    monkeypatch.delenv(actions.DOWNLOAD_DIRS_ENV, raising=False)
     staging, second, profiles = (
         tmp_path / "staging", tmp_path / "staging-other", tmp_path / "profiles")
     staging.mkdir()

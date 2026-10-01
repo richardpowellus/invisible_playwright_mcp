@@ -138,7 +138,7 @@ async def test_usable_means_started_and_not_closed_here():
     assert s.is_usable() is False
 
 
-async def test_failed_engine_close_retains_the_engine_for_retry():
+async def test_failed_engine_close_retains_the_engine_for_retry(tmp_path):
     class Engine:
         attempts = 0
 
@@ -148,9 +148,14 @@ async def test_failed_engine_close_retains_the_engine_for_retry():
                 raise RuntimeError("close failed")
 
     session = StealthSession()
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    (incoming / "statement.pdf").write_bytes(b"private")
+    session.downloads = str(incoming)
     engine = session._ipw = Engine()
     with pytest.raises(RuntimeError, match="close failed"):
         await session.close()
     assert session._ipw is engine
+    assert not incoming.exists() and session.downloads is None
     await session.close()
     assert engine.attempts == 2 and session._ipw is None

@@ -158,6 +158,7 @@ between what the browser says it is and where it appears to be.
 | `STEALTHFOX_MAX_BROWSERS` | Owner mode only: positive integer, default `2`, across all callers, including launching and closing browsers. |
 | `STEALTHFOX_OWNER_IDLE_SECONDS` | Owner mode only: positive finite seconds, default `900`, without tool activity before closing an owner's browsers. |
 | `INVISIBLE_MCP_UPLOAD_DIRS` | Upload staging roots: absolute existing canonical directories, separated by `:` (`;` on Windows). Unset disables uploads. In owner mode the first root holds private owner directories; callers cannot upload directly from shared roots. |
+| `INVISIBLE_MCP_DOWNLOAD_DIRS` | Download roots with the same path rules. Unset disables `browser_download`. In owner mode the first root holds private owner download directories; shared roots are not permitted destinations. |
 | `INVISIBLE_MCP_HOME` | Where saved sessions are kept. Defaults to `%APPDATA%/invisible-playwright-mcp` on Windows, `~/Library/Application Support/invisible-playwright-mcp` on macOS and `$XDG_DATA_HOME/invisible-playwright-mcp` on Linux. A directory left by the previous name is moved onto this one the first time the command runs, once, and the move is printed. Set it to put them on another disk. |
 
 Anything a tool call says wins over these. `browser_open` can pick another
@@ -217,7 +218,7 @@ and cause an unsuccessful exit, not a silently successful close.
 Forced termination (such as SIGKILL) cannot run cleanup. Before accepting calls,
 owner mode removes stale `stealthfox-owner-*` directories directly under
 `tempfile.gettempdir()` and `owner-*` directories directly under the **first**
-upload root. Only directories owned by the current Unix UID are eligible;
+upload and download roots. Only directories owned by the current Unix UID are eligible;
 symlinks are not followed, other roots are untouched, and the removal count is
 logged. Cleanup errors refuse startup. Platforms without Unix UID checks skip
 this sweep with a warning. These roots must be exclusive to this owner-mode
@@ -250,6 +251,30 @@ Use a separate staging directory, never the whole temporary directory. With no
 upload roots configured, browsing still works but uploads are off. These
 owner-only restrictions do not change non-owner mode's shared-root behavior.
 
+**Owner-scoped downloads.** On the first browser launch, the owner gets a
+`0700` directory named `owner-<32 random URL-safe characters>` under the first
+`INVISIBLE_MCP_DOWNLOAD_DIRS` root. Open/status report `download dir: <path>`
+before the final fill-handle line; handle-delegated status never reports it,
+and `browser_download` is not a fill-handle tool.
+
+Each browser has its own incoming-download subdirectory inside that owner
+directory, configured through Firefox's download preferences. The tool polls
+and reads only that owner's incoming files and saves only inside that owner's
+download directory. `save_to` can select a non-hidden subdirectory there, not
+another owner or a shared root. Directory descriptors and file descriptors
+are checked against the owner boundary after page awaits as well as before the
+click; directory links are refused.
+
+Closing/reopening a browser removes its temporary incoming files, not the
+owner's saved files. Session end, idle removal, and process exit remove the
+owner's entire download directory, including the exit fallback if browser
+close fails. Startup sweeps stale owner download directories as described
+above. Any configured download root containing the profile temporary
+directory is refused. With no download roots configured, the tool is off;
+spontaneous browser downloads remain inside that browser's private ephemeral
+profile and are removed with it. Non-owner mode retains its shared configured
+destinations and per-browser temporary incoming directories.
+
 For credential filling, the owner's `browser_open` and `browser_status` return
 `fill handle: bh_...` for **main only** (32 random bytes, 43 URL-safe base64
 characters after the prefix). Pass this secret as `browser_handle` to the
@@ -277,7 +302,7 @@ does not change routing and no fill handles are issued.
 `browser_navigate`, `browser_read_text`, `browser_snapshot`, `browser_read_html`,
 `browser_take_screenshot`, `browser_watch`, `browser_click`, `browser_click_at`,
 `browser_type`, `browser_select_option`, `browser_press_key`,
-`browser_upload_files`, `browser_evaluate`.
+`browser_upload_files`, `browser_download`, `browser_evaluate`.
 
 Tool names mirror the Microsoft Playwright MCP, so prompts written for it work
 here too, with one deliberate departure: **there are no tab tools.** Three
@@ -447,6 +472,7 @@ so.
 | `browser_type` | `selector`, `text` | Fills a field, replacing whatever it holds. It sets the value rather than typing key by key, so per-keystroke handlers such as an autocomplete do not fire; for those, click the field and use `browser_press_key`. |
 | `browser_select_option` | `selector`, `value` | Chooses an option in a `<select>`, by its visible label or by its value. |
 | `browser_upload_files` | `selector`, `paths` | Attaches local files to a file input the way a person picks them: the input, or the button or label that opens its chooser, is clicked with the real pointer and the chooser is answered with `paths`. A hidden input is given the files directly, as its chooser would. Off unless `INVISIBLE_MCP_UPLOAD_DIRS` is configured. Files must be regular, non-hidden and at most 50 MB; owner mode permits only that owner's reported `upload dir`, while non-owner mode permits the configured roots. |
+| `browser_download` | `selector`, or `x` and `y`; `timeout_seconds` (default 30); `save_to` | Clicks what makes the page hand over a file and saves that file: the browser's download or the document the click shows, read from the browser's response. A tab opened only to show the file is closed. Off unless `INVISIBLE_MCP_DOWNLOAD_DIRS` is configured. Owner mode saves only under the caller's reported `download dir`; non-owner mode permits the configured roots. `save_to` defaults to the first permitted directory, is created if missing, and nothing is overwritten. Answers JSON with `saved`, `filename`, `size`, `mime`, `sha256` and `url`. Each browser's incoming downloads are private and removed when it closes, rather than saved in `~/Downloads`. |
 | `browser_press_key` | `key` | Presses a key on whatever has focus: `Enter`, `Tab`, `Escape`, `ArrowDown`, `Control+a`, or a single character. |
 | `browser_evaluate` | `expression` | Runs JavaScript to **read** from the page and returns the result as JSON: a computed style, a value held in a framework's state, the length of a list. |
 

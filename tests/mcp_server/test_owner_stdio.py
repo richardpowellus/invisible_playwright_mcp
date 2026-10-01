@@ -45,12 +45,14 @@ logging.basicConfig(level=logging.DEBUG)
 logging.getLogger().setLevel(logging.DEBUG)
 server.main()
 """
-    profiles, uploads = tmp_path / "profiles", tmp_path / "uploads"
+    profiles, uploads, downloads = (tmp_path / "profiles", tmp_path / "uploads",
+                                   tmp_path / "downloads")
     profiles.mkdir()
     uploads.mkdir()
+    downloads.mkdir()
     stale_profile, stale_upload = profiles / "stealthfox-owner-stale", uploads / "owner-stale"
     if hasattr(os, "getuid"):
-        for directory in (stale_profile, stale_upload):
+        for directory in (stale_profile, stale_upload, downloads / "owner-stale"):
             directory.mkdir()
             (directory / "private-data").write_text("left by an interrupted worker")
     env = subprocess_env({
@@ -59,6 +61,7 @@ server.main()
         "STEALTHFOX_OWNER_IDLE_SECONDS": "900",
         "TMPDIR": str(profiles),
         "INVISIBLE_MCP_UPLOAD_DIRS": str(uploads),
+        "INVISIBLE_MCP_DOWNLOAD_DIRS": str(downloads),
         "TEST_CLOSE_RESULT": close_result,
     })
     env["PYTHONPATH"] += os.pathsep + str(Path(__file__).parent)
@@ -111,6 +114,7 @@ server.main()
             assert init["capabilities"]["experimental"]["stealthfox/owner-isolation"] == {"version": 1}
             if hasattr(os, "getuid"):
                 assert not stale_profile.exists() and not stale_upload.exists()
+                assert not list(downloads.iterdir())
             await send("notifications/initialized", notification=True)
             missing = await call(None, "browser_open", meta={})
             assert missing["isError"]
@@ -121,6 +125,8 @@ server.main()
             assert len(profiles_a) == 1
             uploads_a = set(uploads.glob("owner-*"))
             assert len(uploads_a) == 1
+            downloads_a = set(downloads.glob("owner-*"))
+            assert len(downloads_a) == 1
             assert json.loads(text(await call("B", "browser_list")))["browsers"] == []
             assert (await call("B", "browser_status"))["isError"]
             delegated = await call("B", "browser_status", meta={**identity("B"), HANDLE_KEY: handle})
@@ -141,18 +147,21 @@ server.main()
             await send("notifications/mcpd/session_ended",
                        {"sessionId": "A", "reason": "delete"}, notification=True)
             async with asyncio.timeout(2):
-                while any(path.exists() for path in profiles_a | uploads_a):
+                while any(path.exists() for path in profiles_a | uploads_a | downloads_a):
                     await asyncio.sleep(0.01)
             b = await call("B", "browser_open")
             assert not b["isError"], b
             assert not any(path.exists() for path in profiles_a)
             assert not any(path.exists() for path in uploads_a)
+            assert not any(path.exists() for path in downloads_a)
             stale = await call("B", "browser_status", meta={**identity("B"), HANDLE_KEY: handle})
             assert stale["isError"] and handle not in text(stale)
             profiles_b = set(profiles.glob("stealthfox-owner-*"))
             assert len(profiles_b) == 1
             uploads_b = set(uploads.glob("owner-*"))
             assert len(uploads_b) == 1
+            downloads_b = set(downloads.glob("owner-*"))
+            assert len(downloads_b) == 1
             if shutdown in ("stdin", "stdin_sigterm"):
                 process.stdin.close()
             if shutdown != "stdin":
@@ -160,9 +169,10 @@ server.main()
             await asyncio.wait_for(process.wait(), 5)
             assert not any(path.exists() for path in profiles_b), log.read_text()
             assert not any(path.exists() for path in uploads_b), log.read_text()
+            assert not any(path.exists() for path in downloads_b), log.read_text()
             logged = log.read_text()
             if hasattr(os, "getuid"):
-                assert "Removed 2 stale owner directories at startup" in logged
+                assert "Removed 3 stale owner directories at startup" in logged
             assert process.returncode == (0 if close_result == "success" else 1), logged
             if close_result != "success":
                 assert "Owner browser shutdown" in logged

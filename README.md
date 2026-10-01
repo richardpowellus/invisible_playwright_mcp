@@ -146,6 +146,14 @@ Use exclusive temporary and staging roots for this shared child. On startup,
 owner mode removes stale owner directories belonging to its Unix UID, without
 following symlinks, to recover files left by a forced termination.
 
+For downloads, configure `INVISIBLE_MCP_DOWNLOAD_DIRS`. Each owner gets a
+private `download dir` under its first root; `browser_download` saves only
+there (or a non-hidden subdirectory), never in shared roots or another owner's
+directory. Saved files survive browser reopen and are removed when the owner
+ends. Both directory lines precede the final fill-handle line and are omitted
+from handle-delegated status. Download roots have the same startup restrictions
+and stale-directory cleanup as upload roots.
+
 The owner's `browser_open` and `browser_status` disclose a generation-bound
 **fill handle** for `main`, for delegation to a trusted credential filler.
 Treat it as a secret; closing/reopening revokes it. See
