@@ -597,8 +597,10 @@ async def browser_type(selector: str, text: str, browser: Browser = None,
 
     Up to 80 characters are typed key by key at a human pace (about 0.4 s a
     character). Longer text goes in at once, as a paste does: no key events,
-    one trusted input event, and the field's maxlength applies. Calls that act
-    on the same browser run one at a time, in order.
+    one trusted input event, and the field's maxlength applies. The field is
+    read back once the page has answered; text the page dropped while it
+    arrived is typed again. Calls that act on the same browser run one at a
+    time, in order.
 
     expect_origin (e.g. "https://login.example.com") writes only if the field's
     own page is on that origin at the moment of writing, and nothing otherwise:
