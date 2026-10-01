@@ -722,7 +722,7 @@ async def browser_upload_files(selector: str, paths: list[str],
     Each path is absolute and names a regular file inside a directory listed
     in INVISIBLE_MCP_UPLOAD_DIRS, through no hidden directory; with none
     listed, uploads are off. Never use browser_evaluate to set `files`."""
-    return await work.acting(actions.upload_files, selector, paths, role=browser,
+    return await _work().acting(actions.upload_files, selector, paths, role=browser,
                              exclusive=True)
 
 
