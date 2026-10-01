@@ -12,6 +12,7 @@ import secrets
 import shutil
 import tempfile
 import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -34,6 +35,7 @@ HANDLE_TOOLS = frozenset({
 _HANDLE = re.compile(r"bh_[A-Za-z0-9_-]{43}")
 IDENTITY_ERROR = "Owner mode requires a valid mcpd/identity sessionId."
 HANDLE_ERROR = "Invalid or revoked browser fill handle."
+MAX_ENDED_SESSIONS = 4096
 
 
 class CapacityExhausted(RuntimeError):
@@ -182,6 +184,7 @@ class Owner:
     last_used: float
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     ended: bool = False
+    pending_calls: int = 0
 
 
 class Owners:
@@ -198,7 +201,7 @@ class Owners:
         self.clock = clock
         self.entries: dict[str, Owner] = {}
         self.handles: dict[bytes, OwnerWork] = {}
-        self.ended: set[str] = set()
+        self.ended: OrderedDict[str, None] = OrderedDict()
         self.stopping = asyncio.Event()
 
     @classmethod
@@ -234,38 +237,48 @@ class Owners:
 
     @asynccontextmanager
     async def target(self, meta: dict, tool: str, arguments: dict) -> AsyncIterator[OwnerWork]:
-        caller = self.caller(owner_id(meta))
-        caller.last_used = self.clock()
-        target = caller
+        identity = owner_id(meta)
         handle = meta.get(HANDLE_KEY)
         if HANDLE_KEY in meta:
             if tool not in HANDLE_TOOLS or arguments.get("browser") not in (None, "main"):
                 raise ValueError("This tool or browser is not permitted with a fill handle.")
             work = self.resolve_handle(handle)
             target = next(entry for entry in self.entries.values() if entry.work is work)
-        async with target.lock:
-            if self.stopping.is_set() or target.ended or caller.ended:
-                raise ValueError("This browser owner session has ended.")
-            # Closing/reopening may have happened while this call queued.
-            if HANDLE_KEY in meta and self.resolve_handle(handle) is not target.work:
-                raise ValueError(HANDLE_ERROR)
-            target.last_used = self.clock()
-            if tool == "browser_navigate":
-                url = arguments.get("url")
-                if isinstance(url, str) and urlsplit(url).scheme.lower() == "file":
-                    raise ValueError("file: URLs are refused in owner mode.")
-            try:
-                yield target.work
-            finally:
-                with anyio.CancelScope(shield=True):
-                    await target.work.reap_dead()
+        else:
+            target = self.caller(identity)
+        target.last_used = self.clock()
+        # A released lock can still have queued callers holding this entry.
+        target.pending_calls += 1
+        try:
+            async with target.lock:
+                if self.stopping.is_set() or target.ended or identity in self.ended:
+                    raise ValueError("This browser owner session has ended.")
+                # Closing/reopening may have happened while this call queued.
+                if HANDLE_KEY in meta and self.resolve_handle(handle) is not target.work:
+                    raise ValueError(HANDLE_ERROR)
                 target.last_used = self.clock()
+                if tool == "browser_navigate":
+                    url = arguments.get("url")
+                    if isinstance(url, str) and urlsplit(url).scheme.lower() == "file":
+                        raise ValueError("file: URLs are refused in owner mode.")
+                try:
+                    yield target.work
+                finally:
+                    with anyio.CancelScope(shield=True):
+                        await target.work.reap_dead()
+                    target.last_used = self.clock()
+        finally:
+            target.pending_calls -= 1
 
     async def session_ended(self, identity: str) -> None:
         entry = self.entries.get(identity)
         if entry is None:
             return
-        self.ended.add(identity)
+        # mcpd never routes calls for ended sessions; these bounded tombstones
+        # are only defence in depth, not the transport's authentication boundary.
+        self.ended[identity] = None
+        if len(self.ended) > MAX_ENDED_SESSIONS:
+            self.ended.popitem(last=False)
         entry.ended = True
         entry.work.revoke()
         async with entry.lock:
@@ -278,15 +291,17 @@ class Owners:
             if entry.lock.locked():
                 continue
             async with entry.lock:
-                if entry.ended or self.clock() - entry.last_used >= self.idle_seconds:
-                    try:
-                        await entry.work.close_all()
-                    except Exception as exc:
-                        errors.append(exc)
-                        continue
-                    # Idle sessions may open again; retain the same lock for queued calls.
-                    if entry.ended:
-                        self.entries.pop(identity, None)
+                if not entry.ended and self.clock() - entry.last_used < self.idle_seconds:
+                    continue
+                try:
+                    await entry.work.close_all()
+                except Exception as exc:
+                    errors.append(exc)
+                    continue
+            if (not entry.lock.locked() and not entry.pending_calls
+                    and not entry.work.roles() and not entry.work.profiles
+                    and self.entries.get(identity) is entry):
+                self.entries.pop(identity)
         if errors:
             raise ExceptionGroup("Could not close all idle browser owners", errors)
 

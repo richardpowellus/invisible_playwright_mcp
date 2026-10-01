@@ -156,6 +156,18 @@ async def test_session_ended_closes_only_owner_and_frees_capacity(owners):
     assert "unknown" not in owners.ended
 
 
+async def test_ended_session_bookkeeping_is_capped_and_evicts_oldest(owners):
+    for index in range(4096 + 32):
+        session = f"ended-{index}"
+        owners.caller(session)
+        await owners.session_ended(session)
+        assert len(owners.ended) <= 4096
+        assert not owners.entries
+    assert set(owners.ended) == {f"ended-{index}" for index in range(32, 4096 + 32)}
+    with pytest.raises(ValueError, match="session has ended"):
+        owners.caller("ended-4127")
+
+
 async def test_session_end_notification_does_not_block_other_callers(owners):
     success(await call("A", "browser_open"))
     success(await call("B", "browser_open"))
@@ -204,8 +216,94 @@ async def test_idle_backstop_and_activity(owners):
     await owners.reap_idle()
     assert a.closed and not b.closed
     assert owners.capacity.used == 1
+    assert set(owners.entries) == {"B"}
     success(await call("A", "browser_open"))
     assert owners.entries["A"].work._open["main"] is not a
+
+
+async def test_idle_empty_owner_is_removed_and_later_call_recreates_it(owners):
+    now = [0.0]
+    owners.clock = lambda: now[0]
+    success(await call("A", "browser_list"))
+    original = owners.entries["A"]
+    now[0] = 900
+    await owners.reap_idle()
+    assert not owners.entries
+    success(await call("A", "browser_open"))
+    assert owners.entries["A"] is not original
+    assert owners.entries["A"].work.roles() == ["main"]
+
+
+async def test_idle_cleanup_retains_owner_for_queued_call(owners):
+    now = [0.0]
+    owners.clock = lambda: now[0]
+    success(await call("A", "browser_open"))
+    entry = owners.entries["A"]
+    a = entry.work._open["main"]
+    close = a.close
+    closing, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_close():
+        closing.set()
+        await release.wait()
+        await close()
+
+    a.close = slow_close
+    now[0] = 900
+    reaping = asyncio.create_task(owners.reap_idle())
+    try:
+        await asyncio.wait_for(closing.wait(), 2)
+        opening = asyncio.create_task(call("A", "browser_open"))
+        await asyncio.sleep(0)
+    finally:
+        release.set()
+    await reaping
+    success(await opening)
+    assert owners.entries["A"] is entry
+    assert owners.capacity.used == 1
+    success(await call("A", "browser_status"))
+    now[0] = 1800
+    await owners.reap_idle()
+    assert not owners.entries and owners.capacity.used == 0
+
+
+async def test_idle_cleanup_retains_owner_until_profile_removal_succeeds(owners, monkeypatch):
+    now = [0.0]
+    owners.clock = lambda: now[0]
+    success(await call("A", "browser_open"))
+    entry = owners.entries["A"]
+    now[0] = 900
+
+    def refuse_cleanup(path):
+        raise PermissionError("profile is still held")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("invisible_playwright_mcp.mcp.owners.shutil.rmtree", refuse_cleanup)
+        with pytest.raises(ExceptionGroup, match="idle browser owners"):
+            await owners.reap_idle()
+        assert owners.entries["A"] is entry
+        assert not entry.work.roles() and entry.work.profiles
+        assert owners.capacity.used == 1
+    await owners.reap_idle()
+    assert not owners.entries and owners.capacity.used == 0
+
+
+async def test_cancelled_queued_call_does_not_prevent_idle_owner_removal(owners):
+    now = [0.0]
+    owners.clock = lambda: now[0]
+    success(await call("A", "browser_list"))
+    entry = owners.entries["A"]
+    async with entry.lock:
+        queued = asyncio.create_task(call("A", "browser_list"))
+        await asyncio.sleep(0)
+        assert entry.pending_calls == 1
+        queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+        assert entry.pending_calls == 0
+    now[0] = 900
+    await owners.reap_idle()
+    assert not owners.entries
 
 
 async def test_idle_cleanup_attempts_other_owners_when_one_close_fails(owners):
@@ -439,12 +537,30 @@ async def test_allowed_handle_tools_reach_only_main(owners, monkeypatch, name, a
     result = await call("B", name, args, meta={**identity("B"), HANDLE_KEY: old})
     assert not result.isError, text(result)
     if name == "browser_status":
-        assert old in text(result)
+        assert [line for line in text(result).splitlines() if line.startswith("fill handle:")] == [
+            "fill handle: " + old]
     else:
         assert touched == [a]
     result = await call("B", name, dict(args, browser="support"),
                         meta={**identity("B"), HANDLE_KEY: old})
     assert result.isError and old not in text(result)
+
+
+@pytest.mark.parametrize("name,valid_handle", [
+    ("browser_status", True), ("browser_status", False), ("browser_list", True),
+])
+async def test_fill_transports_never_allocate_owner_entries(owners, name, valid_handle):
+    secret = handle(await call("A", "browser_open"))
+    supplied = secret if valid_handle else "bh_" + "X" * 43
+    before = dict(owners.entries)
+    for index in range(512):
+        result = await call(f"fill-{index}", name,
+                            meta={**identity(f"fill-{index}"), HANDLE_KEY: supplied})
+        assert result.isError == (name != "browser_status" or not valid_handle)
+    assert len(owners.entries) == len(before)
+    assert owners.entries == before
+    assert not owners.ended
+    assert owners.capacity.used == 1
 
 
 @pytest.mark.parametrize("name,args", [
@@ -586,6 +702,11 @@ async def test_non_owner_mode_ignores_metadata_and_issues_no_handle(owners, monk
         result = await call(None, "browser_open", meta={HANDLE_KEY: "not-a-handle"})
         assert "fill handle" not in success(result)
         assert json.loads(success(await call("B", "browser_list")))["browsers"][0]["id"] == "main"
+        success(await call(None, "browser_open", {"browser": "support"}, meta={}))
+        for role in ("main", "support"):
+            for meta in ({}, {HANDLE_KEY: "bh_" + "X" * 43}):
+                status = success(await call(None, "browser_status", {"browser": role}, meta=meta))
+                assert not any(line.startswith("fill handle:") for line in status.splitlines())
     finally:
         await single.close_all()
 

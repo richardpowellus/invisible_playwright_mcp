@@ -209,6 +209,11 @@ calls are not interrupted. Successful delegated calls also refresh the target's
 activity. Stdio EOF and, on Unix, SIGTERM close every owner before the event
 loop exits. Forced termination (such as SIGKILL) cannot run cleanup.
 
+Idle cleanup also removes empty owner records once no calls hold or wait for
+their lock; a later call from the same session creates a fresh record. Ended
+session tombstones retain only the latest 4096 identities, oldest evicted.
+mcpd does not route calls for ended sessions, so this cache is defence in depth.
+
 For credential filling, the owner's `browser_open` and `browser_status` return
 `fill handle: bh_...` for **main only** (32 random bytes, 43 URL-safe base64
 characters after the prefix). Pass this secret as `browser_handle` to the
@@ -218,6 +223,12 @@ This selects the target by capability, not by the filler's owner. It permits
 only `browser_status`, `browser_evaluate`, `browser_snapshot`,
 `browser_read_html`, `browser_read_text`, `browser_type`, and
 `browser_press_key`. An explicit `browser="support"` is refused.
+
+Handle-carrying calls validate the filler's identity without allocating an
+owner record for that transport. With a valid handle, `browser_status` returns
+the exact line `fill handle: <that handle>` as an attestation to the filler.
+In non-owner mode `browser_status` never returns a `fill handle:` line, even
+if a call supplies handle metadata.
 
 Handles are compared in constant time after a hashed lookup, never logged,
 and never echoed in errors. Close, reopen, expiry and session end revoke them.
