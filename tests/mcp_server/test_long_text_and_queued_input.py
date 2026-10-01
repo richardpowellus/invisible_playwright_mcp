@@ -55,6 +55,9 @@ class _Page:
     def locator(self, selector):
         return _Locator(self, selector)
 
+    async def wait_for_selector(self, selector, **kw):
+        return None
+
 
 class _Session:
     def __init__(self, page):
