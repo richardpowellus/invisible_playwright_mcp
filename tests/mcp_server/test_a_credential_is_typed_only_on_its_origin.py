@@ -22,6 +22,9 @@ class _Page:
     def __init__(self):
         self.calls = []
 
+    async def wait_for_selector(self, selector, **kw):
+        pass
+
     async def fill(self, selector, text, **kw):
         self.calls.append((selector, text, kw))
 
