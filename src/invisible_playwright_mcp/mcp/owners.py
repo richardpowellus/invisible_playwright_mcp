@@ -15,13 +15,14 @@ import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import anyio
 
-from . import DEFAULT_BROWSER_ID, GONE
+from . import DEFAULT_BROWSER_ID, GONE, actions
 from .session import StealthSession
 from .work import Work
 from ..engine import Engine
@@ -36,6 +37,7 @@ _HANDLE = re.compile(r"bh_[A-Za-z0-9_-]{43}")
 IDENTITY_ERROR = "Owner mode requires a valid mcpd/identity sessionId."
 HANDLE_ERROR = "Invalid or revoked browser fill handle."
 MAX_ENDED_SESSIONS = 4096
+_delegated_call: ContextVar[bool] = ContextVar("browser_fill_delegated", default=False)
 
 
 class CapacityExhausted(RuntimeError):
@@ -81,6 +83,7 @@ class OwnerWork(Work):
         self.profiles: dict[str, Path] = {}
         self.dead: set[str] = set()
         self.fill_handle: str | None = None
+        self.upload_dir: Path | None = None
 
     def remembered(self) -> None:
         return None
@@ -95,12 +98,70 @@ class OwnerWork(Work):
             raise ValueError("Persistent profile arguments are refused in owner mode; "
                              "leave profile out for an ephemeral browser.")
         result = await super().open(role, seed=seed, proxy=proxy, profile="")
+        if self.upload_dir is not None:
+            result += "\nupload dir: " + str(self.upload_dir)
         if role == DEFAULT_BROWSER_ID and role in self._open:
             if self.fill_handle is None:
                 self.fill_handle = "bh_" + secrets.token_urlsafe(32)
                 self.registry.handles[self.registry.handle_hash(self.fill_handle)] = self
             result += "\nfill handle: " + self.fill_handle
         return result
+
+    def _ensure_upload_dir(self) -> None:
+        try:
+            roots = actions.upload_dirs({
+                actions.UPLOAD_DIRS_ENV: os.pathsep.join(self.registry.upload_roots)})
+        except actions.UploadDirectoryError:
+            raise actions.UploadDirectoryError(
+                "uploads are off: the configured staging root is unavailable.") from None
+        if not roots:
+            return
+        if self.upload_dir is None:
+            directory = Path(roots[0]) / ("owner-" + secrets.token_urlsafe(24))
+            directory.mkdir(mode=0o700)
+            self.upload_dir = directory
+            directory.chmod(0o700)
+        self._upload_env()
+
+    def _upload_env(self) -> dict[str, str]:
+        if self.upload_dir is None:
+            raise RuntimeError(
+                "uploads are off: no private upload directory is configured for this owner.")
+        env = {actions.UPLOAD_DIRS_ENV: str(self.upload_dir)}
+        try:
+            actions.upload_dirs(env)
+        except actions.UploadDirectoryError:
+            raise RuntimeError("uploads are off: your upload directory is unavailable.") from None
+        return env
+
+    def remove_upload_dir(self) -> None:
+        if self.upload_dir is not None:
+            # Never traverse a replaced staging root or follow a directory link.
+            try:
+                actions.upload_dirs({actions.UPLOAD_DIRS_ENV: str(self.upload_dir.parent)})
+            except actions.UploadDirectoryError:
+                raise actions.UploadDirectoryError(
+                    "Cannot remove the upload directory: its staging root is unavailable.") from None
+            if self.upload_dir.is_symlink():
+                self.upload_dir.unlink()
+            elif self.upload_dir.exists():
+                shutil.rmtree(self.upload_dir)
+            self.upload_dir = None
+
+    async def _upload_files(self, session, selector: str, paths) -> str:
+        env = self._upload_env()
+        try:
+            return await actions.upload_files(session, selector, paths, env=env)
+        except actions.UploadDirectoryError:
+            raise RuntimeError("uploads are off: your upload directory is unavailable.") from None
+        except PermissionError:
+            raise PermissionError(
+                "Upload refused. Copy the file into your upload dir: %s" % self.upload_dir) from None
+
+    async def _act(self, at: str, fn, *args, **kwargs):
+        if fn is actions.upload_files:
+            fn = self._upload_files
+        return await super()._act(at, fn, *args, **kwargs)
 
     async def _start(self, role: str, settings: dict) -> StealthSession:
         await self.registry.capacity.reserve()
@@ -112,6 +173,7 @@ class OwnerWork(Work):
         self.profiles[role] = directory
         try:
             directory.chmod(0o700)
+            self._ensure_upload_dir()
             settings["profile_dir"] = str(directory)
             session = self._factory(**settings)
             # Retain even a failed launch until its close has succeeded.
@@ -173,6 +235,8 @@ class OwnerWork(Work):
 
     async def status(self, role: str) -> str:
         result = await super().status(role)
+        if self.upload_dir is not None and not _delegated_call.get():
+            result += "\nupload dir: " + str(self.upload_dir)
         if role == DEFAULT_BROWSER_ID and self.fill_handle is not None:
             result += "\nfill handle: " + self.fill_handle
         return result
@@ -199,6 +263,12 @@ class Owners:
         self.factory = factory
         self.engine = engine
         self.clock = clock
+        self.upload_roots = actions.upload_dirs()
+        profile_root = Path(tempfile.gettempdir()).resolve()
+        if any(profile_root.is_relative_to(root) for root in self.upload_roots):
+            raise ValueError(
+                "Owner mode refuses upload roots containing the profile temp directory; "
+                "configure a separate upload staging directory.")
         self.entries: dict[str, Owner] = {}
         self.handles: dict[bytes, OwnerWork] = {}
         self.ended: OrderedDict[str, None] = OrderedDict()
@@ -261,9 +331,11 @@ class Owners:
                     url = arguments.get("url")
                     if isinstance(url, str) and urlsplit(url).scheme.lower() == "file":
                         raise ValueError("file: URLs are refused in owner mode.")
+                token = _delegated_call.set(HANDLE_KEY in meta)
                 try:
                     yield target.work
                 finally:
+                    _delegated_call.reset(token)
                     with anyio.CancelScope(shield=True):
                         await target.work.reap_dead()
                     target.last_used = self.clock()
@@ -283,6 +355,7 @@ class Owners:
         entry.work.revoke()
         async with entry.lock:
             await entry.work.close_all()
+            entry.work.remove_upload_dir()
             self.entries.pop(identity, None)
 
     async def reap_idle(self) -> None:
@@ -301,6 +374,11 @@ class Owners:
             if (not entry.lock.locked() and not entry.pending_calls
                     and not entry.work.roles() and not entry.work.profiles
                     and self.entries.get(identity) is entry):
+                try:
+                    entry.work.remove_upload_dir()
+                except (OSError, actions.UploadDirectoryError) as exc:
+                    errors.append(exc)
+                    continue
                 self.entries.pop(identity)
         if errors:
             raise ExceptionGroup("Could not close all idle browser owners", errors)

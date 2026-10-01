@@ -157,6 +157,7 @@ between what the browser says it is and where it appears to be.
 | `STEALTHFOX_OWNER_MODE` | `mcpd` enables isolated callers on trusted mcpd stdio. Unset preserves single-owner behavior. Other values and direct HTTP in owner mode are refused. |
 | `STEALTHFOX_MAX_BROWSERS` | Owner mode only: positive integer, default `2`, across all callers, including launching and closing browsers. |
 | `STEALTHFOX_OWNER_IDLE_SECONDS` | Owner mode only: positive finite seconds, default `900`, without tool activity before closing an owner's browsers. |
+| `INVISIBLE_MCP_UPLOAD_DIRS` | Upload staging roots: absolute existing canonical directories, separated by `:` (`;` on Windows). Unset disables uploads. In owner mode the first root holds private owner directories; callers cannot upload directly from shared roots. |
 | `INVISIBLE_MCP_HOME` | Where saved sessions are kept. Defaults to `%APPDATA%/invisible-playwright-mcp` on Windows, `~/Library/Application Support/invisible-playwright-mcp` on macOS and `$XDG_DATA_HOME/invisible-playwright-mcp` on Linux. A directory left by the previous name is moved onto this one the first time the command runs, once, and the move is printed. Set it to put them on another disk. |
 
 Anything a tool call says wins over these. `browser_open` can pick another
@@ -213,6 +214,28 @@ Idle cleanup also removes empty owner records once no calls hold or wait for
 their lock; a later call from the same session creates a fresh record. Ended
 session tombstones retain only the latest 4096 identities, oldest evicted.
 mcpd does not route calls for ended sessions, so this cache is defence in depth.
+
+**Owner-scoped uploads.** On an owner's first browser launch, the server creates
+`<first upload root>/owner-<32 random URL-safe characters>/` with mode `0700`.
+`browser_open` and ordinary `browser_status` report `upload dir: <path>`.
+Copy documents into that directory before calling `browser_upload_files`.
+Neither another owner's directory nor a file directly in a shared staging root
+is allowed. Canonical path, hidden-component, size, descriptor and no-follow
+checks still apply, both before touching the page and when snapshotting files.
+
+The upload directory survives browser close/reopen, including helper browsers.
+Session end, idle removal of the owner record, and process shutdown remove it
+without following symlinks. A cleanup failure is reported and keeps the owner
+record for retry. Handle-delegated status omits the upload directory; `main`'s
+fill handle remains the final line of status.
+
+Upload roots are validated at owner-mode startup and rechecked before directory
+creation. Noncanonical, relative or missing configured roots are refused.
+Owner mode also refuses startup if **any** upload root is equal to or an ancestor
+of `tempfile.gettempdir()`, which contains browser profiles and upload snapshots.
+Use a separate staging directory, never the whole temporary directory. With no
+upload roots configured, browsing still works but uploads are off. These
+owner-only restrictions do not change non-owner mode's shared-root behavior.
 
 For credential filling, the owner's `browser_open` and `browser_status` return
 `fill handle: bh_...` for **main only** (32 random bytes, 43 URL-safe base64
@@ -410,7 +433,7 @@ so.
 | `browser_click_at` | `x`, `y`, `hold_seconds` (default 0) | Clicks a viewport coordinate instead of a selector: moves the pointer there, presses, holds if asked, releases, and returns a screenshot taken right after. For a slider track, a canvas-drawn challenge, a precise point inside a wider element. |
 | `browser_type` | `selector`, `text` | Fills a field, replacing whatever it holds. It sets the value rather than typing key by key, so per-keystroke handlers such as an autocomplete do not fire; for those, click the field and use `browser_press_key`. |
 | `browser_select_option` | `selector`, `value` | Chooses an option in a `<select>`, by its visible label or by its value. |
-| `browser_upload_files` | `selector`, `paths` | Attaches local files to a file input the way a person picks them: the input, or the button or label that opens its chooser, is clicked with the real pointer and the chooser is answered with `paths`. A hidden input is given the files directly, as its chooser would. Off unless `INVISIBLE_MCP_UPLOAD_DIRS` names the directories files may come from (absolute, separated by `:`, `;` on Windows); a path must be a regular file inside one of them, under no hidden directory, at most 50 MB. |
+| `browser_upload_files` | `selector`, `paths` | Attaches local files to a file input the way a person picks them: the input, or the button or label that opens its chooser, is clicked with the real pointer and the chooser is answered with `paths`. A hidden input is given the files directly, as its chooser would. Off unless `INVISIBLE_MCP_UPLOAD_DIRS` is configured. Files must be regular, non-hidden and at most 50 MB; owner mode permits only that owner's reported `upload dir`, while non-owner mode permits the configured roots. |
 | `browser_press_key` | `key` | Presses a key on whatever has focus: `Enter`, `Tab`, `Escape`, `ArrowDown`, `Control+a`, or a single character. |
 | `browser_evaluate` | `expression` | Runs JavaScript to **read** from the page and returns the result as JSON: a computed style, a value held in a framework's state, the length of a list. |
 

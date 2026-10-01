@@ -295,6 +295,8 @@ Open a browser with browser_open before using it; no other tool opens one.
 browser_open and browser_status disclose a fill handle for your main browser;
 pass it only to a trusted credential filler. Closing/reopening revokes it.
 The process-wide browser cap includes other sessions; a refusal evicts nobody.
+For uploads, copy files into your private `upload dir` shown by browser_open
+or browser_status. Shared staging roots and other owners' files are refused.
 
 """
 mcp = BrowserMCP("stealth", instructions=(
@@ -719,9 +721,10 @@ async def browser_upload_files(selector: str, paths: list[str],
     is what its chooser does. Several files need an input that takes several;
     otherwise upload them one call at a time.
 
-    Each path is absolute and names a regular file inside a directory listed
-    in INVISIBLE_MCP_UPLOAD_DIRS, through no hidden directory; with none
-    listed, uploads are off. Never use browser_evaluate to set `files`."""
+    Paths must be absolute regular files with no hidden component. Off unless
+    INVISIBLE_MCP_UPLOAD_DIRS names directories. In owner mode, copy files into
+    your `upload dir` from browser_open/status first; otherwise the listed
+    directories are allowed. Never use browser_evaluate to set `files`."""
     return await _work().acting(actions.upload_files, selector, paths, role=browser,
                              exclusive=True)
 

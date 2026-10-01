@@ -972,6 +972,10 @@ _FILE_INPUT_JS = """el => ({
 _FILE_NAMES_JS = "el => el.files ? Array.from(el.files, f => f.name) : null"
 
 
+class UploadDirectoryError(RuntimeError):
+    pass
+
+
 def upload_dirs(env=None) -> list[str]:
     """The directories named in INVISIBLE_MCP_UPLOAD_DIRS. A relative entry is
     refused rather than resolved against wherever the server started.
@@ -988,12 +992,12 @@ def upload_dirs(env=None) -> list[str]:
         if not entry:
             continue
         if not os.path.isabs(entry):
-            raise RuntimeError(
+            raise UploadDirectoryError(
                 f"{UPLOAD_DIRS_ENV} names {entry!r}, which is not an absolute path")
         named = os.path.normpath(entry)
         real = os.path.realpath(named)
         if real != named or not os.path.isdir(real):
-            raise RuntimeError(
+            raise UploadDirectoryError(
                 f"{UPLOAD_DIRS_ENV} names {entry!r}, which is not a directory at "
                 f"that exact path (it resolves to {real!r}); uploads are off")
         dirs.append(real)
@@ -1164,16 +1168,16 @@ def _expire_snapshots() -> None:
                     shutil.rmtree(path)
 
 
-async def upload_files(session, selector: str, paths) -> str:
+async def upload_files(session, selector: str, paths, *, env=None) -> str:
     """Attach local files to a file input, through its file chooser."""
-    named = uploadable(paths)
+    named = uploadable(paths, env=env)
     page = session.page()
     target = await _on_selector(session, selector, "upload",
                                 lambda: page.eval_on_selector(selector, _FILE_INPUT_JS))
     names = ", ".join(os.path.basename(f) for f in named)
     if len(named) > 1 and target["file"] and not target["multiple"]:
         raise RuntimeError(f"{selector} takes one file; upload them one at a time")
-    files = snapshot_files(named)
+    files = snapshot_files(named, env=env)
 
     if target["file"] and not target["shown"]:
         if len(files) > 1 and not target["multiple"]:

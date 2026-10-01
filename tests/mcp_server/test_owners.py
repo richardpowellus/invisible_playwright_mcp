@@ -59,7 +59,8 @@ def handle(result):
 @pytest.fixture
 async def owners(monkeypatch, tmp_path):
     for name in ("STEALTHFOX_SEED", "STEALTHFOX_PROXY", "STEALTHFOX_PROFILE_DIR",
-                 "STEALTHFOX_HEADLESS", "STEALTHFOX_BINARY", "STEALTHFOX_NO_PROXY"):
+                 "STEALTHFOX_HEADLESS", "STEALTHFOX_BINARY", "STEALTHFOX_NO_PROXY",
+                 actions.UPLOAD_DIRS_ENV):
         monkeypatch.delenv(name, raising=False)
     registry = Owners(factory=_Recording)
     monkeypatch.setattr(server, "owners", registry)
