@@ -138,6 +138,11 @@ anyone. `STEALTHFOX_OWNER_IDLE_SECONDS` defaults to **900**; idle browsers,
 ended sessions and process shutdown close their browsers and remove profiles.
 Persistent `profile` arguments and `file:` navigation are refused in this mode.
 
+For uploads, configure `INVISIBLE_MCP_UPLOAD_DIRS` and copy files into the private
+`upload dir` reported by `browser_open`/`browser_status`, not into the shared
+root. It survives browser reopen and is removed when the owner ends. Upload
+roots containing the profile temporary directory are refused at startup.
+
 The owner's `browser_open` and `browser_status` disclose a generation-bound
 **fill handle** for `main`, for delegation to a trusted credential filler.
 Treat it as a secret; closing/reopening revokes it. See

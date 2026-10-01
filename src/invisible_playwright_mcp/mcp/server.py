@@ -226,8 +226,9 @@ through the real pointer and the real keyboard.
 Try things in this order. It matters, because a page can tell the difference.
 
 1. A named tool with a selector: browser_click, browser_type,
-   browser_select_option, browser_press_key. browser_snapshot gives you the
-   selector for each element - pass it verbatim, it is built to be unambiguous.
+   browser_select_option, browser_press_key, browser_upload_files.
+   browser_snapshot gives you the selector for each element - pass it
+   verbatim, it is built to be unambiguous.
 
 2. Coordinates. browser_snapshot reports `at: [x, y]` for every element it
    lists, in viewport pixels. browser_click_at takes exactly those and moves the
@@ -294,6 +295,8 @@ Open a browser with browser_open before using it; no other tool opens one.
 browser_open and browser_status disclose a fill handle for your main browser;
 pass it only to a trusted credential filler. Closing/reopening revokes it.
 The process-wide browser cap includes other sessions; a refusal evicts nobody.
+For uploads, copy files into your private `upload dir` shown by browser_open
+or browser_status. Shared staging roots and other owners' files are refused.
 
 """
 mcp = BrowserMCP("stealth", instructions=(
@@ -705,6 +708,25 @@ async def browser_select_option(selector: str, value: str,
     through browser_evaluate changes it without the page seeing a real
     interaction."""
     return await _work().acting(actions.select_option, selector, value, role=browser, exclusive=True)
+
+
+@mcp.tool(annotations=_says("Upload files", destructive=True))
+async def browser_upload_files(selector: str, paths: list[str],
+                               browser: Browser = None) -> str:
+    """Attach local files to a file input, the way a person picks them.
+
+    `selector` is the `<input type=file>` itself, or the button or label that
+    opens its chooser: that is clicked with the real pointer and the chooser
+    answered with `paths`. A hidden input is given the files directly, which
+    is what its chooser does. Several files need an input that takes several;
+    otherwise upload them one call at a time.
+
+    Paths must be absolute regular files with no hidden component. Off unless
+    INVISIBLE_MCP_UPLOAD_DIRS names directories. In owner mode, copy files into
+    your `upload dir` from browser_open/status first; otherwise the listed
+    directories are allowed. Never use browser_evaluate to set `files`."""
+    return await _work().acting(actions.upload_files, selector, paths, role=browser,
+                             exclusive=True)
 
 
 @mcp.tool(annotations=_says("Press a key", destructive=True))
