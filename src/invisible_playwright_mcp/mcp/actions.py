@@ -16,7 +16,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import shutil
+import stat
+import tempfile
 import time
 from typing import Any
 
@@ -920,6 +924,302 @@ async def select_option(session, selector: str, value: str) -> str:
         raise RuntimeError(
             f"no option in {selector} has the value or the label {value!r}")
     return f"selected {selector} by label: {chosen}"
+
+
+# ── files, picked the way a person picks them ──────────────────────────────
+#
+# ⛔ WITHOUT THIS, AN UPLOAD WAS IMPOSSIBLE, AND IMPOSSIBLE IS NOT NEUTRAL. A
+# file input takes nothing from the keyboard and nothing from browser_evaluate,
+# so a credit application's "Supporting Documents" page (measured 2026-10-01)
+# was the end of the road: the model could click "Add Document", watch a chooser
+# open that no tool could answer, and stop. The way past it a model finds next
+# is script - a DataTransfer built in the page and assigned to `input.files`,
+# which is exactly the untrusted change this package exists to avoid.
+#
+# The file chooser is what a person uses, so the chooser is what this answers:
+# the real pointer clicks what opens it and the files go in through the
+# engine's own file-input path, with the input and change events a picked file
+# produces. A hidden input - the usual shape, a styled button in front of an
+# `<input type=file>` nobody can see - is given the files directly, which is
+# what its chooser would have done; there is nothing visible to click on it.
+#
+# ⛔ AND IT READS ONLY FROM DIRECTORIES SOMEBODY NAMED. This hands a local file
+# to a remote page, and the model choosing the path is driven by pages it has
+# read. With no list there are no uploads at all, rather than a default that
+# would have to guess which part of a disk is safe to send away.
+
+#: The directories files may be uploaded from, separated by os.pathsep.
+UPLOAD_DIRS_ENV = "INVISIBLE_MCP_UPLOAD_DIRS"
+#: Per file. A form upload past this is not a document, and a typo naming a
+#: disk image should not take the browser down with it.
+UPLOAD_MAX_BYTES = 50 * 1024 * 1024
+UPLOAD_MAX_FILES = 20
+#: All the files of one call together. Each is copied into a snapshot inside
+#: the one shared browser process and kept for an hour, so twenty files at the
+#: per-file limit would be a gigabyte copied and held for one call.
+UPLOAD_MAX_TOTAL_BYTES = 100 * 1024 * 1024
+#: How long the click has to open a chooser before the selector is reported as
+#: not the thing that opens one.
+CHOOSER_MS = 10_000
+
+_FILE_INPUT_JS = """el => ({
+  file: el.tagName === "INPUT" && (el.type || "").toLowerCase() === "file",
+  multiple: !!el.multiple,
+  shown: (() => { const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 1 && r.height > 1 && s.visibility !== "hidden"
+        && s.display !== "none" && +s.opacity > 0.01; })()
+})"""
+_FILE_NAMES_JS = "el => el.files ? Array.from(el.files, f => f.name) : null"
+
+
+def upload_dirs(env=None) -> list[str]:
+    """The directories named in INVISIBLE_MCP_UPLOAD_DIRS. A relative entry is
+    refused rather than resolved against wherever the server started.
+
+    ⛔ AND SO IS ONE THAT RESOLVES SOMEWHERE ELSE. Resolving the entry would let
+    whoever can replace it with a symlink choose the root: a staging directory
+    turned into a link to its parent widens every upload to the parent's whole
+    tree, silently. An entry whose real path is not itself (a link anywhere in
+    it, or a directory that does not exist) turns uploads off with the reason.
+    """
+    raw = (os.environ if env is None else env).get(UPLOAD_DIRS_ENV, "")
+    dirs = []
+    for entry in (e.strip() for e in raw.split(os.pathsep)):
+        if not entry:
+            continue
+        if not os.path.isabs(entry):
+            raise RuntimeError(
+                f"{UPLOAD_DIRS_ENV} names {entry!r}, which is not an absolute path")
+        named = os.path.normpath(entry)
+        real = os.path.realpath(named)
+        if real != named or not os.path.isdir(real):
+            raise RuntimeError(
+                f"{UPLOAD_DIRS_ENV} names {entry!r}, which is not a directory at "
+                f"that exact path (it resolves to {real!r}); uploads are off")
+        dirs.append(real)
+    return dirs
+
+
+def uploadable(paths, env=None) -> list[str]:
+    """The files `paths` names, resolved, or the reason they may not be sent.
+
+    Each must be absolute, a regular file once symlinks are followed, readable,
+    under UPLOAD_MAX_BYTES, inside one of the named directories, and below it
+    through no hidden component (`.ssh`, `.env`, `.git`): those hold keys more
+    often than documents.
+
+    This is the early answer, before any page is touched. What is uploaded is
+    decided again by `snapshot_files`, on the open file rather than on its name.
+    """
+    if isinstance(paths, str) or not isinstance(paths, (list, tuple)) or not paths:
+        raise ValueError("paths is a list of one or more absolute file paths")
+    if len(paths) > UPLOAD_MAX_FILES:
+        raise ValueError(f"at most {UPLOAD_MAX_FILES} files in one upload")
+    dirs = upload_dirs(env)
+    if not dirs:
+        raise RuntimeError(
+            f"uploads are off: {UPLOAD_DIRS_ENV} names no directory files may be "
+            "uploaded from")
+    out, total = [], 0
+    for path in paths:
+        if not isinstance(path, str) or not os.path.isabs(path):
+            raise ValueError(f"{path!r} is not an absolute path")
+        real = os.path.realpath(path)
+        home = next((d for d in dirs if os.path.commonpath([real, d]) == d), None)
+        if home is None:
+            raise PermissionError(
+                f"{path} is not inside a directory uploads may come from "
+                f"({os.pathsep.join(dirs)})")
+        _no_hidden(path, real, home)
+        try:
+            st = os.stat(real)
+        except OSError as exc:
+            raise FileNotFoundError(f"{path}: {exc.strerror or exc}") from None
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"{path} is not a regular file")
+        if st.st_size > UPLOAD_MAX_BYTES:
+            raise ValueError(f"{path} is {st.st_size} bytes, over the "
+                             f"{UPLOAD_MAX_BYTES}-byte limit for one file")
+        if not os.access(real, os.R_OK):
+            raise PermissionError(f"{path} is not readable")
+        if real in out:
+            raise ValueError(f"{path} is named twice")
+        total += st.st_size
+        if total > UPLOAD_MAX_TOTAL_BYTES:
+            raise ValueError(f"these files come to more than {UPLOAD_MAX_TOTAL_BYTES} "
+                             "bytes together; upload them in more than one call")
+        out.append(real)
+    return out
+
+
+def _home(real: str, dirs: list[str]):
+    return next((d for d in dirs if os.path.commonpath([real, d]) == d), None)
+
+
+def _no_hidden(path: str, real: str, home: str) -> None:
+    rel = os.path.relpath(real, home)
+    hidden = [c for c in rel.split(os.sep) if c.startswith(".")] if rel != "." else []
+    if hidden:
+        raise PermissionError(f"{path} lies under a hidden name ({hidden[0]}); not sent")
+
+
+def _opened_path(fd: int, real: str, st) -> str:
+    """Where the OPEN file actually is. On Linux the kernel says so; elsewhere
+    the name must still lead to the very file that was opened."""
+    proc = f"/proc/self/fd/{fd}"
+    if os.path.islink(proc):
+        where = os.readlink(proc)
+        # A file unlinked after it was opened is still the file that was
+        # opened; the kernel marks its old name rather than giving it a new one.
+        if where.endswith(" (deleted)") and os.fstat(fd).st_nlink == 0:
+            where = where[: -len(" (deleted)")]
+        return where
+    now = os.stat(real)
+    if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+        raise PermissionError(f"{real} changed while it was being read; not sent")
+    return real
+
+
+#: How long a snapshot outlives its call. Firefox reads a picked file's bytes
+#: when the page sends it, not when it is picked, so the copy has to be there
+#: for the submit that follows; an hour is longer than any form takes.
+SNAPSHOT_KEEP_S = 3600
+
+
+def snapshot_files(files: list[str], env=None) -> list[str]:
+    """Private copies of `files`, checked on the open file, not on its name.
+
+    ⛔ THE NAME IS NOT THE FILE. `uploadable` resolves and stats a path, and a
+    chooser is answered seconds later; in a directory other processes write to
+    (a staging directory several sessions share), the name can be pointed at
+    something else in between, and the engine would read whatever it names by
+    then. So each file is opened without following a final link, the OPEN file
+    is checked - regular, within the limit, really inside an allowed directory
+    and under no hidden name - and its bytes are copied into a fresh owner-only
+    directory. That copy is what the engine is given, and nothing else can
+    write to it.
+    """
+    dirs = upload_dirs(env)
+    _expire_snapshots()
+    root = tempfile.mkdtemp(prefix=_SNAPSHOT_PREFIX)
+    try:
+        out, total = [], 0
+        for i, real in enumerate(files):
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+            try:
+                fd = os.open(real, flags)
+            except OSError as exc:
+                raise PermissionError(f"{real} could not be opened as a plain file "
+                                      f"({exc.strerror or exc}); not sent") from None
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise ValueError(f"{real} is not a regular file")
+                actual = os.path.realpath(_opened_path(fd, real, st))
+                home = _home(actual, dirs)
+                if home is None:
+                    raise PermissionError(
+                        f"{real} is no longer inside a directory uploads may come from; not sent")
+                _no_hidden(real, actual, home)
+                os.makedirs(os.path.join(root, str(i)), mode=0o700)
+                # The name checked and shown is the one the caller gave, never
+                # one read back from the descriptor: that can carry the
+                # kernel's " (deleted)" mark, and a portal checks extensions.
+                dest = os.path.join(root, str(i), os.path.basename(real))
+                size = 0
+                with os.fdopen(os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                       | getattr(os, "O_BINARY", 0), 0o600), "wb") as copy:
+                    while chunk := os.read(fd, 1 << 20):
+                        size += len(chunk)
+                        total += len(chunk)
+                        if size > UPLOAD_MAX_BYTES:
+                            raise ValueError(f"{real} is over the {UPLOAD_MAX_BYTES}-byte "
+                                             "limit for one file")
+                        if total > UPLOAD_MAX_TOTAL_BYTES:
+                            raise ValueError(f"these files came to more than "
+                                             f"{UPLOAD_MAX_TOTAL_BYTES} bytes together")
+                        copy.write(chunk)
+                out.append(dest)
+            finally:
+                os.close(fd)
+        return out
+    except BaseException:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+
+
+_SNAPSHOT_PREFIX = "invisible-upload-"
+
+
+def _expire_snapshots() -> None:
+    """Snapshots older than SNAPSHOT_KEEP_S, from this or an earlier process."""
+    base = tempfile.gettempdir()
+    with swallow("a snapshot directory that cannot be listed is left alone"):
+        for name in os.listdir(base):
+            path = os.path.join(base, name)
+            if not name.startswith(_SNAPSHOT_PREFIX) or os.path.islink(path):
+                continue
+            with swallow("another process may expire it first"):
+                if time.time() - os.stat(path).st_mtime > SNAPSHOT_KEEP_S:
+                    shutil.rmtree(path)
+
+
+async def upload_files(session, selector: str, paths) -> str:
+    """Attach local files to a file input, through its file chooser."""
+    named = uploadable(paths)
+    page = session.page()
+    target = await _on_selector(session, selector, "upload",
+                                lambda: page.eval_on_selector(selector, _FILE_INPUT_JS))
+    names = ", ".join(os.path.basename(f) for f in named)
+    if len(named) > 1 and target["file"] and not target["multiple"]:
+        raise RuntimeError(f"{selector} takes one file; upload them one at a time")
+    files = snapshot_files(named)
+
+    if target["file"] and not target["shown"]:
+        if len(files) > 1 and not target["multiple"]:
+            raise RuntimeError(f"{selector} takes one file; upload them one at a time")
+        await _on_selector(session, selector, "upload",
+                           lambda: page.set_input_files(selector, files, timeout=15_000))
+        how = "the input is hidden, so given them directly, as its chooser does"
+        held = await _held(page.eval_on_selector(selector, _FILE_NAMES_JS))
+    else:
+        try:
+            async with page.expect_file_chooser(timeout=CHOOSER_MS) as chosen:
+                await _on_selector(session, selector, "click",
+                                   lambda: page.click(selector, timeout=15_000))
+            chooser = await chosen.value
+        except Exception as exc:
+            if "Timeout" not in type(exc).__name__ and "imeout" not in str(exc):
+                raise
+            raise RuntimeError(
+                f"clicking {selector} opened no file chooser. Give the selector of "
+                "the <input type=file>, or of the button or label that opens it "
+                "(browser_snapshot lists both).") from None
+        if len(files) > 1 and not chooser.is_multiple():
+            raise RuntimeError(
+                f"the chooser {selector} opened takes one file; nothing was "
+                "attached. Upload them one at a time")
+        await chooser.set_files(files, timeout=15_000)
+        how = "picked in the file chooser"
+        held = await _held(chooser.element.evaluate(_FILE_NAMES_JS))
+
+    said = f"attached {len(files)} file{'s' if len(files) != 1 else ''} to {selector} ({how}): {names}"
+    want = [os.path.basename(f) for f in files]
+    if held is None or held == want:
+        return said
+    if not held:
+        return said + ("; the input is empty again, which is what a page that "
+                       "uploads on change and then resets the input does - check "
+                       "the page for the files")
+    return said + f"; the input now holds: {', '.join(held)}"
+
+
+async def _held(read):
+    """What the input holds after the upload, or None when it cannot be read
+    (a page that replaced the input once it had the files)."""
+    with swallow("an input the page replaced after taking the files"):
+        return await read
+    return None
 
 
 async def press_key(session, key: str) -> str:
