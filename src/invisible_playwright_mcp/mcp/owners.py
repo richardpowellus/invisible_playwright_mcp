@@ -10,10 +10,11 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import tempfile
 import time
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -37,11 +38,34 @@ _HANDLE = re.compile(r"bh_[A-Za-z0-9_-]{43}")
 IDENTITY_ERROR = "Owner mode requires a valid mcpd/identity sessionId."
 HANDLE_ERROR = "Invalid or revoked browser fill handle."
 MAX_ENDED_SESSIONS = 4096
+EXIT_CLOSE_SECONDS = 3.0
 _delegated_call: ContextVar[bool] = ContextVar("browser_fill_delegated", default=False)
 
 
 class CapacityExhausted(RuntimeError):
     pass
+
+
+async def _close_all(*calls: Awaitable[None]) -> None:
+    results = await asyncio.gather(*calls, return_exceptions=True)
+    errors = []
+    for result in results:
+        # gather returns CancelledError as a value; it is NOT an Exception.
+        if isinstance(result, asyncio.CancelledError):
+            error = RuntimeError("Browser close was cancelled")
+            error.__cause__ = result
+            errors.append(error)
+        elif isinstance(result, Exception):
+            errors.append(result)
+    if errors:
+        raise ExceptionGroup("Could not close all owner browsers", errors)
+
+
+def _remove_directory(directory: Path) -> None:
+    if directory.is_symlink():
+        directory.unlink()
+    elif directory.exists():
+        shutil.rmtree(directory)
 
 
 def owner_id(meta: dict) -> str:
@@ -142,10 +166,7 @@ class OwnerWork(Work):
             except actions.UploadDirectoryError:
                 raise actions.UploadDirectoryError(
                     "Cannot remove the upload directory: its staging root is unavailable.") from None
-            if self.upload_dir.is_symlink():
-                self.upload_dir.unlink()
-            elif self.upload_dir.exists():
-                shutil.rmtree(self.upload_dir)
+            _remove_directory(self.upload_dir)
             self.upload_dir = None
 
     async def _upload_files(self, session, selector: str, paths) -> str:
@@ -203,7 +224,7 @@ class OwnerWork(Work):
         directory = self.profiles.get(role)
         if directory is not None:
             # Only directories made by this Work are eligible for removal.
-            shutil.rmtree(directory)
+            _remove_directory(directory)
             self.profiles.pop(role)
             await self.registry.capacity.release()
         self.dead.discard(role)
@@ -224,14 +245,7 @@ class OwnerWork(Work):
             await self._drop(role)
 
     async def close_all(self) -> None:
-        errors = []
-        for role in set(self._open) | set(self.profiles):
-            try:
-                await self._drop(role)
-            except Exception as exc:
-                errors.append(exc)
-        if errors:
-            raise ExceptionGroup("Could not close all owner browsers", errors)
+        await _close_all(*(self._drop(role) for role in set(self._open) | set(self.profiles)))
 
     async def status(self, role: str) -> str:
         result = await super().status(role)
@@ -284,6 +298,35 @@ class Owners:
         return cls(limit=int(os.environ.get("STEALTHFOX_MAX_BROWSERS", "2")),
                    idle_seconds=float(os.environ.get("STEALTHFOX_OWNER_IDLE_SECONDS", "900")),
                    engine=engine)
+
+    def remove_stale_dirs(self) -> None:
+        # One owner-mode child per mcpd share group exclusively uses these
+        # roots. Do not share TMPDIR or the first upload root with another child.
+        if self.entries:
+            raise RuntimeError("Stale owner cleanup must run before accepting calls.")
+        if not hasattr(os, "getuid"):
+            logger.warning("Stale owner cleanup unavailable: cannot verify filesystem UID")
+            return
+        roots = actions.upload_dirs({
+            actions.UPLOAD_DIRS_ENV: os.pathsep.join(self.upload_roots)})
+        locations = [(Path(tempfile.gettempdir()).resolve(), "stealthfox-owner-")]
+        if roots:
+            locations.append((Path(roots[0]), "owner-"))
+        count = 0
+        for root, prefix in locations:
+            for directory in root.iterdir():
+                if not directory.name.startswith(prefix):
+                    continue
+                try:
+                    info = directory.lstat()
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+                    continue
+                # rmtree checks the directory again and does not traverse links.
+                shutil.rmtree(directory)
+                count += 1
+        logger.info("Removed %d stale owner directories at startup", count)
 
     @staticmethod
     def handle_hash(handle: str) -> bytes:
@@ -395,9 +438,28 @@ class Owners:
 
     async def close_all(self) -> None:
         self.stopping.set()
-        results = await asyncio.gather(
-            *(self.session_ended(identity) for identity in list(self.entries)),
-            return_exceptions=True)
-        errors = [result for result in results if isinstance(result, Exception)]
+        errors = []
+        try:
+            # Leave time for filesystem cleanup inside mcpd's five-second grace.
+            async with asyncio.timeout(EXIT_CLOSE_SECONDS):
+                await _close_all(*(self.session_ended(identity) for identity in list(self.entries)))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            # Process exit cannot leave credentials on disk just because the
+            # engine close failed, was cancelled, or never answered. Normal
+            # session/idle closes still retain profiles until close succeeds.
+            for entry in self.entries.values():
+                entry.work.revoke()
+                for directory in entry.work.profiles.values():
+                    try:
+                        _remove_directory(directory)
+                    except OSError as exc:
+                        errors.append(exc)
+                try:
+                    entry.work.remove_upload_dir()
+                except (OSError, actions.UploadDirectoryError) as exc:
+                    errors.append(exc)
         if errors:
-            raise ExceptionGroup("Could not close all browser owners", errors)
+            logger.error("Owner browser shutdown failed; attempted remaining directory cleanup")
+            raise ExceptionGroup("Owner browser shutdown failed", errors)

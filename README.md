@@ -142,6 +142,9 @@ For uploads, configure `INVISIBLE_MCP_UPLOAD_DIRS` and copy files into the priva
 `upload dir` reported by `browser_open`/`browser_status`, not into the shared
 root. It survives browser reopen and is removed when the owner ends. Upload
 roots containing the profile temporary directory are refused at startup.
+Use exclusive temporary and staging roots for this shared child. On startup,
+owner mode removes stale owner directories belonging to its Unix UID, without
+following symlinks, to recover files left by a forced termination.
 
 The owner's `browser_open` and `browser_status` disclose a generation-bound
 **fill handle** for `main`, for delegation to a trusted credential filler.

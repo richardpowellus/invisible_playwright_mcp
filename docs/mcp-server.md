@@ -207,8 +207,21 @@ adapter uses the SDK's decoded stdio stream and registered notification
 handler because the SDK's standard client-notification union otherwise drops
 extension methods. The idle backstop checks at most every 30 seconds; active
 calls are not interrupted. Successful delegated calls also refresh the target's
-activity. Stdio EOF and, on Unix, SIGTERM close every owner before the event
-loop exits. Forced termination (such as SIGKILL) cannot run cleanup.
+activity. The last session's departure can stop the child without a
+`session_ended` notification. Stdio EOF and, on Unix, SIGTERM close all owners
+on the original event loop. Graceful owner closes have a three-second budget
+inside mcpd's five-second shutdown grace; profile and upload cleanup is attempted
+even when a close fails, is cancelled, or times out. Those failures are logged
+and cause an unsuccessful exit, not a silently successful close.
+
+Forced termination (such as SIGKILL) cannot run cleanup. Before accepting calls,
+owner mode removes stale `stealthfox-owner-*` directories directly under
+`tempfile.gettempdir()` and `owner-*` directories directly under the **first**
+upload root. Only directories owned by the current Unix UID are eligible;
+symlinks are not followed, other roots are untouched, and the removal count is
+logged. Cleanup errors refuse startup. Platforms without Unix UID checks skip
+this sweep with a warning. These roots must be exclusive to this owner-mode
+child (one shared mcpd worker per share group), not shared with other workers.
 
 Idle cleanup also removes empty owner records once no calls hold or wait for
 their lock; a later call from the same session creates a fresh record. Ended

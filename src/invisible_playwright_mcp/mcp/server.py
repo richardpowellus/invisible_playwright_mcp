@@ -139,6 +139,7 @@ class BrowserMCP(FastMCP):
         if owners is None:
             return await super().run_stdio_async()
         redact_sdk_logs()
+        owners.remove_stale_dirs()
         async with shutdown_on_sigterm(), owner_stdio() as (read, write):
             async with notifications(read, self._mcp_server) as filtered:
                 await self._mcp_server.run(
@@ -180,8 +181,13 @@ async def _lifespan(_server):
         if registry is not None and idle is not None:
             with anyio.CancelScope(shield=True):
                 registry.stopping.set()
-                await idle
-                await registry.close_all()
+                idle.cancel()
+                try:
+                    await idle
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    await registry.close_all()
         if _close_on_lifespan_exit:
             # The download too: a client that closes the server in its first
             # minute kills a download in flight, and abandoning it here is
