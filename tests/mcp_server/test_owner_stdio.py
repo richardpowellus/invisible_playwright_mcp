@@ -74,10 +74,13 @@ server.main()
             return "\n".join(item["text"] for item in result["content"] if item["type"] == "text")
 
         try:
-            await send("initialize", {
+            init = await send("initialize", {
                 "protocolVersion": "2024-11-05", "capabilities": {},
                 "clientInfo": {"name": "owner-isolation-test", "version": "1"},
             })
+            # A credential filler trusts this, never tool output, as proof
+            # that callers are isolated.
+            assert init["capabilities"]["experimental"]["stealthfox/owner-isolation"] == {"version": 1}
             await send("notifications/initialized", notification=True)
             missing = await call(None, "browser_open", meta={})
             assert missing["isError"]
@@ -89,7 +92,8 @@ server.main()
             assert json.loads(text(await call("B", "browser_list")))["browsers"] == []
             assert (await call("B", "browser_status"))["isError"]
             delegated = await call("B", "browser_status", meta={**identity("B"), HANDLE_KEY: handle})
-            assert not delegated["isError"] and handle in text(delegated)
+            assert not delegated["isError"]
+            assert text(delegated).rstrip().splitlines()[-1] == "fill handle: " + handle
             malformed = await send("tools/call", {
                 "name": "browser_status", "arguments": 123,
                 "_meta": {**identity("B"), HANDLE_KEY: handle},

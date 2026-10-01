@@ -59,6 +59,11 @@ from ..engine import Engine
 from ..quiet import swallow
 from .work import DEFAULT_BROWSER_ID, Work
 from .owners import CapacityExhausted, IDENTITY_ERROR, Owners
+
+#: Announced in initialize only in owner mode. A credential filler requires it
+#: before typing: tool output can carry caller-chosen text (a profile path, a
+#: page title), so it cannot prove the server isolates callers; this can.
+OWNER_CAPABILITY = "stealthfox/owner-isolation"
 from .owner_transport import (
     SessionEnded, notifications, owner_stdio, redact_sdk_logs, shutdown_on_sigterm,
 )
@@ -137,7 +142,8 @@ class BrowserMCP(FastMCP):
         async with shutdown_on_sigterm(), owner_stdio() as (read, write):
             async with notifications(read, self._mcp_server) as filtered:
                 await self._mcp_server.run(
-                    filtered, write, self._mcp_server.create_initialization_options())
+                    filtered, write, self._mcp_server.create_initialization_options(
+                        experimental_capabilities={OWNER_CAPABILITY: {"version": 1}}))
 
 
 #: Set by main(). Over stdio the SDK enters the lifespan once per process, so
