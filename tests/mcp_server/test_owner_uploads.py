@@ -443,3 +443,42 @@ async def test_lifespan_interrupts_stalled_idle_reap_before_exit_cleanup(owners,
                 await entered.wait()
     assert not directory.exists()
     session.close = close
+
+
+def _sweep(directory):
+    """What browser-uploads-expire did on 2026-10-01: delete it outright."""
+    for path in sorted(directory.rglob("*"), reverse=True):
+        path.rmdir() if path.is_dir() and not path.is_symlink() else path.unlink()
+    directory.rmdir()
+
+
+async def test_browser_open_survives_its_instance_directory_being_swept(owners):
+    # 2026-10-01 23:09: an hourly staging cleanup deleted the live child's
+    # empty stealthfox-proc-* directory, and every later browser_open failed
+    # with ENOENT making an owner dir inside it.
+    first = upload_dir(await call("A", "browser_open"))
+    _sweep(first.parent)
+    success(await call("A", "browser_close"))
+    reopened = upload_dir(await call("A", "browser_open"))
+    assert reopened.is_dir() and reopened.stat().st_mode & 0o777 == 0o700
+    assert reopened.parent != first.parent and (reopened.parent / ".lock").is_file()
+    fresh = upload_dir(await call("B", "browser_open"))
+    assert fresh.parent == reopened.parent
+    file = reopened / "statement.pdf"
+    file.write_bytes(b"statement")
+    success(await upload("A", file))
+
+
+async def test_a_new_caller_opens_after_the_instance_was_swept(owners):
+    gone = upload_dir(await call("A", "browser_open")).parent
+    _sweep(gone)
+    fresh = upload_dir(await call("B", "browser_open"))
+    assert fresh.is_dir() and fresh.parent != gone
+
+
+async def test_an_owner_dir_swept_alone_is_recreated(owners):
+    first = upload_dir(await call("A", "browser_open"))
+    first.rmdir()
+    success(await call("A", "browser_close"))
+    reopened = upload_dir(await call("A", "browser_open"))
+    assert reopened.is_dir() and reopened.parent == first.parent

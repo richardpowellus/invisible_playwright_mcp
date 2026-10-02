@@ -143,6 +143,11 @@ class OwnerWork(Work):
                 "uploads are off: the configured staging root is unavailable.") from None
         if not roots:
             return
+        if self.upload_dir is not None and not os.path.lexists(self.upload_dir):
+            # Removed from outside (its instance swept by a cleanup): allocate
+            # a new private directory. A path that still exists but was
+            # REPLACED is not reallocated; _upload_env refuses it below.
+            self.upload_dir = None
         if self.upload_dir is None:
             directory = self.registry.instances.directory(Path(roots[0])) / (
                 "owner-" + secrets.token_urlsafe(24))
@@ -195,6 +200,11 @@ class OwnerWork(Work):
                 "downloads are off: the configured download root is unavailable.") from None
         if not roots:
             return
+        if self.download_dir is not None and not os.path.lexists(self.download_dir):
+            # Removed from outside (its instance swept by a cleanup): allocate
+            # a new private directory. A path that still exists but was
+            # REPLACED is not reallocated; _download_env refuses it below.
+            self.download_dir = None
         if self.download_dir is None:
             directory = self.registry.instances.directory(Path(roots[0])) / (
                 "owner-" + secrets.token_urlsafe(24))
