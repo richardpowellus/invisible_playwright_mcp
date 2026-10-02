@@ -23,6 +23,7 @@ from .owners import HANDLE_KEY, owner_id
 
 SESSION_ENDED = "notifications/mcpd/session_ended"
 HARD_EXIT_SECONDS = 3.5
+HARD_EXIT_CLEANUP_SECONDS = 1.0
 
 
 class ExitWatchdog:
@@ -66,13 +67,30 @@ class ExitWatchdog:
         # Async timeouts cannot interrupt synchronous engine process reaping.
         # A to_thread close would use loop-bound objects from the wrong loop
         # and default-executor shutdown would still wait for blocked threads.
-        os.write(2, b"Owner browser shutdown exceeded deadline; removing instances and exiting\n")
+        # Neither a broken or full stderr pipe nor a cleanup stuck behind the
+        # instances lock may keep the process alive: cleanup runs on its own
+        # daemon thread with a bounded join, and exit follows unconditionally.
+        # Anything left is removed by the next start's sweep once this
+        # process's instance locks are released by its death.
         try:
-            self.registry.instances.close()
-        except Exception:
-            traceback.print_exc()
+            cleanup = threading.Thread(target=self._last_cleanup, name="owner-exit-cleanup",
+                                       daemon=True)
+            cleanup.start()
+            cleanup.join(HARD_EXIT_CLEANUP_SECONDS)
         finally:
             os._exit(1)
+
+    def _last_cleanup(self) -> None:
+        # The diagnostic is written here, inside the bounded join, so a full
+        # stderr pipe cannot hold the exit and a broken one cannot skip it.
+        try:
+            os.write(2, b"Owner browser shutdown exceeded deadline; removing instances and exiting\n")
+        except BaseException:
+            pass
+        try:
+            self.registry.instances.close()
+        except BaseException:
+            pass
 
     def finish(self) -> None:
         self.done.set()

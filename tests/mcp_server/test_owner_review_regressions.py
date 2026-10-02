@@ -146,3 +146,33 @@ def test_mkdir_cannot_follow_an_ancestor_swapped_between_components(roots, monke
         pass
     assert swapped
     assert not (victim / "nested").exists(), "mkdir followed a swapped ancestor into owner A"
+
+
+def test_exit_watchdog_exits_when_cleanup_blocks_and_stderr_is_closed(monkeypatch):
+    """The hard deadline must not wait on cleanup or on writing a diagnostic."""
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    from invisible_playwright_mcp.mcp import owner_transport
+
+    exited = threading.Event()
+    release = threading.Event()
+
+    def stuck_close():
+        release.wait(30)
+
+    monkeypatch.setattr(owner_transport, "HARD_EXIT_SECONDS", 0.05)
+    monkeypatch.setattr(owner_transport, "HARD_EXIT_CLEANUP_SECONDS", 0.2)
+    monkeypatch.setattr(owner_transport.os, "_exit", lambda code: exited.set())
+    monkeypatch.setattr(owner_transport.os, "write", lambda *a: (_ for _ in ()).throw(BrokenPipeError()))
+    watchdog = object.__new__(owner_transport.ExitWatchdog)
+    watchdog.registry = SimpleNamespace(instances=SimpleNamespace(close=stuck_close))
+    watchdog.done = threading.Event()
+    start = time.monotonic()
+    threading.Thread(target=watchdog._wait, daemon=True).start()
+    try:
+        assert exited.wait(2), "watchdog never exited while cleanup was blocked"
+        assert time.monotonic() - start < 1.0
+    finally:
+        release.set()
