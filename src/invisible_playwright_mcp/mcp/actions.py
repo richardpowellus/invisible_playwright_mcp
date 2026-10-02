@@ -1282,6 +1282,28 @@ def download_target(save_to=None, env=None) -> str:
             f"({os.pathsep.join(dirs)})")
     _no_hidden(save_to, named, home)
     rel = os.path.relpath(named, home)
+    if os.name == "posix" or env is not None:
+        with _download_directory(home, {DOWNLOAD_DIRS_ENV: os.pathsep.join(dirs)}) as root_fd:
+            fd = os.dup(root_fd)
+            try:
+                for part in ([] if rel == "." else rel.split(os.sep)):
+                    try:
+                        os.mkdir(part, 0o700, dir_fd=fd)
+                    except FileExistsError:
+                        pass
+                    try:
+                        child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                        dir_fd=fd)
+                    except OSError as exc:
+                        raise PermissionError(
+                            "Download destination component is not a plain directory") from exc
+                    os.close(fd)
+                    fd = child
+            finally:
+                os.close(fd)
+        if os.path.realpath(named) != named:
+            raise PermissionError("Download destination changed during creation")
+        return named
     here = home
     for part in ([] if rel == "." else rel.split(os.sep)):
         here = os.path.join(here, part)

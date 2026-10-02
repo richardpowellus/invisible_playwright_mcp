@@ -65,8 +65,8 @@ async def owners(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "owners", registry)
     yield registry
     await registry.close_all()
-    assert not list(roots[0].glob("owner-*"))
-    assert not list(roots[2].glob("stealthfox-owner-*"))
+    assert not list(roots[0].glob("stealthfox-proc-*"))
+    assert not list(roots[2].glob("stealthfox-proc-*"))
 
 
 def download_dir(result):
@@ -119,7 +119,8 @@ async def test_download_directory_lifetime_preferences_and_handle_disclosure(own
     opened = await call("A", "browser_open")
     directory = download_dir(opened)
     secret = handle(opened)
-    assert directory.parent == Path(owners.download_roots[0])
+    assert directory.parent.parent == Path(owners.download_roots[0])
+    assert directory.parent.name.startswith("stealthfox-proc-")
     assert re.fullmatch(r"owner-[A-Za-z0-9_-]{32}", directory.name)
     assert directory.stat().st_mode & 0o777 == 0o700
     session = owners.entries["A"].work.session("main")
@@ -281,31 +282,34 @@ def test_download_roots_fail_closed_at_startup(owners, monkeypatch, tmp_path, ki
 @pytest.mark.skipif(not hasattr(os, "getuid"), reason="Unix UID checks")
 def test_startup_sweeps_only_owned_direct_download_directories(owners, monkeypatch, caplog):
     root = Path(owners.download_roots[0])
-    stale, foreign, target = root / "owner-stale", root / "owner-foreign", root / "keep"
+    stale, foreign, target = root / "stealthfox-proc-stale", root / "stealthfox-proc-foreign", root / "keep"
     other = Path(owners.download_roots[1]) / "owner-other"
     for directory in (stale, foreign, target, other, target / "owner-nested"):
         directory.mkdir()
+    for directory in (stale, foreign):
+        (directory / ".lock").touch(mode=0o600)
     (target / "keep.pdf").write_bytes(b"keep")
-    link = root / "owner-link"
+    link = root / "stealthfox-proc-link"
     link.symlink_to(target, target_is_directory=True)
     (stale / "link").symlink_to(target, target_is_directory=True)
-    lstat = Path.lstat
+    original_stat = os.stat
 
-    def other_uid(path):
-        result = lstat(path)
-        if path == foreign:
+    def other_uid(path, **kwargs):
+        result = original_stat(path, **kwargs)
+        if str(path) == foreign.name:
             values = list(result)
             values[4] += 1
             return os.stat_result(values)
         return result
 
-    monkeypatch.setattr(Path, "lstat", other_uid)
+    monkeypatch.setattr(os, "stat", other_uid)
     with caplog.at_level(logging.INFO):
         owners.remove_stale_dirs()
     assert not stale.exists() and foreign.exists() and other.exists()
     assert link.is_symlink() and (target / "keep.pdf").read_bytes() == b"keep"
     assert (target / "owner-nested").exists()
-    assert "Removed 1 stale owner directories" in caplog.text
+    assert "Removed 1 stale owner instances" in caplog.text
+    (foreign / ".lock").unlink()
     foreign.rmdir()
     link.unlink()
 

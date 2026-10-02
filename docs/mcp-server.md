@@ -180,8 +180,8 @@ Every tool, including list, status and watch, selects only that owner's
 `main`/`support`. Each browser is a separate Firefox launch. Owner calls are
 serialized, while different owners may run concurrently.
 
-Profiles are newly created private directories (mode `0700`) and are removed
-after close. Saved sessions and `STEALTHFOX_PROFILE_DIR` are not read or written
+Profiles are newly created private directories (mode `0700`) inside a locked
+process-instance directory and are removed after close. Saved sessions and `STEALTHFOX_PROFILE_DIR` are not read or written
 in this mode. Supplying `profile` (even `""`) is refused; leave it out.
 `browser_navigate` refuses `file:` URLs. Reopening creates a fresh profile:
 the persistence descriptions elsewhere on this page apply to non-owner mode.
@@ -210,19 +210,30 @@ extension methods. The idle backstop checks at most every 30 seconds; active
 calls are not interrupted. Successful delegated calls also refresh the target's
 activity. The last session's departure can stop the child without a
 `session_ended` notification. Stdio EOF and, on Unix, SIGTERM close all owners
-on the original event loop. Graceful owner closes have a three-second budget
-inside mcpd's five-second shutdown grace; profile and upload cleanup is attempted
-even when a close fails, is cancelled, or times out. Those failures are logged
-and cause an unsuccessful exit, not a silently successful close.
+on the original event loop. The idle-task join is limited to 0.1 seconds and
+graceful owner closes to three seconds. An independent daemon-thread watchdog
+observes stdin hangup without consuming protocol bytes, and a synchronous
+SIGTERM handler arms the same deadline. At 3.5 seconds it removes this process's
+instances and forces exit code 1, even if engine process reaping is blocking the
+event loop or executor shutdown. It stays armed until the event loop has exited.
+This deliberately avoids closing loop-bound engine objects from another thread.
+mcpd still terminates the browser process group within its five-second grace.
+Failures are reported, never a silently successful close.
 
 Forced termination (such as SIGKILL) cannot run cleanup. Before accepting calls,
-owner mode removes stale `stealthfox-owner-*` directories directly under
-`tempfile.gettempdir()` and `owner-*` directories directly under the **first**
-upload and download roots. Only directories owned by the current Unix UID are eligible;
-symlinks are not followed, other roots are untouched, and the removal count is
-logged. Cleanup errors refuse startup. Platforms without Unix UID checks skip
-this sweep with a warning. These roots must be exclusive to this owner-mode
-child (one shared mcpd worker per share group), not shared with other workers.
+owner mode sweeps `stealthfox-proc-*` directories directly under
+`tempfile.gettempdir()` and the **first** upload and download roots. Each
+process creates one `0700` instance under each distinct root and holds an
+exclusive `flock` on its `.lock` file until cleanup or process death. A
+`.stealthfox-instances-<uid>.lock` in each root serializes publication with sweeps.
+Only same-UID instances whose lock can be acquired non-blocking are removed;
+symlinks are never followed. A replacement child therefore cannot delete its
+still-live predecessor's files, even if replacement initialization fails.
+
+Legacy flat `stealthfox-owner-*`/`owner-*` directories and instances with no
+verifiable lock are retained and counted in the log: their liveness cannot be
+proved. Cleanup errors refuse startup. Owner mode requires POSIX descriptor
+operations and locks; non-owner mode is unchanged.
 
 Idle cleanup also removes empty owner records once no calls hold or wait for
 their lock; a later call from the same session creates a fresh record. Ended
@@ -230,7 +241,8 @@ session tombstones retain only the latest 4096 identities, oldest evicted.
 mcpd does not route calls for ended sessions, so this cache is defence in depth.
 
 **Owner-scoped uploads.** On an owner's first browser launch, the server creates
-`<first upload root>/owner-<32 random URL-safe characters>/` with mode `0700`.
+`<first upload root>/stealthfox-proc-<instance>/owner-<32 random URL-safe characters>/`
+with mode `0700`.
 `browser_open` and ordinary `browser_status` report `upload dir: <path>`.
 Copy documents into that directory before calling `browser_upload_files`.
 Neither another owner's directory nor a file directly in a shared staging root
@@ -252,8 +264,9 @@ upload roots configured, browsing still works but uploads are off. These
 owner-only restrictions do not change non-owner mode's shared-root behavior.
 
 **Owner-scoped downloads.** On the first browser launch, the owner gets a
-`0700` directory named `owner-<32 random URL-safe characters>` under the first
-`INVISIBLE_MCP_DOWNLOAD_DIRS` root. Open/status report `download dir: <path>`
+`0700` directory named `owner-<32 random URL-safe characters>` inside its
+process instance under the first `INVISIBLE_MCP_DOWNLOAD_DIRS` root.
+Open/status report `download dir: <path>`
 before the final fill-handle line; handle-delegated status never reports it,
 and `browser_download` is not a fill-handle tool.
 
@@ -263,7 +276,10 @@ and reads only that owner's incoming files and saves only inside that owner's
 download directory. `save_to` can select a non-hidden subdirectory there, not
 another owner or a shared root. Directory descriptors and file descriptors
 are checked against the owner boundary after page awaits as well as before the
-click; directory links are refused.
+click; directory links are refused. Missing destination components are
+created with `mkdir(..., dir_fd=...)` and opened with `O_DIRECTORY|O_NOFOLLOW`
+relative to the validated parent descriptor, so a swapped ancestor cannot
+create directories in another owner's tree before the final check.
 
 Closing/reopening a browser removes its temporary incoming files, not the
 owner's saved files. Session end, idle removal, and process exit remove the

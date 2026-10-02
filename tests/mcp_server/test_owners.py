@@ -69,7 +69,7 @@ async def owners(monkeypatch, tmp_path):
     yield registry
     await registry.close_all()
     assert registry.capacity.used == 0
-    assert not list(tmp_path.glob("stealthfox-owner-*"))
+    assert not list(tmp_path.glob("stealthfox-proc-*"))
 
 
 async def test_a_b_negative_isolation(owners):

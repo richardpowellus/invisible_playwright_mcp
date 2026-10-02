@@ -5,8 +5,10 @@ import asyncio
 import logging
 import os
 import re
+import select
 import signal
 import sys
+import threading
 import traceback
 from contextlib import asynccontextmanager
 from typing import Literal
@@ -20,6 +22,64 @@ from pydantic import ValidationError
 from .owners import HANDLE_KEY, owner_id
 
 SESSION_ENDED = "notifications/mcpd/session_ended"
+HARD_EXIT_SECONDS = 3.5
+
+
+class ExitWatchdog:
+    """Last-resort process exit, independent of the browser's asyncio loop."""
+
+    def __init__(self, registry) -> None:
+        self.registry = registry
+        self.loop = asyncio.get_running_loop()
+        self.done = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.input_thread: threading.Thread | None = None
+        self.lock = threading.RLock()
+
+    def arm(self) -> None:
+        with self.lock:
+            if self.thread is not None:
+                return
+            self.loop.call_soon_threadsafe(self.registry.stopping.set)
+            self.thread = threading.Thread(target=self._wait, name="owner-exit-watchdog", daemon=True)
+            self.thread.start()
+
+    def watch_stdin(self) -> None:
+        # Observe hangup without reading or parsing any protocol bytes. This
+        # still runs if an idle browser close has blocked the asyncio thread.
+        fd = sys.stdin.fileno()
+
+        def watch():
+            poll = select.poll()
+            poll.register(fd, select.POLLHUP | select.POLLERR)
+            while not self.done.is_set():
+                if poll.poll(50):
+                    self.arm()
+                    return
+
+        self.input_thread = threading.Thread(target=watch, name="owner-stdin-watchdog", daemon=True)
+        self.input_thread.start()
+
+    def _wait(self) -> None:
+        if self.done.wait(HARD_EXIT_SECONDS):
+            return
+        # Async timeouts cannot interrupt synchronous engine process reaping.
+        # A to_thread close would use loop-bound objects from the wrong loop
+        # and default-executor shutdown would still wait for blocked threads.
+        os.write(2, b"Owner browser shutdown exceeded deadline; removing instances and exiting\n")
+        try:
+            self.registry.instances.close()
+        except Exception:
+            traceback.print_exc()
+        finally:
+            os._exit(1)
+
+    def finish(self) -> None:
+        self.done.set()
+        if self.input_thread is not None:
+            self.input_thread.join()
+        if self.thread is not None:
+            self.thread.join()
 
 
 class SessionEndedParams(types.NotificationParams):
@@ -55,35 +115,40 @@ def redact_sdk_logs() -> None:
 
 
 @asynccontextmanager
-async def shutdown_on_sigterm():
+async def shutdown_on_sigterm(on_shutdown=lambda: None):
     if os.name == "nt":
         yield
         return
     async with anyio.create_task_group() as tasks:
-        with anyio.open_signal_receiver(signal.SIGTERM) as signals:
-            async def stop():
-                async for _ in signals:
-                    tasks.cancel_scope.cancel()
-                    return
+        def stop(signum, frame):
+            # A Python signal handler can arm the independent deadline while
+            # synchronous teardown is blocking the event loop.
+            on_shutdown()
+            tasks.cancel_scope.cancel()
 
-            tasks.start_soon(stop)
-            try:
-                yield
-            finally:
-                tasks.cancel_scope.cancel()
+        previous = signal.signal(signal.SIGTERM, stop)
+        try:
+            yield
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+            tasks.cancel_scope.cancel()
 
 
 class _PipeInput(anyio.AsyncFile[str]):
-    def __init__(self, reader: asyncio.StreamReader) -> None:
+    def __init__(self, reader: asyncio.StreamReader, on_shutdown) -> None:
         super().__init__(sys.stdin)
         self.reader = reader
+        self.on_shutdown = on_shutdown
 
     async def readline(self) -> str:
-        return (await self.reader.readline()).decode("utf-8", errors="replace")
+        line = await self.reader.readline()
+        if not line:
+            self.on_shutdown()
+        return line.decode("utf-8", errors="replace")
 
 
 @asynccontextmanager
-async def owner_stdio():
+async def owner_stdio(on_shutdown=lambda: None):
     if os.name == "nt":
         async with stdio_server() as streams:
             yield streams
@@ -95,7 +160,7 @@ async def owner_stdio():
     transport, _ = await asyncio.get_running_loop().connect_read_pipe(
         lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
     try:
-        async with stdio_server(stdin=_PipeInput(reader)) as streams:
+        async with stdio_server(stdin=_PipeInput(reader, on_shutdown)) as streams:
             yield streams
     finally:
         transport.close()

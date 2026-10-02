@@ -10,7 +10,6 @@ import os
 import re
 import secrets
 import shutil
-import stat
 import tempfile
 import time
 from collections import OrderedDict
@@ -25,6 +24,7 @@ import anyio
 
 from . import DEFAULT_BROWSER_ID, GONE, actions
 from .session import StealthSession
+from .owner_instances import Instances
 from .work import Work
 from ..engine import Engine
 
@@ -144,7 +144,8 @@ class OwnerWork(Work):
         if not roots:
             return
         if self.upload_dir is None:
-            directory = Path(roots[0]) / ("owner-" + secrets.token_urlsafe(24))
+            directory = self.registry.instances.directory(Path(roots[0])) / (
+                "owner-" + secrets.token_urlsafe(24))
             directory.mkdir(mode=0o700)
             self.upload_dir = directory
             directory.chmod(0o700)
@@ -163,6 +164,9 @@ class OwnerWork(Work):
 
     def remove_upload_dir(self) -> None:
         if self.upload_dir is not None:
+            if not os.path.lexists(self.upload_dir):
+                self.upload_dir = None
+                return
             # Never traverse a replaced staging root or follow a directory link.
             try:
                 actions.upload_dirs({actions.UPLOAD_DIRS_ENV: str(self.upload_dir.parent)})
@@ -192,7 +196,8 @@ class OwnerWork(Work):
         if not roots:
             return
         if self.download_dir is None:
-            directory = Path(roots[0]) / ("owner-" + secrets.token_urlsafe(24))
+            directory = self.registry.instances.directory(Path(roots[0])) / (
+                "owner-" + secrets.token_urlsafe(24))
             directory.mkdir(mode=0o700)
             self.download_dir = directory
             directory.chmod(0o700)
@@ -211,6 +216,9 @@ class OwnerWork(Work):
 
     def remove_download_dir(self) -> None:
         if self.download_dir is not None:
+            if not os.path.lexists(self.download_dir):
+                self.download_dir = None
+                return
             try:
                 actions.download_dirs({actions.DOWNLOAD_DIRS_ENV: str(self.download_dir.parent)})
             except actions.DownloadDirectoryError:
@@ -251,7 +259,9 @@ class OwnerWork(Work):
     async def _start(self, role: str, settings: dict) -> StealthSession:
         await self.registry.capacity.reserve()
         try:
-            directory = Path(tempfile.mkdtemp(prefix="stealthfox-owner-"))
+            directory = Path(tempfile.mkdtemp(
+                prefix="stealthfox-owner-",
+                dir=self.registry.instances.directory(Path(tempfile.gettempdir()).resolve())))
         except BaseException:
             await self.registry.capacity.release()
             raise
@@ -362,6 +372,7 @@ class Owners:
         self.handles: dict[bytes, OwnerWork] = {}
         self.ended: OrderedDict[str, None] = OrderedDict()
         self.stopping = asyncio.Event()
+        self.instances = Instances()
 
     @classmethod
     def from_env(cls, *, engine: Engine | None = None) -> Owners | None:
@@ -375,37 +386,22 @@ class Owners:
                    engine=engine)
 
     def remove_stale_dirs(self) -> None:
-        # One owner-mode child per mcpd share group exclusively uses these
-        # roots. Do not share TMPDIR or the first file roots with another child.
+        # Hot reload initializes the candidate BEFORE stopping the old worker.
+        # Locks, not prefixes or PIDs, prove that a generation can be removed.
         if self.entries:
             raise RuntimeError("Stale owner cleanup must run before accepting calls.")
-        if not hasattr(os, "getuid"):
-            logger.warning("Stale owner cleanup unavailable: cannot verify filesystem UID")
-            return
         roots = actions.upload_dirs({
             actions.UPLOAD_DIRS_ENV: os.pathsep.join(self.upload_roots)})
-        locations = [(Path(tempfile.gettempdir()).resolve(), "stealthfox-owner-")]
+        locations = [Path(tempfile.gettempdir()).resolve()]
         if roots:
-            locations.append((Path(roots[0]), "owner-"))
+            locations.append(Path(roots[0]))
         downloads = actions.download_dirs({
             actions.DOWNLOAD_DIRS_ENV: os.pathsep.join(self.download_roots)})
-        if downloads and (Path(downloads[0]), "owner-") not in locations:
-            locations.append((Path(downloads[0]), "owner-"))
-        count = 0
-        for root, prefix in locations:
-            for directory in root.iterdir():
-                if not directory.name.startswith(prefix):
-                    continue
-                try:
-                    info = directory.lstat()
-                except FileNotFoundError:
-                    continue
-                if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
-                    continue
-                # rmtree checks the directory again and does not traverse links.
-                shutil.rmtree(directory)
-                count += 1
-        logger.info("Removed %d stale owner directories at startup", count)
+        if downloads:
+            locations.append(Path(downloads[0]))
+        self.instances.sweep(locations)
+        for root in locations:
+            self.instances.directory(root)
 
     @staticmethod
     def handle_hash(handle: str) -> bytes:
@@ -541,6 +537,10 @@ class Owners:
                 except (OSError, actions.UploadDirectoryError, actions.DownloadDirectoryError,
                         ExceptionGroup) as exc:
                     errors.append(exc)
+            try:
+                self.instances.close()
+            except ExceptionGroup as exc:
+                errors.append(exc)
         if errors:
             logger.error("Owner browser shutdown failed; attempted remaining directory cleanup")
             raise ExceptionGroup("Owner browser shutdown failed", errors)

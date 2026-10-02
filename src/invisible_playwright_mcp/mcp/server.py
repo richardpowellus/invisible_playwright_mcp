@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import logging
 import os
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
@@ -65,7 +66,7 @@ from .owners import CapacityExhausted, IDENTITY_ERROR, Owners
 #: page title), so it cannot prove the server isolates callers; this can.
 OWNER_CAPABILITY = "stealthfox/owner-isolation"
 from .owner_transport import (
-    SessionEnded, notifications, owner_stdio, redact_sdk_logs, shutdown_on_sigterm,
+    ExitWatchdog, SessionEnded, notifications, owner_stdio, redact_sdk_logs, shutdown_on_sigterm,
 )
 # Reached by tests as `server.<name>`; the tools themselves no longer
 # read them, because the piece of work answers with them.
@@ -116,6 +117,18 @@ def _work() -> Work:
 
 
 class BrowserMCP(FastMCP):
+    _owner_exit_watchdog: ExitWatchdog | None = None
+
+    def run(self, transport: Literal["stdio", "sse", "streamable-http"] = "stdio",
+            mount_path: str | None = None) -> None:
+        try:
+            super().run(transport, mount_path)
+        finally:
+            # Keep the deadline armed through event-loop and executor shutdown.
+            if self._owner_exit_watchdog is not None:
+                self._owner_exit_watchdog.finish()
+                self._owner_exit_watchdog = None
+
     async def call_tool(self, name: str, arguments: dict[str, Any]
                         ) -> Sequence[ContentBlock] | dict[str, Any]:
         if owners is None:
@@ -140,11 +153,17 @@ class BrowserMCP(FastMCP):
             return await super().run_stdio_async()
         redact_sdk_logs()
         owners.remove_stale_dirs()
-        async with shutdown_on_sigterm(), owner_stdio() as (read, write):
-            async with notifications(read, self._mcp_server) as filtered:
-                await self._mcp_server.run(
-                    filtered, write, self._mcp_server.create_initialization_options(
-                        experimental_capabilities={OWNER_CAPABILITY: {"version": 1}}))
+        watchdog = ExitWatchdog(owners)
+        self._owner_exit_watchdog = watchdog
+        watchdog.watch_stdin()
+        try:
+            async with shutdown_on_sigterm(watchdog.arm), owner_stdio(watchdog.arm) as (read, write):
+                async with notifications(read, self._mcp_server) as filtered:
+                    await self._mcp_server.run(
+                        filtered, write, self._mcp_server.create_initialization_options(
+                            experimental_capabilities={OWNER_CAPABILITY: {"version": 1}}))
+        finally:
+            owners.instances.close()
 
 
 #: Set by main(). Over stdio the SDK enters the lifespan once per process, so
@@ -183,9 +202,12 @@ async def _lifespan(_server):
                 registry.stopping.set()
                 idle.cancel()
                 try:
-                    await idle
+                    async with asyncio.timeout(0.1):
+                        await asyncio.shield(idle)
                 except asyncio.CancelledError:
                     pass
+                except TimeoutError:
+                    logging.getLogger(__name__).error("Idle owner cleanup exceeded shutdown deadline")
                 finally:
                     await registry.close_all()
         if _close_on_lifespan_exit:

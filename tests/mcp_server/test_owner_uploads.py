@@ -41,9 +41,9 @@ async def owners(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "owners", registry)
     yield registry
     await registry.close_all()
-    assert not list(staging.glob("owner-*"))
+    assert not list(staging.glob("stealthfox-proc-*"))
     assert not list(second.glob("owner-*"))
-    assert not list(profiles.glob("stealthfox-owner-*"))
+    assert not list(profiles.glob("stealthfox-proc-*"))
 
 
 def upload_dir(result):
@@ -61,7 +61,8 @@ async def test_owner_upload_dir_is_private_and_persists_across_browser_reopen(ow
     assert not list(Path(owners.upload_roots[0]).iterdir())
     opened = await call("A", "browser_open")
     directory = upload_dir(opened)
-    assert directory.parent == Path(owners.upload_roots[0])
+    assert directory.parent.parent == Path(owners.upload_roots[0])
+    assert directory.parent.name.startswith("stealthfox-proc-")
     assert re.fullmatch(r"owner-[A-Za-z0-9_-]{32}", directory.name)
     assert directory.stat().st_mode & 0o777 == 0o700
     assert success(opened).splitlines()[-1] == "fill handle: " + handle(opened)
@@ -324,7 +325,7 @@ async def test_non_owner_uploads_still_accept_shared_staging_files(owners, monke
 def test_startup_removes_only_direct_owned_directories_without_following_links(owners, tmp_path, caplog):
     profiles = Path(tempfile.gettempdir())
     uploads = Path(owners.upload_roots[0])
-    stale = [profiles / "stealthfox-owner-old", uploads / "owner-old"]
+    stale = [profiles / "stealthfox-proc-old", uploads / "stealthfox-proc-old"]
     keep = [
         profiles / "ordinary", uploads / "ordinary",
         Path(owners.upload_roots[1]) / "owner-other-root",
@@ -335,7 +336,9 @@ def test_startup_removes_only_direct_owned_directories_without_following_links(o
     for directory in stale + keep:
         directory.mkdir()
         (directory / "keep").write_text("private")
-    links = [profiles / "stealthfox-owner-link", uploads / "owner-link"]
+    for directory in stale:
+        (directory / ".lock").touch(mode=0o600)
+    links = [profiles / "stealthfox-proc-link", uploads / "stealthfox-proc-link"]
     for link in links:
         link.symlink_to(tmp_path / "outside", target_is_directory=True)
     for directory in stale:
@@ -349,7 +352,7 @@ def test_startup_removes_only_direct_owned_directories_without_following_links(o
     assert all((directory / "keep").read_text() == "private" for directory in keep)
     assert all(link.is_symlink() for link in links)
     assert all(file.read_text() == "not a directory" for file in files)
-    assert "Removed 2 stale owner directories at startup" in caplog.text
+    assert "Removed 2 stale owner instances at startup" in caplog.text
     # These intentionally preserved names are not resources of the registry.
     for path in links + files:
         path.unlink()
@@ -358,32 +361,33 @@ def test_startup_removes_only_direct_owned_directories_without_following_links(o
 
 
 @pytest.mark.skipif(not hasattr(os, "getuid"), reason="Unix filesystem ownership")
-def test_startup_preserves_directories_owned_by_another_uid(owners, monkeypatch, caplog):
+def test_startup_preserves_legacy_directories(owners, caplog):
     profiles = Path(tempfile.gettempdir())
     directories = [profiles / "stealthfox-owner-other", Path(owners.upload_roots[0]) / "owner-other"]
     for directory in directories:
         directory.mkdir()
-    monkeypatch.setattr(os, "getuid", lambda: directories[0].stat().st_uid + 1)
     with caplog.at_level(logging.INFO):
         owners.remove_stale_dirs()
     assert all(directory.is_dir() for directory in directories)
-    assert "Removed 0 stale owner directories at startup" in caplog.text
+    assert "Removed 0 stale owner instances at startup; retained 2 legacy" in caplog.text
     for directory in directories:
         directory.rmdir()
 
 
 @pytest.mark.skipif(not hasattr(os, "getuid"), reason="Unix filesystem ownership")
 def test_startup_cleanup_failure_is_not_silently_ignored(owners, monkeypatch):
-    directory = Path(tempfile.gettempdir()) / "stealthfox-owner-old"
+    directory = Path(tempfile.gettempdir()) / "stealthfox-proc-old"
     directory.mkdir()
+    (directory / ".lock").touch(mode=0o600)
 
-    def refused(path):
+    def refused(path, **kwargs):
         raise PermissionError("cannot delete stale credentials")
 
     with monkeypatch.context() as patch:
         patch.setattr("invisible_playwright_mcp.mcp.owners.shutil.rmtree", refused)
         with pytest.raises(PermissionError, match="stale credentials"):
             owners.remove_stale_dirs()
+    (directory / ".lock").unlink()
     directory.rmdir()
 
 
