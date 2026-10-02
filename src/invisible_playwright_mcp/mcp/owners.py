@@ -13,7 +13,7 @@ import shutil
 import tempfile
 import time
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -24,6 +24,7 @@ import anyio
 
 from . import DEFAULT_BROWSER_ID, GONE, actions
 from .session import StealthSession
+from .owner_instances import Instances
 from .work import Work
 from ..engine import Engine
 
@@ -37,11 +38,34 @@ _HANDLE = re.compile(r"bh_[A-Za-z0-9_-]{43}")
 IDENTITY_ERROR = "Owner mode requires a valid mcpd/identity sessionId."
 HANDLE_ERROR = "Invalid or revoked browser fill handle."
 MAX_ENDED_SESSIONS = 4096
+EXIT_CLOSE_SECONDS = 3.0
 _delegated_call: ContextVar[bool] = ContextVar("browser_fill_delegated", default=False)
 
 
 class CapacityExhausted(RuntimeError):
     pass
+
+
+async def _close_all(*calls: Awaitable[None]) -> None:
+    results = await asyncio.gather(*calls, return_exceptions=True)
+    errors = []
+    for result in results:
+        # gather returns CancelledError as a value; it is NOT an Exception.
+        if isinstance(result, asyncio.CancelledError):
+            error = RuntimeError("Browser close was cancelled")
+            error.__cause__ = result
+            errors.append(error)
+        elif isinstance(result, Exception):
+            errors.append(result)
+    if errors:
+        raise ExceptionGroup("Could not close all owner browsers", errors)
+
+
+def _remove_directory(directory: Path) -> None:
+    if directory.is_symlink():
+        directory.unlink()
+    elif directory.exists():
+        shutil.rmtree(directory)
 
 
 def owner_id(meta: dict) -> str:
@@ -84,6 +108,7 @@ class OwnerWork(Work):
         self.dead: set[str] = set()
         self.fill_handle: str | None = None
         self.upload_dir: Path | None = None
+        self.download_dir: Path | None = None
 
     def remembered(self) -> None:
         return None
@@ -100,6 +125,8 @@ class OwnerWork(Work):
         result = await super().open(role, seed=seed, proxy=proxy, profile="")
         if self.upload_dir is not None:
             result += "\nupload dir: " + str(self.upload_dir)
+        if self.download_dir is not None:
+            result += "\ndownload dir: " + str(self.download_dir)
         if role == DEFAULT_BROWSER_ID and role in self._open:
             if self.fill_handle is None:
                 self.fill_handle = "bh_" + secrets.token_urlsafe(32)
@@ -117,7 +144,8 @@ class OwnerWork(Work):
         if not roots:
             return
         if self.upload_dir is None:
-            directory = Path(roots[0]) / ("owner-" + secrets.token_urlsafe(24))
+            directory = self.registry.instances.directory(Path(roots[0])) / (
+                "owner-" + secrets.token_urlsafe(24))
             directory.mkdir(mode=0o700)
             self.upload_dir = directory
             directory.chmod(0o700)
@@ -136,16 +164,16 @@ class OwnerWork(Work):
 
     def remove_upload_dir(self) -> None:
         if self.upload_dir is not None:
+            if not os.path.lexists(self.upload_dir):
+                self.upload_dir = None
+                return
             # Never traverse a replaced staging root or follow a directory link.
             try:
                 actions.upload_dirs({actions.UPLOAD_DIRS_ENV: str(self.upload_dir.parent)})
             except actions.UploadDirectoryError:
                 raise actions.UploadDirectoryError(
                     "Cannot remove the upload directory: its staging root is unavailable.") from None
-            if self.upload_dir.is_symlink():
-                self.upload_dir.unlink()
-            elif self.upload_dir.exists():
-                shutil.rmtree(self.upload_dir)
+            _remove_directory(self.upload_dir)
             self.upload_dir = None
 
     async def _upload_files(self, session, selector: str, paths) -> str:
@@ -158,15 +186,82 @@ class OwnerWork(Work):
             raise PermissionError(
                 "Upload refused. Copy the file into your upload dir: %s" % self.upload_dir) from None
 
+    def _ensure_download_dir(self) -> None:
+        try:
+            roots = actions.download_dirs({
+                actions.DOWNLOAD_DIRS_ENV: os.pathsep.join(self.registry.download_roots)})
+        except actions.DownloadDirectoryError:
+            raise actions.DownloadDirectoryError(
+                "downloads are off: the configured download root is unavailable.") from None
+        if not roots:
+            return
+        if self.download_dir is None:
+            directory = self.registry.instances.directory(Path(roots[0])) / (
+                "owner-" + secrets.token_urlsafe(24))
+            directory.mkdir(mode=0o700)
+            self.download_dir = directory
+            directory.chmod(0o700)
+        self._download_env()
+
+    def _download_env(self) -> dict[str, str]:
+        if self.download_dir is None:
+            raise RuntimeError(
+                "downloads are off: no private download directory is configured for this owner.")
+        env = {actions.DOWNLOAD_DIRS_ENV: str(self.download_dir)}
+        try:
+            actions.download_dirs(env)
+        except actions.DownloadDirectoryError:
+            raise RuntimeError("downloads are off: your download directory is unavailable.") from None
+        return env
+
+    def remove_download_dir(self) -> None:
+        if self.download_dir is not None:
+            if not os.path.lexists(self.download_dir):
+                self.download_dir = None
+                return
+            try:
+                actions.download_dirs({actions.DOWNLOAD_DIRS_ENV: str(self.download_dir.parent)})
+            except actions.DownloadDirectoryError:
+                raise actions.DownloadDirectoryError(
+                    "Cannot remove the download directory: its root is unavailable.") from None
+            _remove_directory(self.download_dir)
+            self.download_dir = None
+
+    def remove_file_dirs(self) -> None:
+        errors = []
+        for remove in (self.remove_upload_dir, self.remove_download_dir):
+            try:
+                remove()
+            except (OSError, actions.UploadDirectoryError, actions.DownloadDirectoryError) as exc:
+                errors.append(exc)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise ExceptionGroup("Could not remove owner file directories", errors)
+
+    async def _download(self, session, *args, **kwargs) -> str:
+        env = self._download_env()
+        try:
+            return await actions.download(session, *args, **kwargs, env=env)
+        except actions.DownloadDirectoryError:
+            raise RuntimeError("downloads are off: your download directory is unavailable.") from None
+        except PermissionError:
+            raise PermissionError(
+                "Download refused. Use only your download dir: %s" % self.download_dir) from None
+
     async def _act(self, at: str, fn, *args, **kwargs):
         if fn is actions.upload_files:
             fn = self._upload_files
+        elif fn is actions.download:
+            fn = self._download
         return await super()._act(at, fn, *args, **kwargs)
 
     async def _start(self, role: str, settings: dict) -> StealthSession:
         await self.registry.capacity.reserve()
         try:
-            directory = Path(tempfile.mkdtemp(prefix="stealthfox-owner-"))
+            directory = Path(tempfile.mkdtemp(
+                prefix="stealthfox-owner-",
+                dir=self.registry.instances.directory(Path(tempfile.gettempdir()).resolve())))
         except BaseException:
             await self.registry.capacity.release()
             raise
@@ -174,7 +269,11 @@ class OwnerWork(Work):
         try:
             directory.chmod(0o700)
             self._ensure_upload_dir()
+            self._ensure_download_dir()
             settings["profile_dir"] = str(directory)
+            # Even with browser_download disabled, spontaneous downloads stay
+            # inside this owner's ephemeral profile, never a shared temp pool.
+            settings["download_root"] = str(self.download_dir or directory)
             session = self._factory(**settings)
             # Retain even a failed launch until its close has succeeded.
             self._open[role] = session
@@ -203,7 +302,7 @@ class OwnerWork(Work):
         directory = self.profiles.get(role)
         if directory is not None:
             # Only directories made by this Work are eligible for removal.
-            shutil.rmtree(directory)
+            _remove_directory(directory)
             self.profiles.pop(role)
             await self.registry.capacity.release()
         self.dead.discard(role)
@@ -224,19 +323,14 @@ class OwnerWork(Work):
             await self._drop(role)
 
     async def close_all(self) -> None:
-        errors = []
-        for role in set(self._open) | set(self.profiles):
-            try:
-                await self._drop(role)
-            except Exception as exc:
-                errors.append(exc)
-        if errors:
-            raise ExceptionGroup("Could not close all owner browsers", errors)
+        await _close_all(*(self._drop(role) for role in set(self._open) | set(self.profiles)))
 
     async def status(self, role: str) -> str:
         result = await super().status(role)
         if self.upload_dir is not None and not _delegated_call.get():
             result += "\nupload dir: " + str(self.upload_dir)
+        if self.download_dir is not None and not _delegated_call.get():
+            result += "\ndownload dir: " + str(self.download_dir)
         if role == DEFAULT_BROWSER_ID and self.fill_handle is not None:
             result += "\nfill handle: " + self.fill_handle
         return result
@@ -264,15 +358,21 @@ class Owners:
         self.engine = engine
         self.clock = clock
         self.upload_roots = actions.upload_dirs()
+        self.download_roots = actions.download_dirs()
         profile_root = Path(tempfile.gettempdir()).resolve()
         if any(profile_root.is_relative_to(root) for root in self.upload_roots):
             raise ValueError(
                 "Owner mode refuses upload roots containing the profile temp directory; "
                 "configure a separate upload staging directory.")
+        if any(profile_root.is_relative_to(root) for root in self.download_roots):
+            raise ValueError(
+                "Owner mode refuses download roots containing the profile temp directory; "
+                "configure a separate download directory.")
         self.entries: dict[str, Owner] = {}
         self.handles: dict[bytes, OwnerWork] = {}
         self.ended: OrderedDict[str, None] = OrderedDict()
         self.stopping = asyncio.Event()
+        self.instances = Instances()
 
     @classmethod
     def from_env(cls, *, engine: Engine | None = None) -> Owners | None:
@@ -284,6 +384,24 @@ class Owners:
         return cls(limit=int(os.environ.get("STEALTHFOX_MAX_BROWSERS", "2")),
                    idle_seconds=float(os.environ.get("STEALTHFOX_OWNER_IDLE_SECONDS", "900")),
                    engine=engine)
+
+    def remove_stale_dirs(self) -> None:
+        # Hot reload initializes the candidate BEFORE stopping the old worker.
+        # Locks, not prefixes or PIDs, prove that a generation can be removed.
+        if self.entries:
+            raise RuntimeError("Stale owner cleanup must run before accepting calls.")
+        roots = actions.upload_dirs({
+            actions.UPLOAD_DIRS_ENV: os.pathsep.join(self.upload_roots)})
+        locations = [Path(tempfile.gettempdir()).resolve()]
+        if roots:
+            locations.append(Path(roots[0]))
+        downloads = actions.download_dirs({
+            actions.DOWNLOAD_DIRS_ENV: os.pathsep.join(self.download_roots)})
+        if downloads:
+            locations.append(Path(downloads[0]))
+        self.instances.sweep(locations)
+        for root in locations:
+            self.instances.directory(root)
 
     @staticmethod
     def handle_hash(handle: str) -> bytes:
@@ -355,7 +473,7 @@ class Owners:
         entry.work.revoke()
         async with entry.lock:
             await entry.work.close_all()
-            entry.work.remove_upload_dir()
+            entry.work.remove_file_dirs()
             self.entries.pop(identity, None)
 
     async def reap_idle(self) -> None:
@@ -375,8 +493,9 @@ class Owners:
                     and not entry.work.roles() and not entry.work.profiles
                     and self.entries.get(identity) is entry):
                 try:
-                    entry.work.remove_upload_dir()
-                except (OSError, actions.UploadDirectoryError) as exc:
+                    entry.work.remove_file_dirs()
+                except (OSError, actions.UploadDirectoryError, actions.DownloadDirectoryError,
+                        ExceptionGroup) as exc:
                     errors.append(exc)
                     continue
                 self.entries.pop(identity)
@@ -395,9 +514,33 @@ class Owners:
 
     async def close_all(self) -> None:
         self.stopping.set()
-        results = await asyncio.gather(
-            *(self.session_ended(identity) for identity in list(self.entries)),
-            return_exceptions=True)
-        errors = [result for result in results if isinstance(result, Exception)]
+        errors = []
+        try:
+            # Leave time for filesystem cleanup inside mcpd's five-second grace.
+            async with asyncio.timeout(EXIT_CLOSE_SECONDS):
+                await _close_all(*(self.session_ended(identity) for identity in list(self.entries)))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            # Process exit cannot leave credentials on disk just because the
+            # engine close failed, was cancelled, or never answered. Normal
+            # session/idle closes still retain profiles until close succeeds.
+            for entry in self.entries.values():
+                entry.work.revoke()
+                for directory in entry.work.profiles.values():
+                    try:
+                        _remove_directory(directory)
+                    except OSError as exc:
+                        errors.append(exc)
+                try:
+                    entry.work.remove_file_dirs()
+                except (OSError, actions.UploadDirectoryError, actions.DownloadDirectoryError,
+                        ExceptionGroup) as exc:
+                    errors.append(exc)
+            try:
+                self.instances.close()
+            except ExceptionGroup as exc:
+                errors.append(exc)
         if errors:
-            raise ExceptionGroup("Could not close all browser owners", errors)
+            logger.error("Owner browser shutdown failed; attempted remaining directory cleanup")
+            raise ExceptionGroup("Owner browser shutdown failed", errors)

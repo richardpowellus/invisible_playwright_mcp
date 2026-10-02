@@ -12,6 +12,9 @@ newest live one; that is the whole of it.
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
+import tempfile
 import time
 from typing import Any
 
@@ -21,7 +24,7 @@ from invisible_playwright.async_api import InvisiblePlaywright, TargetClosedErro
 
 
 class StealthSession:
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, *, download_root: str | None = None, **kwargs: Any) -> None:
         # ⛔ NO FALLBACK TO THE ENVIRONMENT. This used to be
         # `kwargs or launch_kwargs(os.environ)`, which made this a THIRD place
         # that decided how a browser is configured, behind the tool arguments
@@ -41,6 +44,9 @@ class StealthSession:
         # The clock a frame's age is read from. An attribute so a test can move
         # time instead of sleeping through STALE_AFTER.
         self._clock = time.monotonic
+        #: Where Firefox saves what this browser downloads; see `downloads`.
+        self.downloads: str | None = None
+        self._download_root = download_root
 
     async def _attach(self, result) -> None:
         """`InvisiblePlaywright.__aenter__()` returns a Browser in ephemeral
@@ -54,8 +60,36 @@ class StealthSession:
             self._context = result
 
     async def start(self) -> None:
-        self._ipw = InvisiblePlaywright(**self._kwargs)
-        await self._attach(await self._ipw.__aenter__())
+        # ⛔ A DOWNLOAD USED TO LAND IN ~/Downloads, AND NOTHING SAID SO. The
+        # engine's Firefox saves through its own download manager - Juggler's
+        # download events never fire in it (measured 2026-10-01: a CSV and a
+        # PDF attachment both went to ~/Downloads and no `download` event came)
+        # - so a statement a site handed over was on disk where no tool looked,
+        # shared with everything else in that directory. Each browser now saves
+        # into a private directory of its own, removed with it, and
+        # browser_download takes the file out of there. These preferences are
+        # the browser's own and are not visible to any page.
+        self.downloads = tempfile.mkdtemp(prefix="invisible-downloads-", dir=self._download_root)
+        kwargs = dict(self._kwargs)
+        kwargs["extra_prefs"] = {**(kwargs.get("extra_prefs") or {}),
+                                 **download_prefs(self.downloads)}
+        try:
+            self._ipw = InvisiblePlaywright(**kwargs)
+            await self._attach(await self._ipw.__aenter__())
+        except BaseException:
+            self._drop_downloads()
+            raise
+
+    def _drop_downloads(self) -> None:
+        if self.downloads:
+            if self._download_root is not None:
+                if os.path.islink(self.downloads):
+                    os.unlink(self.downloads)
+                elif os.path.exists(self.downloads):
+                    shutil.rmtree(self.downloads)
+            else:
+                shutil.rmtree(self.downloads, ignore_errors=True)
+            self.downloads = None
 
     def is_usable(self) -> bool:
         """Whether this object is worth handing out, asked WITHOUT talking to
@@ -251,13 +285,30 @@ class StealthSession:
     # --- the end ----------------------------------------------------------------
 
     async def close(self) -> None:
-        for key in list(self._watch):
-            await self._stop_watch(key)
-        if self._context is not None:
-            with swallow("a context already gone cannot be closed twice"):
-                await self._context.close()
-            self._context = None
-        if self._ipw is not None:
-            await self._ipw.__aexit__(None, None, None)
-            self._ipw = None
-            self._browser = None
+        try:
+            for key in list(self._watch):
+                await self._stop_watch(key)
+            if self._context is not None:
+                with swallow("a context already gone cannot be closed twice"):
+                    await self._context.close()
+                self._context = None
+            if self._ipw is not None:
+                await self._ipw.__aexit__(None, None, None)
+                # A failed engine close must keep its handle for a retry.
+                self._ipw = None
+                self._browser = None
+        finally:
+            self._drop_downloads()
+
+
+def download_prefs(directory: str) -> dict:
+    """Firefox's own download settings, pointed at `directory`: always save
+    there, never ask, and keep the downloads panel shut so it does not cover
+    the page."""
+    return {
+        "browser.download.folderList": 2,
+        "browser.download.dir": os.path.abspath(directory),
+        "browser.download.useDownloadDir": True,
+        "browser.download.always_ask_before_handling_new_types": False,
+        "browser.download.alwaysOpenPanel": False,
+    }

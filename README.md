@@ -142,6 +142,24 @@ For uploads, configure `INVISIBLE_MCP_UPLOAD_DIRS` and copy files into the priva
 `upload dir` reported by `browser_open`/`browser_status`, not into the shared
 root. It survives browser reopen and is removed when the owner ends. Upload
 roots containing the profile temporary directory are refused at startup.
+Owner mode requires POSIX locks. Each process holds a locked `stealthfox-proc-*`
+instance directory under the temporary, first upload, and first download roots;
+all owner directories live inside those instances. Startup removes only
+same-UID instances whose lock can be acquired, so hot-reload generations can
+overlap safely. Legacy flat directories are retained and logged.
+
+For downloads, configure `INVISIBLE_MCP_DOWNLOAD_DIRS`. Each owner gets a
+private `download dir` under its first root; `browser_download` saves only
+there (or a non-hidden subdirectory), never in shared roots or another owner's
+directory. Saved files survive browser reopen and are removed when the owner
+ends. Both directory lines precede the final fill-handle line and are omitted
+from handle-delegated status. Download roots have the same startup restrictions
+and stale-directory cleanup as upload roots.
+
+Shutdown attempts graceful closes for three seconds. An independent watchdog
+observes stdin hangup and SIGTERM even if teardown blocks the event loop; at
+3.5 seconds it removes this process's instances and exits unsuccessfully.
+mcpd remains responsible for terminating the browser process group.
 
 The owner's `browser_open` and `browser_status` disclose a generation-bound
 **fill handle** for `main`, for delegation to a trusted credential filler.

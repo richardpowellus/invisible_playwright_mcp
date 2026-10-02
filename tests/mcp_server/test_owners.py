@@ -60,7 +60,7 @@ def handle(result):
 async def owners(monkeypatch, tmp_path):
     for name in ("STEALTHFOX_SEED", "STEALTHFOX_PROXY", "STEALTHFOX_PROFILE_DIR",
                  "STEALTHFOX_HEADLESS", "STEALTHFOX_BINARY", "STEALTHFOX_NO_PROXY",
-                 actions.UPLOAD_DIRS_ENV):
+                 actions.UPLOAD_DIRS_ENV, actions.DOWNLOAD_DIRS_ENV):
         monkeypatch.delenv(name, raising=False)
     registry = Owners(factory=_Recording)
     monkeypatch.setattr(server, "owners", registry)
@@ -69,7 +69,7 @@ async def owners(monkeypatch, tmp_path):
     yield registry
     await registry.close_all()
     assert registry.capacity.used == 0
-    assert not list(tmp_path.glob("stealthfox-owner-*"))
+    assert not list(tmp_path.glob("stealthfox-proc-*"))
 
 
 async def test_a_b_negative_isolation(owners):

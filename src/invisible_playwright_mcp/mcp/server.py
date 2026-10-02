@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import logging
 import os
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
@@ -65,7 +66,7 @@ from .owners import CapacityExhausted, IDENTITY_ERROR, Owners
 #: page title), so it cannot prove the server isolates callers; this can.
 OWNER_CAPABILITY = "stealthfox/owner-isolation"
 from .owner_transport import (
-    SessionEnded, notifications, owner_stdio, redact_sdk_logs, shutdown_on_sigterm,
+    ExitWatchdog, SessionEnded, notifications, owner_stdio, redact_sdk_logs, shutdown_on_sigterm,
 )
 # Reached by tests as `server.<name>`; the tools themselves no longer
 # read them, because the piece of work answers with them.
@@ -116,6 +117,18 @@ def _work() -> Work:
 
 
 class BrowserMCP(FastMCP):
+    _owner_exit_watchdog: ExitWatchdog | None = None
+
+    def run(self, transport: Literal["stdio", "sse", "streamable-http"] = "stdio",
+            mount_path: str | None = None) -> None:
+        try:
+            super().run(transport, mount_path)
+        finally:
+            # Keep the deadline armed through event-loop and executor shutdown.
+            if self._owner_exit_watchdog is not None:
+                self._owner_exit_watchdog.finish()
+                self._owner_exit_watchdog = None
+
     async def call_tool(self, name: str, arguments: dict[str, Any]
                         ) -> Sequence[ContentBlock] | dict[str, Any]:
         if owners is None:
@@ -139,11 +152,18 @@ class BrowserMCP(FastMCP):
         if owners is None:
             return await super().run_stdio_async()
         redact_sdk_logs()
-        async with shutdown_on_sigterm(), owner_stdio() as (read, write):
-            async with notifications(read, self._mcp_server) as filtered:
-                await self._mcp_server.run(
-                    filtered, write, self._mcp_server.create_initialization_options(
-                        experimental_capabilities={OWNER_CAPABILITY: {"version": 1}}))
+        owners.remove_stale_dirs()
+        watchdog = ExitWatchdog(owners)
+        self._owner_exit_watchdog = watchdog
+        watchdog.watch_stdin()
+        try:
+            async with shutdown_on_sigterm(watchdog.arm), owner_stdio(watchdog.arm) as (read, write):
+                async with notifications(read, self._mcp_server) as filtered:
+                    await self._mcp_server.run(
+                        filtered, write, self._mcp_server.create_initialization_options(
+                            experimental_capabilities={OWNER_CAPABILITY: {"version": 1}}))
+        finally:
+            owners.instances.close()
 
 
 #: Set by main(). Over stdio the SDK enters the lifespan once per process, so
@@ -180,8 +200,16 @@ async def _lifespan(_server):
         if registry is not None and idle is not None:
             with anyio.CancelScope(shield=True):
                 registry.stopping.set()
-                await idle
-                await registry.close_all()
+                idle.cancel()
+                try:
+                    async with asyncio.timeout(0.1):
+                        await asyncio.shield(idle)
+                except asyncio.CancelledError:
+                    pass
+                except TimeoutError:
+                    logging.getLogger(__name__).error("Idle owner cleanup exceeded shutdown deadline")
+                finally:
+                    await registry.close_all()
         if _close_on_lifespan_exit:
             # The download too: a client that closes the server in its first
             # minute kills a download in flight, and abandoning it here is
@@ -226,7 +254,8 @@ through the real pointer and the real keyboard.
 Try things in this order. It matters, because a page can tell the difference.
 
 1. A named tool with a selector: browser_click, browser_type,
-   browser_select_option, browser_press_key, browser_upload_files.
+   browser_select_option, browser_press_key, browser_upload_files,
+   browser_download.
    browser_snapshot gives you the selector for each element - pass it
    verbatim, it is built to be unambiguous.
 
@@ -297,6 +326,7 @@ pass it only to a trusted credential filler. Closing/reopening revokes it.
 The process-wide browser cap includes other sessions; a refusal evicts nobody.
 For uploads, copy files into your private `upload dir` shown by browser_open
 or browser_status. Shared staging roots and other owners' files are refused.
+Downloads use your private `download dir`; save_to must remain inside it.
 
 """
 mcp = BrowserMCP("stealth", instructions=(
@@ -727,6 +757,28 @@ async def browser_upload_files(selector: str, paths: list[str],
     directories are allowed. Never use browser_evaluate to set `files`."""
     return await _work().acting(actions.upload_files, selector, paths, role=browser,
                              exclusive=True)
+
+
+@mcp.tool(annotations=_says("Download a file", destructive=True))
+async def browser_download(selector: str | None = None, x: float | None = None,
+                           y: float | None = None, timeout_seconds: float = 30,
+                           save_to: str | None = None,
+                           browser: Browser = None) -> str:
+    """Click what makes the page hand over a file, and save that file.
+
+    Give the link or button's `selector`, or `x` and `y` from browser_snapshot.
+    The real pointer clicks it; then whichever comes first within
+    `timeout_seconds` is kept: the file the browser downloads, or the document
+    the click shows (a PDF opening in the viewer, in this tab or a new one),
+    taken from what the browser received - not a screenshot. A tab opened
+    only to show the file is closed again.
+
+    Saved under `save_to` (absolute; made if missing), which must lie inside a
+    directory listed in INVISIBLE_MCP_DOWNLOAD_DIRS, or in the first of them.
+    Owner mode instead permits only your reported `download dir`.
+    Never overwrites. Answers JSON: saved, filename, size, mime, sha256, url."""
+    return await _work().acting(actions.download, selector, x, y, timeout_seconds,
+                             save_to, role=browser, exclusive=True)
 
 
 @mcp.tool(annotations=_says("Press a key", destructive=True))

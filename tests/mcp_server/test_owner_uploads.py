@@ -1,5 +1,6 @@
 """Upload staging belongs to a caller, not to the shared child process."""
 import asyncio
+import logging
 import os
 import re
 import tempfile
@@ -26,6 +27,7 @@ class _Uploading(_Recording):
 
 @pytest.fixture
 async def owners(monkeypatch, tmp_path):
+    monkeypatch.delenv(actions.DOWNLOAD_DIRS_ENV, raising=False)
     staging, second, profiles = (
         tmp_path / "staging", tmp_path / "staging-other", tmp_path / "profiles")
     staging.mkdir()
@@ -39,9 +41,9 @@ async def owners(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "owners", registry)
     yield registry
     await registry.close_all()
-    assert not list(staging.glob("owner-*"))
+    assert not list(staging.glob("stealthfox-proc-*"))
     assert not list(second.glob("owner-*"))
-    assert not list(profiles.glob("stealthfox-owner-*"))
+    assert not list(profiles.glob("stealthfox-proc-*"))
 
 
 def upload_dir(result):
@@ -59,7 +61,8 @@ async def test_owner_upload_dir_is_private_and_persists_across_browser_reopen(ow
     assert not list(Path(owners.upload_roots[0]).iterdir())
     opened = await call("A", "browser_open")
     directory = upload_dir(opened)
-    assert directory.parent == Path(owners.upload_roots[0])
+    assert directory.parent.parent == Path(owners.upload_roots[0])
+    assert directory.parent.name.startswith("stealthfox-proc-")
     assert re.fullmatch(r"owner-[A-Za-z0-9_-]{32}", directory.name)
     assert directory.stat().st_mode & 0o777 == 0o700
     assert success(opened).splitlines()[-1] == "fill handle: " + handle(opened)
@@ -316,3 +319,127 @@ async def test_non_owner_uploads_still_accept_shared_staging_files(owners, monke
         success(await upload(None, file, meta={}))
     finally:
         await work.close_all()
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="Unix filesystem ownership")
+def test_startup_removes_only_direct_owned_directories_without_following_links(owners, tmp_path, caplog):
+    profiles = Path(tempfile.gettempdir())
+    uploads = Path(owners.upload_roots[0])
+    stale = [profiles / "stealthfox-proc-old", uploads / "stealthfox-proc-old"]
+    keep = [
+        profiles / "ordinary", uploads / "ordinary",
+        Path(owners.upload_roots[1]) / "owner-other-root",
+        profiles / "ordinary" / "stealthfox-owner-nested",
+        uploads / "ordinary" / "owner-nested",
+        tmp_path / "outside",
+    ]
+    for directory in stale + keep:
+        directory.mkdir()
+        (directory / "keep").write_text("private")
+    for directory in stale:
+        (directory / ".lock").touch(mode=0o600)
+    links = [profiles / "stealthfox-proc-link", uploads / "stealthfox-proc-link"]
+    for link in links:
+        link.symlink_to(tmp_path / "outside", target_is_directory=True)
+    for directory in stale:
+        (directory / "link").symlink_to(tmp_path / "outside", target_is_directory=True)
+    files = [profiles / "stealthfox-owner-file", uploads / "owner-file"]
+    for file in files:
+        file.write_text("not a directory")
+    with caplog.at_level(logging.INFO):
+        owners.remove_stale_dirs()
+    assert not any(directory.exists() for directory in stale)
+    assert all((directory / "keep").read_text() == "private" for directory in keep)
+    assert all(link.is_symlink() for link in links)
+    assert all(file.read_text() == "not a directory" for file in files)
+    assert "Removed 2 stale owner instances at startup" in caplog.text
+    # These intentionally preserved names are not resources of the registry.
+    for path in links + files:
+        path.unlink()
+    (Path(owners.upload_roots[1]) / "owner-other-root" / "keep").unlink()
+    (Path(owners.upload_roots[1]) / "owner-other-root").rmdir()
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="Unix filesystem ownership")
+def test_startup_preserves_legacy_directories(owners, caplog):
+    profiles = Path(tempfile.gettempdir())
+    directories = [profiles / "stealthfox-owner-other", Path(owners.upload_roots[0]) / "owner-other"]
+    for directory in directories:
+        directory.mkdir()
+    with caplog.at_level(logging.INFO):
+        owners.remove_stale_dirs()
+    assert all(directory.is_dir() for directory in directories)
+    assert "Removed 0 stale owner instances at startup; retained 2 legacy" in caplog.text
+    for directory in directories:
+        directory.rmdir()
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="Unix filesystem ownership")
+def test_startup_cleanup_failure_is_not_silently_ignored(owners, monkeypatch):
+    directory = Path(tempfile.gettempdir()) / "stealthfox-proc-old"
+    directory.mkdir()
+    (directory / ".lock").touch(mode=0o600)
+    (directory / "owner-x").mkdir()
+
+    def refused(path, **kwargs):
+        raise PermissionError("cannot delete stale credentials")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("invisible_playwright_mcp.mcp.owners.shutil.rmtree", refused)
+        with pytest.raises(PermissionError, match="stale credentials"):
+            owners.remove_stale_dirs()
+    (directory / "owner-x").rmdir()
+    (directory / ".lock").unlink()
+    directory.rmdir()
+
+
+async def test_stale_cleanup_cannot_run_over_live_owners(owners):
+    directory = upload_dir(await call("A", "browser_open"))
+    with pytest.raises(RuntimeError, match="before accepting calls"):
+        owners.remove_stale_dirs()
+    assert directory.is_dir()
+
+
+async def test_shutdown_cleanup_attempts_all_browsers_after_cancelled_close(owners):
+    directory = upload_dir(await call("A", "browser_open"))
+    success(await call("A", "browser_open", {"browser": "support"}))
+    entry = owners.entries["A"]
+    profiles = list(entry.work.profiles.values())
+    session = entry.work._open["main"]
+    support = entry.work._open["support"]
+    close = session.close
+
+    async def cancelled():
+        raise asyncio.CancelledError("engine close was interrupted")
+
+    session.close = cancelled
+    try:
+        with pytest.raises(ExceptionGroup, match="Owner browser shutdown"):
+            await owners.close_all()
+        assert support.closed
+        assert not directory.exists() and not any(profile.exists() for profile in profiles)
+        assert owners.capacity.used == 1  # an unconfirmed close never releases capacity
+        assert not owners.handles
+    finally:
+        session.close = close
+
+
+async def test_lifespan_interrupts_stalled_idle_reap_before_exit_cleanup(owners, monkeypatch):
+    owners.idle_seconds = 0.01
+    monkeypatch.setattr("invisible_playwright_mcp.mcp.owners.EXIT_CLOSE_SECONDS", 0.05)
+    entered = asyncio.Event()
+
+    async def stalled():
+        entered.set()
+        await asyncio.Event().wait()
+
+    async with asyncio.timeout(2):
+        with pytest.raises(ExceptionGroup, match="Owner browser shutdown"):
+            async with server._lifespan(server.mcp):
+                directory = upload_dir(await call("A", "browser_open"))
+                session = owners.entries["A"].work._open["main"]
+                close = session.close
+                session.close = stalled
+                await entered.wait()
+    assert not directory.exists()
+    session.close = close

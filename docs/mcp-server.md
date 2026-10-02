@@ -158,6 +158,7 @@ between what the browser says it is and where it appears to be.
 | `STEALTHFOX_MAX_BROWSERS` | Owner mode only: positive integer, default `2`, across all callers, including launching and closing browsers. |
 | `STEALTHFOX_OWNER_IDLE_SECONDS` | Owner mode only: positive finite seconds, default `900`, without tool activity before closing an owner's browsers. |
 | `INVISIBLE_MCP_UPLOAD_DIRS` | Upload staging roots: absolute existing canonical directories, separated by `:` (`;` on Windows). Unset disables uploads. In owner mode the first root holds private owner directories; callers cannot upload directly from shared roots. |
+| `INVISIBLE_MCP_DOWNLOAD_DIRS` | Download roots with the same path rules. Unset disables `browser_download`. In owner mode the first root holds private owner download directories; shared roots are not permitted destinations. |
 | `INVISIBLE_MCP_HOME` | Where saved sessions are kept. Defaults to `%APPDATA%/invisible-playwright-mcp` on Windows, `~/Library/Application Support/invisible-playwright-mcp` on macOS and `$XDG_DATA_HOME/invisible-playwright-mcp` on Linux. A directory left by the previous name is moved onto this one the first time the command runs, once, and the move is printed. Set it to put them on another disk. |
 
 Anything a tool call says wins over these. `browser_open` can pick another
@@ -179,8 +180,8 @@ Every tool, including list, status and watch, selects only that owner's
 `main`/`support`. Each browser is a separate Firefox launch. Owner calls are
 serialized, while different owners may run concurrently.
 
-Profiles are newly created private directories (mode `0700`) and are removed
-after close. Saved sessions and `STEALTHFOX_PROFILE_DIR` are not read or written
+Profiles are newly created private directories (mode `0700`) inside a locked
+process-instance directory and are removed after close. Saved sessions and `STEALTHFOX_PROFILE_DIR` are not read or written
 in this mode. Supplying `profile` (even `""`) is refused; leave it out.
 `browser_navigate` refuses `file:` URLs. Reopening creates a fresh profile:
 the persistence descriptions elsewhere on this page apply to non-owner mode.
@@ -207,8 +208,32 @@ adapter uses the SDK's decoded stdio stream and registered notification
 handler because the SDK's standard client-notification union otherwise drops
 extension methods. The idle backstop checks at most every 30 seconds; active
 calls are not interrupted. Successful delegated calls also refresh the target's
-activity. Stdio EOF and, on Unix, SIGTERM close every owner before the event
-loop exits. Forced termination (such as SIGKILL) cannot run cleanup.
+activity. The last session's departure can stop the child without a
+`session_ended` notification. Stdio EOF and, on Unix, SIGTERM close all owners
+on the original event loop. The idle-task join is limited to 0.1 seconds and
+graceful owner closes to three seconds. An independent daemon-thread watchdog
+observes stdin hangup without consuming protocol bytes, and a synchronous
+SIGTERM handler arms the same deadline. At 3.5 seconds it removes this process's
+instances and forces exit code 1, even if engine process reaping is blocking the
+event loop or executor shutdown. It stays armed until the event loop has exited.
+This deliberately avoids closing loop-bound engine objects from another thread.
+mcpd still terminates the browser process group within its five-second grace.
+Failures are reported, never a silently successful close.
+
+Forced termination (such as SIGKILL) cannot run cleanup. Before accepting calls,
+owner mode sweeps `stealthfox-proc-*` directories directly under
+`tempfile.gettempdir()` and the **first** upload and download roots. Each
+process creates one `0700` instance under each distinct root and holds an
+exclusive `flock` on its `.lock` file until cleanup or process death. A
+`.stealthfox-instances-<uid>.lock` in each root serializes publication with sweeps.
+Only same-UID instances whose lock can be acquired non-blocking are removed;
+symlinks are never followed. A replacement child therefore cannot delete its
+still-live predecessor's files, even if replacement initialization fails.
+
+Legacy flat `stealthfox-owner-*`/`owner-*` directories and instances with no
+verifiable lock are retained and counted in the log: their liveness cannot be
+proved. Cleanup errors refuse startup. Owner mode requires POSIX descriptor
+operations and locks; non-owner mode is unchanged.
 
 Idle cleanup also removes empty owner records once no calls hold or wait for
 their lock; a later call from the same session creates a fresh record. Ended
@@ -216,7 +241,8 @@ session tombstones retain only the latest 4096 identities, oldest evicted.
 mcpd does not route calls for ended sessions, so this cache is defence in depth.
 
 **Owner-scoped uploads.** On an owner's first browser launch, the server creates
-`<first upload root>/owner-<32 random URL-safe characters>/` with mode `0700`.
+`<first upload root>/stealthfox-proc-<instance>/owner-<32 random URL-safe characters>/`
+with mode `0700`.
 `browser_open` and ordinary `browser_status` report `upload dir: <path>`.
 Copy documents into that directory before calling `browser_upload_files`.
 Neither another owner's directory nor a file directly in a shared staging root
@@ -236,6 +262,34 @@ of `tempfile.gettempdir()`, which contains browser profiles and upload snapshots
 Use a separate staging directory, never the whole temporary directory. With no
 upload roots configured, browsing still works but uploads are off. These
 owner-only restrictions do not change non-owner mode's shared-root behavior.
+
+**Owner-scoped downloads.** On the first browser launch, the owner gets a
+`0700` directory named `owner-<32 random URL-safe characters>` inside its
+process instance under the first `INVISIBLE_MCP_DOWNLOAD_DIRS` root.
+Open/status report `download dir: <path>`
+before the final fill-handle line; handle-delegated status never reports it,
+and `browser_download` is not a fill-handle tool.
+
+Each browser has its own incoming-download subdirectory inside that owner
+directory, configured through Firefox's download preferences. The tool polls
+and reads only that owner's incoming files and saves only inside that owner's
+download directory. `save_to` can select a non-hidden subdirectory there, not
+another owner or a shared root. Directory descriptors and file descriptors
+are checked against the owner boundary after page awaits as well as before the
+click; directory links are refused. Missing destination components are
+created with `mkdir(..., dir_fd=...)` and opened with `O_DIRECTORY|O_NOFOLLOW`
+relative to the validated parent descriptor, so a swapped ancestor cannot
+create directories in another owner's tree before the final check.
+
+Closing/reopening a browser removes its temporary incoming files, not the
+owner's saved files. Session end, idle removal, and process exit remove the
+owner's entire download directory, including the exit fallback if browser
+close fails. Startup sweeps stale owner download directories as described
+above. Any configured download root containing the profile temporary
+directory is refused. With no download roots configured, the tool is off;
+spontaneous browser downloads remain inside that browser's private ephemeral
+profile and are removed with it. Non-owner mode retains its shared configured
+destinations and per-browser temporary incoming directories.
 
 For credential filling, the owner's `browser_open` and `browser_status` return
 `fill handle: bh_...` for **main only** (32 random bytes, 43 URL-safe base64
@@ -264,7 +318,7 @@ does not change routing and no fill handles are issued.
 `browser_navigate`, `browser_read_text`, `browser_snapshot`, `browser_read_html`,
 `browser_take_screenshot`, `browser_watch`, `browser_click`, `browser_click_at`,
 `browser_type`, `browser_select_option`, `browser_press_key`,
-`browser_upload_files`, `browser_evaluate`.
+`browser_upload_files`, `browser_download`, `browser_evaluate`.
 
 Tool names mirror the Microsoft Playwright MCP, so prompts written for it work
 here too, with one deliberate departure: **there are no tab tools.** Three
@@ -434,6 +488,7 @@ so.
 | `browser_type` | `selector`, `text` | Fills a field, replacing whatever it holds. It sets the value rather than typing key by key, so per-keystroke handlers such as an autocomplete do not fire; for those, click the field and use `browser_press_key`. |
 | `browser_select_option` | `selector`, `value` | Chooses an option in a `<select>`, by its visible label or by its value. |
 | `browser_upload_files` | `selector`, `paths` | Attaches local files to a file input the way a person picks them: the input, or the button or label that opens its chooser, is clicked with the real pointer and the chooser is answered with `paths`. A hidden input is given the files directly, as its chooser would. Off unless `INVISIBLE_MCP_UPLOAD_DIRS` is configured. Files must be regular, non-hidden and at most 50 MB; owner mode permits only that owner's reported `upload dir`, while non-owner mode permits the configured roots. |
+| `browser_download` | `selector`, or `x` and `y`; `timeout_seconds` (default 30); `save_to` | Clicks what makes the page hand over a file and saves that file: the browser's download or the document the click shows, read from the browser's response. A tab opened only to show the file is closed. Off unless `INVISIBLE_MCP_DOWNLOAD_DIRS` is configured. Owner mode saves only under the caller's reported `download dir`; non-owner mode permits the configured roots. `save_to` defaults to the first permitted directory, is created if missing, and nothing is overwritten. Answers JSON with `saved`, `filename`, `size`, `mime`, `sha256` and `url`. Each browser's incoming downloads are private and removed when it closes, rather than saved in `~/Downloads`. |
 | `browser_press_key` | `key` | Presses a key on whatever has focus: `Enter`, `Tab`, `Escape`, `ArrowDown`, `Control+a`, or a single character. |
 | `browser_evaluate` | `expression` | Runs JavaScript to **read** from the page and returns the result as JSON: a computed style, a value held in a framework's state, the length of a list. |
 
