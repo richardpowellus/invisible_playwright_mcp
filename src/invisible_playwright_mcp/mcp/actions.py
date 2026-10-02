@@ -866,17 +866,86 @@ async def type_text(session, selector: str, text: str,
     # selector diagnosis is skipped (it reads page text, which may by then hold
     # the value), the engine's exception is not chained, and the text is
     # removed from the message in case anything upstream echoed it.
+    page = session.page()
+    began = time.monotonic()
+    for tries in range(1, TYPE_ATTEMPTS + 1):
+        await _fill_on_origin(page, selector, text, expect_origin,
+                              expect_input_type, retry=tries > 1)
+        # The engine's write focuses the field and sets its value in one step,
+        # and a page whose model answers the focus writes its stored (empty)
+        # answer over it before the trusted input event arrives: Vuetify on
+        # Bluevine's MFA page, where "typed into" left the field empty and the
+        # button disabled (2026-10-01). By the second write the field already
+        # has focus, so nothing answers it. Every write is origin-locked again,
+        # and the readback is one bit, whether the field is empty: the value
+        # itself, its length or a digest of it is never read.
+        if not text:
+            return f"typed into {selector}"
+        emptied = await _emptied(page, selector, began)
+        if emptied is None:
+            raise RuntimeError(
+                f"{selector} was written with expect_origin but could not be "
+                "read back (it no longer matches a field on this page), so "
+                "whether it kept the value is not known. The write outcome "
+                "is unknown.")
+        if not emptied:
+            return f"typed into {selector}"
+    raise RuntimeError(
+        f"{selector} did not keep the value written with expect_origin: "
+        f"written {TYPE_ATTEMPTS} times, the page emptied it each time. "
+        "The write outcome is unknown.")
+
+
+async def _is_empty(page, selector: str):
+    """Whether the field is empty, or None when it cannot be asked.
+
+    Asked of the first match, as fill writes the first match: a locator would
+    refuse a selector matching two elements that fill had just written into.
+    A target with no value property (a contenteditable) is never empty."""
+    try:
+        return bool(await asyncio.wait_for(page.eval_on_selector(
+            selector, "el => 'value' in el && el.value === ''"), 5))
+    except Exception:
+        return None
+
+
+async def _emptied(page, selector: str, began: float):
+    """True once the page has emptied the field, read until it has stayed
+    filled SETTLE_S after the write and SINCE_FOCUS_S after the call began.
+    None when the field cannot be read back, which proves nothing either way."""
+    loop_end = max(time.monotonic() + SETTLE_S, began + SINCE_FOCUS_S)
+    while True:
+        empty = await _is_empty(page, selector)
+        if empty is None:
+            return None
+        if empty:
+            return True
+        if time.monotonic() >= loop_end:
+            return False
+        await asyncio.sleep(0.1)
+
+
+async def _fill_on_origin(page, selector, text, expect_origin,
+                          expect_input_type, *, retry):
     try:
         kwargs = {"timeout": 15_000, "expect_origin": expect_origin}
         if expect_input_type is not None:
             kwargs["expect_input_type"] = expect_input_type
-        await session.page().fill(selector, text, **kwargs)
+        await page.fill(selector, text, **kwargs)
     except Exception as exc:
         message = str(exc)
-        if "nothing was written" in message:
+        if "nothing was written" in message and not retry:
             raise RuntimeError(
                 "expect_origin refused: the field's page is not on %s or the "
                 "field changed; nothing was written" % expect_origin) from None
+        if "nothing was written" in message:
+            # An earlier write landed and the page emptied it; this one was
+            # refused. That is not "nothing was written" for the call.
+            raise RuntimeError(
+                "expect_origin refused a second write: the field's page is "
+                "no longer on %s or the field changed. The first write landed "
+                "and the page emptied it; the write outcome is unknown."
+                % expect_origin) from None
         safe = "; ".join(p for p in message.split("; ") if "origin" in p or "written" in p)
         safe = (safe or type(exc).__name__)[:300]
         if text:
@@ -884,7 +953,6 @@ async def type_text(session, selector: str, text: str,
         raise RuntimeError(
             "typing with expect_origin=%s failed; the write outcome is unknown: %s"
             % (expect_origin, safe)) from None
-    return f"typed into {selector}"
 
 
 async def select_option(session, selector: str, value: str) -> str:
