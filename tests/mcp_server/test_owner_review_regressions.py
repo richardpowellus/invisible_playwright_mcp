@@ -176,3 +176,39 @@ def test_exit_watchdog_exits_when_cleanup_blocks_and_stderr_is_closed(monkeypatc
         assert time.monotonic() - start < 1.0
     finally:
         release.set()
+
+
+def test_an_instance_whose_deletion_was_interrupted_is_reclaimed_next_start(tmp_path, monkeypatch):
+    """Deletion stopped part-way must leave the lock, so the sweep can prove the owner dead."""
+    import os
+
+    import pytest
+
+    from invisible_playwright_mcp.mcp import owner_instances
+
+    root = tmp_path.resolve()
+    instance = owner_instances.Instance(root)
+    (instance.path / "owner-a").mkdir()
+    (instance.path / "owner-a" / "cookies.sqlite").write_text("x")
+    (instance.path / "owner-b").mkdir()
+
+    real_rmtree = owner_instances.shutil.rmtree
+    calls = []
+
+    def dies_after_one(path, *args, **kwargs):
+        calls.append(path)
+        if len(calls) > 1:
+            raise KeyboardInterrupt("killed mid-deletion")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(owner_instances.shutil, "rmtree", dies_after_one)
+    with pytest.raises(KeyboardInterrupt):
+        instance.close()
+    monkeypatch.setattr(owner_instances.shutil, "rmtree", real_rmtree)
+    assert (instance.path / owner_instances.LOCK).exists(), "lock removed before the payload"
+    # The process dies: the kernel releases its flock.
+    for fd in (instance.lock, instance.directory, instance.parent):
+        os.close(fd)
+
+    owner_instances.Instances().sweep([root])
+    assert not instance.path.exists()

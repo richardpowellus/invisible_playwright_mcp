@@ -379,6 +379,7 @@ def test_startup_cleanup_failure_is_not_silently_ignored(owners, monkeypatch):
     directory = Path(tempfile.gettempdir()) / "stealthfox-proc-old"
     directory.mkdir()
     (directory / ".lock").touch(mode=0o600)
+    (directory / "owner-x").mkdir()
 
     def refused(path, **kwargs):
         raise PermissionError("cannot delete stale credentials")
@@ -387,6 +388,7 @@ def test_startup_cleanup_failure_is_not_silently_ignored(owners, monkeypatch):
         patch.setattr("invisible_playwright_mcp.mcp.owners.shutil.rmtree", refused)
         with pytest.raises(PermissionError, match="stale credentials"):
             owners.remove_stale_dirs()
+    (directory / "owner-x").rmdir()
     (directory / ".lock").unlink()
     directory.rmdir()
 

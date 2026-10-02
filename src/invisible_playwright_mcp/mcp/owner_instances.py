@@ -1,6 +1,7 @@
 """Locked filesystem namespaces for overlapping mcpd worker generations."""
 from __future__ import annotations
 
+import contextlib
 import errno
 import logging
 import os
@@ -55,6 +56,27 @@ def _root(root: Path):
         os.close(fd)
 
 
+def _remove_instance(parent: int, name: str, directory: int) -> None:
+    """Remove an instance with its lock file LAST.
+
+    A deletion interrupted part-way (the exit watchdog's bounded join, a kill)
+    must leave an instance the next start can still prove dead: the sweep
+    reclaims only instances whose .lock it can take, so a payload left behind
+    without its lock would be retained forever as unverifiable.
+    """
+    for entry in os.listdir(directory):
+        if entry == LOCK:
+            continue
+        info = os.stat(entry, dir_fd=directory, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            shutil.rmtree(entry, dir_fd=directory)
+        else:
+            os.unlink(entry, dir_fd=directory)
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(LOCK, dir_fd=directory)
+    os.rmdir(name, dir_fd=parent)
+
+
 def _same_directory(parent: int, name: str, directory: int) -> bool:
     try:
         named = os.stat(name, dir_fd=parent, follow_symlinks=False)
@@ -89,7 +111,7 @@ class Instance:
         if self.closed:
             return
         if _same_directory(self.parent, self.path.name, self.directory):
-            shutil.rmtree(self.path.name, dir_fd=self.parent)
+            _remove_instance(self.parent, self.path.name, self.directory)
         elif os.path.lexists(self.path):
             raise PermissionError("Owner instance directory was replaced; refusing cleanup")
         for fd in (self.lock, self.directory, self.parent):
@@ -164,7 +186,7 @@ class Instances:
                             except BlockingIOError:
                                 continue
                             if _same_directory(parent, name, directory):
-                                shutil.rmtree(name, dir_fd=parent)
+                                _remove_instance(parent, name, directory)
                                 removed += 1
                         finally:
                             os.close(lock)
