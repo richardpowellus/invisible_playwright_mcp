@@ -107,6 +107,24 @@ class Instance:
         self.directory, self.lock = directory, lock
         self.closed = False
 
+    def present(self) -> bool:
+        """Is the directory at self.path still the one this instance created?"""
+        return not self.closed and _same_directory(self.parent, self.path.name, self.directory)
+
+    def retire(self) -> None:
+        """Let go of an instance whose directory was removed or replaced.
+
+        Something outside this process may delete a live instance (on
+        2026-10-01 an hourly staging cleanup removed it as an old empty
+        directory). A replacement in its place is not ours, so it is left
+        alone and only this instance's descriptors are released.
+        """
+        if self.closed:
+            return
+        for fd in (self.lock, self.directory, self.parent):
+            os.close(fd)
+        self.closed = True
+
     def close(self) -> None:
         if self.closed:
             return
@@ -129,9 +147,19 @@ class Instances:
         with self.lock:
             if self.stopping:
                 raise RuntimeError("Owner instances are shutting down")
-            if root not in self.entries:
-                self.entries[root] = Instance(root)
-            return self.entries[root].path
+            current = self.entries.get(root)
+            if current is not None and not current.present():
+                # Swept or replaced underneath a live process. Every owner
+                # directory below it is gone with it, so allocate a fresh
+                # locked instance rather than handing out a path whose parent
+                # no longer exists (ENOENT on the next owner mkdir).
+                logger.warning("Owner instance %s was removed or replaced while in use; "
+                               "allocating a new one", current.path)
+                current.retire()
+                current = None
+            if current is None:
+                current = self.entries[root] = Instance(root)
+            return current.path
 
     def close(self) -> None:
         with self.lock:
