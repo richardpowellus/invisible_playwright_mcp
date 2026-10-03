@@ -121,6 +121,35 @@ async def test_instance_cleanup_never_follows_a_lock_or_directory_symlink(roots,
         await registry.close_all()
 
 
+@pytest.mark.parametrize("explicit_env", [False, True])
+def test_mkdir_cannot_follow_an_ancestor_swapped_between_components(roots, monkeypatch, explicit_env):
+    owner = roots[2] / "owner-b"
+    victim = roots[2] / "owner-a"
+    owner.mkdir()
+    victim.mkdir()
+    ancestor = owner / "first"
+    mkdir = os.mkdir
+    swapped = False
+
+    def swap(path, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if Path(path).name == "nested" and not swapped:
+            swapped = True
+            ancestor.rename(owner / "original")
+            ancestor.symlink_to(victim, target_is_directory=True)
+        return mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "mkdir", swap)
+    monkeypatch.setenv(actions.DOWNLOAD_DIRS_ENV, str(owner))
+    try:
+        actions.download_target(str(ancestor / "nested"),
+                                env={actions.DOWNLOAD_DIRS_ENV: str(owner)} if explicit_env else None)
+    except PermissionError:
+        pass
+    assert swapped
+    assert not (victim / "nested").exists(), "mkdir followed a swapped ancestor into owner A"
+
+
 def test_exit_watchdog_exits_when_cleanup_blocks_and_stderr_is_closed(monkeypatch):
     """The hard deadline must not wait on cleanup or on writing a diagnostic."""
     import threading

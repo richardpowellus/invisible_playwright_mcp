@@ -248,7 +248,7 @@ through the real pointer and the real keyboard.
 Try things in this order. It matters, because a page can tell the difference.
 
 1. A named tool with a selector: browser_click, browser_type,
-   browser_select_option, browser_press_key, browser_upload_files.
+   browser_select_option, browser_press_key, browser_upload_files, browser_download.
    browser_snapshot gives you the selector for each element - pass it
    verbatim, it is built to be unambiguous.
 
@@ -320,7 +320,7 @@ pass it only to a trusted credential filler. Closing/reopening revokes it.
 The process-wide browser cap includes other sessions; a refusal evicts nobody.
 For uploads, copy files into your private `upload dir` shown by browser_open
 or browser_status. Shared staging roots and other owners' files are refused.
-Spontaneous downloads stay in your browser's private landing directory.
+Downloads use your private `download dir`; save_to must remain inside it.
 
 """
 mcp = BrowserMCP("stealth", instructions=(
@@ -752,6 +752,27 @@ async def browser_upload_files(selector: str, paths: list[str],
     listed, uploads are off. Owner mode permits only your reported `upload dir`.
     Never use browser_evaluate to set `files`."""
     return await _work().acting(actions.upload_files, selector, paths, role=browser)
+
+
+@mcp.tool(annotations=_says("Download a file", destructive=True))
+async def browser_download(selector: str | None = None, x: float | None = None,
+                           y: float | None = None, timeout_seconds: float = 30,
+                           save_to: str | None = None,
+                           browser: Browser = None) -> str:
+    """Click a link or button and keep the file it downloads or shows.
+
+    Give `selector`, or `x` and `y` from browser_snapshot. Waits up to
+    `timeout_seconds` for a completed download or a document navigation
+    (including a PDF in a new tab). A fetch or XHR is not a download.
+    A tab opened only for the file is closed again.
+
+    `save_to` is an absolute directory, made if missing, inside
+    INVISIBLE_MCP_DOWNLOAD_DIRS; omitted uses the first root. With no roots,
+    downloads are off. Owner mode permits only your reported `download dir`.
+    Never overwrites. Refuses empty or incomplete files. Answers JSON with
+    saved, filename, size, mime, sha256, url, from and notes."""
+    return await _work().acting(actions.download, selector, x, y, timeout_seconds,
+                                save_to, role=browser)
 
 
 @mcp.tool(annotations=_says("Press a key", destructive=True))

@@ -250,9 +250,21 @@ class OwnerWork(Work):
         if errors:
             raise ExceptionGroup("Could not remove owner file directories", errors)
 
+    async def _download(self, session, *args, **kwargs) -> str:
+        env = self._download_env()
+        try:
+            return await actions.download(session, *args, **kwargs, env=env)
+        except actions.DownloadDirectoryError:
+            raise RuntimeError("downloads are off: your download directory is unavailable.") from None
+        except PermissionError:
+            raise PermissionError(
+                "Download refused. Use only your download dir: %s" % self.download_dir) from None
+
     async def _act(self, at: str, fn, *args, **kwargs):
         if fn is actions.upload_files:
             fn = self._upload_files
+        elif fn is actions.download:
+            fn = self._download
         return await super()._act(at, fn, *args, **kwargs)
 
     async def _start(self, role: str, settings: dict) -> StealthSession:

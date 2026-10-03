@@ -116,6 +116,7 @@ EVERY_TOOL = [
     ("browser_select_option", {"selector": "#s", "value": "a"}),
     ("browser_press_key", {"key": "Enter"}),
     ("browser_upload_files", {"selector": "#f", "paths": [str(Path("a.pdf").resolve())]}),
+    ("browser_download", {"selector": "#download"}),
     ("browser_evaluate", {"expression": "1"}),
     ("browser_status", {}),
 ]

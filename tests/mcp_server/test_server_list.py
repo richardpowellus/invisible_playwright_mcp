@@ -49,7 +49,7 @@ async def test_server_registers_expected_tools():
         # Added 2026-10-01: a file input took nothing any tool could give it,
         # so an upload was the end of the road - or a DataTransfer built in
         # script, which is the untrusted change this package exists to avoid.
-        "browser_upload_files",
+        "browser_upload_files", "browser_download",
     }
     # EXACT, not a subset. `expected <= names` passed while a tool nobody
     # meant to publish sat in the list, and the surface of an MCP server is
