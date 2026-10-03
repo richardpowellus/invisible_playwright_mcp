@@ -44,16 +44,19 @@ def _tools():
 def _reaches(node):
     """Every `work.<attr>` a tool body touches, with the call if it is one."""
     for inner in ast.walk(node):
-        if (isinstance(inner, ast.Attribute) and isinstance(inner.value, ast.Name)
-                and inner.value.id == "work"):
+        if isinstance(inner, ast.Attribute) and _is_work(inner.value):
             yield inner.attr, inner
+
+
+def _is_work(node):
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "_work")
 
 
 def _acting_calls(node):
     for inner in ast.walk(node):
         if (isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute)
-                and isinstance(inner.func.value, ast.Name)
-                and inner.func.value.id == "work" and inner.func.attr in FUNNEL):
+                and _is_work(inner.func.value) and inner.func.attr in FUNNEL):
             yield inner
 
 
@@ -78,6 +81,8 @@ def test_every_tool_that_drives_a_page_goes_through_the_funnel_and_names_its_bro
 
 def test_no_tool_reaches_past_the_funnel():
     for tool in _tools():
+        assert not any(isinstance(n, ast.Name) and n.id == "work" for n in ast.walk(tool)), (
+            f"{tool.name} bypasses the owner selector")
         for attr, _ in _reaches(tool):
             assert attr in ALLOWED, (
                 "%s reaches `work.%s`, which is not one of the doors" % (tool.name, attr))
@@ -92,7 +97,7 @@ def test_the_tools_that_act_on_the_piece_of_work_name_a_browser_too():
             continue
         calls = [c for c in ast.walk(tool)
                  if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
-                 and isinstance(c.func.value, ast.Name) and c.func.value.id == "work"]
+                 and _is_work(c.func.value)]
         assert len(calls) == 1, tool.name
         first = calls[0].args[0]
         assert isinstance(first, ast.BoolOp) and any(

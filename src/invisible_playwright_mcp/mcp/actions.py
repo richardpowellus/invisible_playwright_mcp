@@ -926,6 +926,10 @@ _FILE_INPUT_JS = """el => ({
 _FILE_NAMES_JS = "el => el.files ? Array.from(el.files, f => f.name) : null"
 
 
+class UploadDirectoryError(RuntimeError):
+    pass
+
+
 def upload_dirs(env=None) -> list[str]:
     """The directories named in INVISIBLE_MCP_UPLOAD_DIRS. A relative entry is
     refused rather than resolved against wherever the server started.
@@ -942,14 +946,14 @@ def upload_dirs(env=None) -> list[str]:
         if not entry:
             continue
         if not os.path.isabs(entry):
-            raise RuntimeError(
+            raise UploadDirectoryError(
                 f"{UPLOAD_DIRS_ENV} names {entry!r}, which is not an absolute path")
         named = os.path.normpath(entry)
         real = os.path.realpath(named)
         # Compared as this system compares paths: `c:/tmp` and `C:/tmp` are
         # one directory on Windows, and only a link makes them two.
         if os.path.normcase(real) != os.path.normcase(named) or not os.path.isdir(real):
-            raise RuntimeError(
+            raise UploadDirectoryError(
                 f"{UPLOAD_DIRS_ENV} names {entry!r}, which is not a directory at "
                 f"that exact path (it resolves to {real!r}); uploads are off")
         dirs.append(real)
@@ -1073,7 +1077,7 @@ def _opened_path(fd: int, real: str, st) -> str:
 #: later upload, so a server that closed left them in %TEMP% for good.
 
 
-def snapshot_files(files: list[str], env=None) -> list[str]:
+def snapshot_files(files: list[str], env=None, *, snapshot_root=None) -> list[str]:
     """Private copies of `files`, checked on the open file, not on its name.
 
     ⛔ THE NAME IS NOT THE FILE. `uploadable` resolves and stats a path, and a
@@ -1088,7 +1092,8 @@ def snapshot_files(files: list[str], env=None) -> list[str]:
     """
     dirs = upload_dirs(env)
     _expire_snapshots()
-    root = tempfile.mkdtemp(prefix="%s%d-" % (_SNAPSHOT_PREFIX, os.getpid()))
+    root = tempfile.mkdtemp(prefix="%s%d-" % (_SNAPSHOT_PREFIX, os.getpid()),
+                            dir=snapshot_root)
     try:
         out, total = [], 0
         for i, real in enumerate(files):
@@ -1219,7 +1224,7 @@ async def _open_chooser(session, opener: str):
         waiter.cancel()
 
 
-async def upload_files(session, selector: str, paths) -> str:
+async def upload_files(session, selector: str, paths, *, env=None, snapshot_root=None) -> str:
     """Attach local files to a file input, through its file chooser.
 
     The files are checked before any page is touched, the thing that opens the
@@ -1228,14 +1233,14 @@ async def upload_files(session, selector: str, paths) -> str:
     hesitations, drawn from the same persona its typing uses - and the input is
     read back.
     """
-    named = uploadable(paths)
+    named = uploadable(paths, env=env)
     page = session.page()
     target = await _on_selector(session, selector, "upload",
                                 lambda: page.eval_on_selector(selector, _FILE_INPUT_JS))
     if len(named) > 1 and target["file"] and not target["multiple"]:
         raise RuntimeError(f"{selector} takes one file; upload them one at a time")
     opener = await _opener(page, selector, target)
-    files = snapshot_files(named)
+    files = snapshot_files(named, env=env, snapshot_root=snapshot_root)
     session.keep_until_closed(os.path.dirname(os.path.dirname(files[0])))
     chooser = await _open_chooser(session, opener)
     if len(files) > 1 and not chooser.is_multiple():
@@ -1267,6 +1272,37 @@ async def _held(read):
     with swallow("an input the page replaced after taking the files"):
         return await read
     return None
+
+
+DOWNLOAD_DIRS_ENV = "INVISIBLE_MCP_DOWNLOAD_DIRS"
+
+
+class DownloadDirectoryError(RuntimeError):
+    pass
+
+
+def download_dirs(env=None) -> list[str]:
+    """The directories named in INVISIBLE_MCP_DOWNLOAD_DIRS, held to the same
+    rules as the upload ones: absolute, and each its own real path."""
+    return _named_dirs(DOWNLOAD_DIRS_ENV, "downloads", env, error_type=DownloadDirectoryError)
+
+
+def _named_dirs(var: str, what: str, env=None, *, error_type=RuntimeError) -> list[str]:
+    raw = (os.environ if env is None else env).get(var, "")
+    dirs = []
+    for entry in (e.strip() for e in raw.split(os.pathsep)):
+        if not entry:
+            continue
+        if not os.path.isabs(entry):
+            raise error_type(f"{var} names {entry!r}, which is not an absolute path")
+        named = os.path.normpath(entry)
+        real = os.path.realpath(named)
+        if os.path.normcase(real) != os.path.normcase(named) or not os.path.isdir(real):
+            raise error_type(
+                f"{var} names {entry!r}, which is not a directory at that exact "
+                f"path (it resolves to {real!r}); {what} are off")
+        dirs.append(real)
+    return dirs
 
 
 async def press_key(session, key: str) -> str:

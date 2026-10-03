@@ -12,6 +12,9 @@ newest live one; that is the whole of it.
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
+import tempfile
 import time
 from typing import Any
 
@@ -21,7 +24,7 @@ from invisible_playwright.async_api import InvisiblePlaywright, TargetClosedErro
 
 
 class StealthSession:
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, *, download_root: str | None = None, **kwargs: Any) -> None:
         # ⛔ NO FALLBACK TO THE ENVIRONMENT. This used to be
         # `kwargs or launch_kwargs(os.environ)`, which made this a THIRD place
         # that decided how a browser is configured, behind the tool arguments
@@ -48,6 +51,8 @@ class StealthSession:
         # removed when it closes: Firefox reads a picked file when the page
         # sends it, so they must last exactly as long as the browser does.
         self._kept: list[str] = []
+        self.downloads: str | None = None
+        self._download_root = download_root
 
     @property
     def seed(self):
@@ -74,8 +79,24 @@ class StealthSession:
             self._context = result
 
     async def start(self) -> None:
-        self._ipw = InvisiblePlaywright(**self._kwargs)
-        await self._attach(await self._ipw.__aenter__())
+        self.downloads = tempfile.mkdtemp(prefix="invisible-downloads-", dir=self._download_root)
+        kwargs = dict(self._kwargs)
+        kwargs["extra_prefs"] = {**(kwargs.get("extra_prefs") or {}),
+                                 **download_prefs(self.downloads)}
+        try:
+            self._ipw = InvisiblePlaywright(**kwargs)
+            await self._attach(await self._ipw.__aenter__())
+        except BaseException:
+            self._drop_downloads()
+            raise
+
+    def _drop_downloads(self) -> None:
+        if self.downloads:
+            if os.path.islink(self.downloads):
+                os.unlink(self.downloads)
+            elif os.path.exists(self.downloads):
+                shutil.rmtree(self.downloads)
+            self.downloads = None
 
     def is_usable(self) -> bool:
         """Whether this object is worth handing out, asked WITHOUT talking to
@@ -278,12 +299,12 @@ class StealthSession:
                 await self._context.close()
             self._context = None
         if self._ipw is not None:
-            try:
-                await self._ipw.__aexit__(None, None, None)
-            finally:
-                self._ipw = None
-                self._browser = None
-                self._forget_kept()
+            await self._ipw.__aexit__(None, None, None)
+            # A failed close retains the engine handle and files for a retry.
+            self._ipw = None
+            self._browser = None
+        self._forget_kept()
+        self._drop_downloads()
 
     def _forget_kept(self) -> None:
         """Remove what was kept for the browser, now that nothing can read it."""
@@ -292,3 +313,14 @@ class StealthSession:
         for path in self._kept:
             shutil.rmtree(path, ignore_errors=True)
         self._kept.clear()
+
+
+def download_prefs(directory: str) -> dict:
+    """Keep spontaneous downloads in this browser's private landing area."""
+    return {
+        "browser.download.folderList": 2,
+        "browser.download.dir": os.path.abspath(directory),
+        "browser.download.useDownloadDir": True,
+        "browser.download.always_ask_before_handling_new_types": False,
+        "browser.download.alwaysOpenPanel": False,
+    }
