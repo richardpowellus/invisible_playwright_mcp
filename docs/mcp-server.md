@@ -156,6 +156,10 @@ between what the browser says it is and where it appears to be.
 | `STEALTHFOX_MCP_TRANSPORT` | `http` to serve over streamable HTTP instead of stdio. Default is stdio, which is what MCP clients expect. What else changes when you flip it, including the one thing that changes silently: [local or remote](local-vs-remote-mcp-server.md). |
 | `STEALTHFOX_MCP_HOST` | Bind address for the HTTP transport. Default `127.0.0.1`. |
 | `STEALTHFOX_MCP_PORT` | Port for the HTTP transport. Default `8766`. It used to be `8765`, the invisible_playwright_mcp interface's own default, so running both meant a bind error with nothing to explain it. |
+| `STEALTHFOX_OWNER_MODE` | `mcpd` enables trusted stdio per-caller isolation; unset preserves single-owner behavior. Requires POSIX filesystem locks. |
+| `STEALTHFOX_MAX_BROWSERS` | Owner mode's process-wide browser capacity, including pending launches and closes; default 2. |
+| `STEALTHFOX_OWNER_IDLE_SECONDS` | Idle owner expiry; default 900 seconds. Active background typing is not idle. |
+| `INVISIBLE_MCP_DOWNLOAD_DIRS` | Absolute canonical download roots, separated by the platform path separator. Empty means downloads are off. |
 | `INVISIBLE_MCP_HOME` | Where saved sessions are kept. Defaults to `%APPDATA%/invisible-playwright-mcp` on Windows, `~/Library/Application Support/invisible-playwright-mcp` on macOS and `$XDG_DATA_HOME/invisible-playwright-mcp` on Linux. A directory left by the previous name is moved onto this one the first time the command runs, once, and the move is printed. Set it to put them on another disk. |
 
 Anything a tool call says wins over these. `browser_open` can pick another
@@ -168,7 +172,7 @@ a browser gets when nobody says anything.
 `browser_navigate`, `browser_read_text`, `browser_snapshot`, `browser_read_html`,
 `browser_take_screenshot`, `browser_watch`, `browser_click`, `browser_click_at`,
 `browser_type`, `browser_select_option`, `browser_press_key`,
-`browser_upload_files`, `browser_evaluate`.
+`browser_upload_files`, `browser_download`, `browser_evaluate`.
 
 Tool names mirror the Microsoft Playwright MCP, so prompts written for it work
 here too, with one deliberate departure: **there are no tab tools.** Three
@@ -332,6 +336,27 @@ so.
 
 ### Acting on the page
 
+The fork adds optional `expect_origin` and `expect_input_type` to `browser_type`.
+The companion engine checks these at the instant of writing; an input type
+requires an origin. It writes without keystrokes and reports kept only after a
+read-only equality check remains true. A field emptied by a first-focus model
+render is rewritten at most twice, with both guards checked again on each
+write. A changed nonempty or unreadable value fails without a retry. Success
+is exactly `typed into <selector>`; guarded calls wait for their terminal
+answer and leave ordinary background-typing news for status or the next plain
+action. Plain typing never automatically retries. Credential diagnostics
+contain no field value; a refusal after a previous write never claims that
+the whole call wrote nothing.
+
+`browser_download(selector=..., x=..., y=..., timeout_seconds=30, save_to=...)`
+clicks a selector or a point and saves a completed browser download or document
+navigation. Fetch/XHR responses and other existing tabs are not candidates.
+`save_to` is an absolute directory within a configured root; it is created if
+missing. Names are sanitized, existing files are never overwritten, empty files
+are refused, and size and SHA-256 are verified after flushing. A new tab used
+only for the file is closed. The result is JSON with `saved`, `filename`,
+`size`, `mime`, `sha256`, `url`, `from`, and `notes`.
+
 | Tool | Arguments | What it does |
 |---|---|---|
 | `browser_click` | `selector` | Clicks the first element matching a CSS selector, scrolling it into view and waiting for it to be clickable. The pointer approaches, hovers, presses and releases, the way a hand does. |
@@ -391,6 +416,34 @@ exit unless you give the second its own proxy, and a command that names neither
 goes to `main` even when the focus is elsewhere.
 [Two browsers in one session](two-browsers-in-one-session.md) has the measured
 behaviour and the cases the second one is for.
+
+## Shared mcpd owner mode
+
+Enable `STEALTHFOX_OWNER_MODE=mcpd` only behind trusted mcpd stdio. mcpd supplies
+`_meta["mcpd/identity"]["sessionId"]`; missing identity is refused, not mapped
+to a default owner. Direct HTTP owner mode is refused. Each caller owns an
+ephemeral main/support pair; persistent profile arguments and `file:` navigation
+are refused. The browser cap covers all callers and evicts nobody.
+
+`browser_open` and `browser_status` report private upload/download directories.
+Only files staged in that caller's upload directory may use upstream's chooser
+upload; `save_to` is confined to that caller's download directory. Files survive
+browser reopen, then disappear on owner expiry, session end or process exit.
+
+The main browser's final `fill handle` line is a secret generation-bound
+capability. A trusted filler passes it in `_meta["stealthfox/browser_handle"]`;
+it permits only main's status, reads, type and press-key tools. It cannot open,
+close, navigate, upload or download. Closing/reopening main revokes it; delegated
+status omits both directory paths. Initialize advertises
+`stealthfox/owner-isolation: {"version": 1}`.
+
+`notifications/mcpd/session_ended` closes the named session. Locked
+`stealthfox-proc-*` instance directories separate overlapping worker generations;
+startup sweeps only same-UID instances whose flock can be acquired. Missing
+live instances are replaced on next allocation, never reused. Shutdown allows
+three seconds for graceful closes; an independent watchdog starts cleanup at
+3.5 seconds and exits after at most one additional second, even with blocked
+stderr or cleanup. mcpd must terminate the browser process group.
 
 ## More than one client on the same browser
 

@@ -125,6 +125,68 @@ Passing `--openrouter-key` puts the key in your shell history, and on Linux in
 the process list. `OPENROUTER_API_KEY` in the environment or in a `.env` avoids
 both.
 
+### Shared mcpd process: isolated callers
+
+Set `STEALTHFOX_OWNER_MODE=mcpd` only for a trusted mcpd stdio child. Each
+transport session gets its own `main` and `support`, with separate Firefox
+launches and private ephemeral profiles. Missing owner metadata is refused;
+without this variable the existing single-owner behavior is unchanged.
+
+`STEALTHFOX_MAX_BROWSERS` defaults to **2 across all callers**, including
+launches and closes in progress. A full process refuses opens without evicting
+anyone. `STEALTHFOX_OWNER_IDLE_SECONDS` defaults to **900**; idle browsers,
+ended sessions and process shutdown close their browsers and remove profiles.
+Persistent `profile` arguments and `file:` navigation are refused in this mode.
+
+For uploads, configure `INVISIBLE_MCP_UPLOAD_DIRS` and copy files into the private
+`upload dir` reported by `browser_open`/`browser_status`, not into the shared
+root. It survives browser reopen and is removed when the owner ends. Upload
+roots containing the profile temporary directory are refused at startup.
+Owner mode requires POSIX locks. Each process holds a locked `stealthfox-proc-*`
+instance directory under the temporary, first upload, and first download roots;
+all owner directories live inside those instances. Startup removes only
+same-UID instances whose lock can be acquired, so hot-reload generations can
+overlap safely. Legacy flat directories are retained and logged.
+
+For downloads, configure `INVISIBLE_MCP_DOWNLOAD_DIRS`. Each owner gets a
+private `download dir` under its first root; `browser_download` saves only
+there (or a non-hidden subdirectory), never in shared roots or another owner's
+directory. Saved files survive browser reopen and are removed when the owner
+ends. Both directory lines precede the final fill-handle line and are omitted
+from handle-delegated status. Download roots have the same startup restrictions
+and stale-directory cleanup as upload roots.
+
+Shutdown attempts graceful closes for three seconds. An independent watchdog
+observes stdin hangup and SIGTERM even if teardown blocks the event loop; after
+3.5 seconds it attempts cleanup for at most one more second and exits unsuccessfully.
+mcpd remains responsible for terminating the browser process group.
+
+The owner's `browser_open` and `browser_status` disclose a generation-bound
+**fill handle** for `main`, for delegation to a trusted credential filler.
+Treat it as a secret; closing/reopening revokes it. See
+[owner-mode configuration and the transport trust boundary](docs/mcp-server.md#shared-mcpd-owner-mode).
+
+### Fork-only credential guard and downloads
+
+`browser_type` accepts `expect_origin` and, with it, `expect_input_type`.
+The engine checks both at every write. A first-focus model render can empty a
+credential field; only an observed empty field permits a repeat, up to three
+guarded writes. An unreadable or changed nonempty value fails without retry.
+Success requires a stable equality readback and is exactly `typed into <selector>`,
+never background progress or another typing's news. Plain typing retains
+upstream's no-retry behavior. Credential values never appear in diagnostics.
+This requires the companion fork engine's guard API; the ordinary upstream
+engine cannot perform guarded writes.
+
+`browser_download` clicks a selector or point and keeps a completed file or a
+document navigation, not a page's fetch/XHR. Set `INVISIBLE_MCP_DOWNLOAD_DIRS`
+to absolute canonical directories, separated by the platform's path separator.
+`save_to` is a directory inside those roots (only the caller's private directory
+in owner mode). Empty files and incomplete responses are refused; saved files
+are flushed and their size and SHA-256 read back before success. Firefox's
+randomly named `.part` files keep a landing directory pending until completion.
+Downloads work on Windows and POSIX; owner mode itself requires POSIX locks.
+
 ## The wiki: AI browser-agent guides
 
 The reading room around the agent lives in the
