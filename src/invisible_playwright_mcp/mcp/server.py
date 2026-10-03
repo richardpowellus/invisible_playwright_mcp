@@ -700,15 +700,27 @@ async def browser_click_at(x: float, y: float, hold_seconds: float = 0.0,
 
 
 @mcp.tool(annotations=_says("Type into a field", destructive=True))
-async def browser_type(selector: str, text: str, browser: Browser = None) -> str:
+async def browser_type(selector: str, text: str, browser: Browser = None,
+                       expect_origin: str | None = None,
+                       expect_input_type: str | None = None) -> str:
     """Type into a field, replacing what it holds, key by key at a human pace.
 
     The answer says what the field kept: all of it, a maxlength's cut, the
     page's reformatting, nothing (the page took it out), or one box of a code
     the page spreads over several. Nothing is retyped on its own. Text too long
     to finish within one answer goes on in the background; until it ends,
-    actions on that browser are refused with its progress, and reads work."""
-    return await _work().typing(actions.type_text, selector, text, role=browser)
+    actions on that browser are refused with its progress, and reads work.
+
+    For credentials, expect_origin requires the field's own page to have that
+    origin at the instant of writing. expect_input_type, with expect_origin,
+    also locks the input type. Writes without keystrokes; retries only an
+    observed empty field, at most three writes, guarding each. An unreadable
+    or changed value never reports success. Success is exactly 'typed into
+    <selector>', without background progress or other typing's news."""
+    guard = {key: value for key, value in (
+        ("expect_origin", expect_origin), ("expect_input_type", expect_input_type))
+        if value is not None}
+    return await _work().typing(actions.type_text, selector, text, role=browser, **guard)
 
 
 @mcp.tool(annotations=_says("Choose a dropdown option", destructive=True))

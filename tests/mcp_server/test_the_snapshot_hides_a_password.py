@@ -62,6 +62,7 @@ def test_the_snapshot_carries_the_one_predicate():
 
 @needs_node
 def test_a_filled_password_box_shows_bullets_not_the_value():
+    assert clean.MASKED_PASSWORD == BULLETS == "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"
     assert text_of({"tagName": "INPUT", "type": "password", "value": "hunter2", "innerText": ""}) == BULLETS
 
 
@@ -192,7 +193,10 @@ def test_neither_reader_returns_a_typed_secret(page):
     assert page.get_attribute("#p", "value") == "hunter2", "the page did not mirror the value"
     assert page.get_attribute("#shown", "type") == "text", "the toggle did not show it"
 
-    snap = json.dumps(page.evaluate(actions.SNAPSHOT_JS), ensure_ascii=False)
+    snapshot = page.evaluate(actions.SNAPSHOT_JS)
+    password = next(el for el in snapshot["interactive_elements"] if el["selector"] == "#p")
+    assert password["text"] == BULLETS
+    snap = json.dumps(snapshot, ensure_ascii=False)
     assert "hunter2" not in snap and "hunter3" not in snap
     assert BULLETS in snap
     assert "plainname" in snap

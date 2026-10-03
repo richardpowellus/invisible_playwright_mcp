@@ -21,6 +21,7 @@ import re
 import shutil
 import stat
 import tempfile
+import time
 from typing import Any
 
 from invisible_playwright import hesitation
@@ -788,7 +789,9 @@ def what_the_field_kept(selector: str, text: str, before: dict, after: dict) -> 
     return "typed into %s; the page shows it as %s" % (selector, _shown(value, secret))
 
 
-async def type_text(session, selector: str, text: str) -> str:
+async def type_text(session, selector: str, text: str,
+                    expect_origin: str | None = None,
+                    expect_input_type: str | None = None) -> str:
     """Type into a field the way a person does, and say what the field kept.
 
     The engine's `fill`: focus, the typist's pause (longer while the page is
@@ -814,12 +817,70 @@ async def type_text(session, selector: str, text: str) -> str:
     would outlast a client's patience goes on in the background
     (`Work.typing`), so typing it still finishes.
     """
+    if expect_input_type is not None and expect_origin is None:
+        raise ValueError("expect_input_type is only accepted together with expect_origin")
     page = session.page()
+    if expect_origin is not None:
+        return await _type_on_origin(page, selector, text, expect_origin, expect_input_type)
     before = await _on_selector(session, selector, "typing",
                                 lambda: _field_state(page, selector))
     await _on_selector(session, selector, "typing",
                        lambda: page.fill(selector, text, timeout=ACTION_TIMEOUT_MS))
     return what_the_field_kept(selector, text, before, await _field_state(page, selector))
+
+
+GUARD_SETTLE_S = 0.75
+GUARD_SINCE_START_S = 2.0
+GUARD_ATTEMPTS = 3
+_GUARDED_STATE_JS = """(el, expected) => {
+    if (el.ownerDocument.location.origin !== expected.origin ||
+        !('value' in el)) return null;
+    return {kept: el.value === expected.text, empty: el.value === ''};
+}"""
+
+
+async def _type_on_origin(page, selector, text, expect_origin, expect_input_type) -> str:
+    began = time.monotonic()
+    kwargs = {"timeout": ACTION_TIMEOUT_MS, "expect_origin": expect_origin}
+    if expect_input_type is not None:
+        kwargs["expect_input_type"] = expect_input_type
+    for attempt in range(GUARD_ATTEMPTS):
+        try:
+            await page.fill(selector, text, **kwargs)
+        except Exception as exc:
+            if attempt == 0 and "nothing was written" in str(exc):
+                raise RuntimeError(
+                    "expect_origin refused: the field's page is not on the expected origin "
+                    "or the field changed; nothing was written") from None
+            # A repeat refusal cannot undo an earlier write. Engine diagnostics
+            # can contain the credential, so neither quote nor diagnose them.
+            raise RuntimeError(
+                "typing with expect_origin failed; the write outcome is unknown") from None
+
+        until = max(time.monotonic() + GUARD_SETTLE_S, began + GUARD_SINCE_START_S)
+        while True:
+            try:
+                state = await asyncio.wait_for(page.eval_on_selector(
+                    selector, _GUARDED_STATE_JS, {"origin": expect_origin, "text": text}), 5)
+            except Exception:
+                raise RuntimeError(
+                    "the origin-locked field could not be read back; the write outcome is unknown") from None
+            if state not in ({"kept": True, "empty": not bool(text)},
+                             {"kept": False, "empty": True}):
+                raise RuntimeError(
+                    "the origin-locked field did not keep the value or could not be read back; "
+                    "the write outcome is unknown. Read the page before typing again")
+            if not state["kept"]:
+                # A first-focus model render can erase an autofill. Only a
+                # positively empty field permits another origin/type-locked write.
+                if text and attempt + 1 < GUARD_ATTEMPTS:
+                    break
+                raise RuntimeError(
+                    "the page emptied the origin-locked field after each of three writes; "
+                    "nothing is held there now; do not retry automatically")
+            if time.monotonic() >= until:
+                return f"typed into {selector}"
+            await asyncio.sleep(0.1)
 
 
 async def select_option(session, selector: str, value: str) -> str:

@@ -593,6 +593,24 @@ async def test_allowed_handle_tools_reach_only_main(owners, monkeypatch, name, a
     assert result.isError and old not in text(result)
 
 
+async def test_handle_guarded_delivery_is_exact_and_evaluate_still_refuses_writes(owners, monkeypatch):
+    from test_a_credential_is_typed_only_on_its_origin import _PageForRetry
+
+    token = handle(await call("A", "browser_open"))
+    page = _PageForRetry()
+    monkeypatch.setattr(owners.entries["A"].work._open["main"], "page", lambda: page)
+    meta = {**identity("filler"), HANDLE_KEY: token}
+    result = await call("filler", "browser_type", {
+        "browser": "main", "selector": "#p", "text": "hunter2",
+        "expect_origin": "https://login.example.com", "expect_input_type": "password"}, meta=meta)
+    assert success(result) == "typed into #p" and len(page.calls) == 2
+    result = await call("filler", "browser_evaluate", {
+        "browser": "main", "expression": "document.querySelector('#p').value = 'changed'"}, meta=meta)
+    assert result.isError and "browser_type" in text(result)
+    assert len(page.calls) == 2
+    assert "filler" not in owners.entries
+
+
 @pytest.mark.parametrize("name,valid_handle", [
     ("browser_status", True), ("browser_status", False), ("browser_list", True),
 ])

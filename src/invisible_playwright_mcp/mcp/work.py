@@ -539,7 +539,7 @@ class Work:
         return await self._act(role or DEFAULT_BROWSER_ID, fn, *args, **kwargs)
 
     async def typing(self, fn: Callable[..., Awaitable], selector: str, text: str,
-                     role: Optional[str] = None) -> str:
+                     role: Optional[str] = None, **kwargs) -> str:
         """Type, through the input lock like any action, answering within
         `ANSWER_WITHIN_S` whether or not the typing has finished.
 
@@ -561,12 +561,17 @@ class Work:
         """
         at = role or DEFAULT_BROWSER_ID
         await self._refuse_while_typing(at)
+        if kwargs.get("expect_origin") is not None:
+            # The filler requires a terminal, exact answer. Keep ordinary
+            # background-typing news for status/the next unguarded action.
+            async with self._input_lock(at):
+                return await self._act(at, fn, selector, text, **kwargs)
         news = self._typing_news(at)
         lock = self._input_lock(at)
 
         async def run():
             async with lock:
-                return await self._act(at, fn, selector, text)
+                return await self._act(at, fn, selector, text, **kwargs)
 
         task = asyncio.create_task(run())
         rec = _Typing(task, selector, len(text), time.monotonic())
