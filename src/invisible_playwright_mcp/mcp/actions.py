@@ -29,7 +29,6 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
 
-from invisible_playwright import hesitation
 from invisible_playwright.async_api import Error
 
 from . import certificates, clean, lan, process
@@ -1316,10 +1315,10 @@ async def upload_files(session, selector: str, paths, *, env=None, snapshot_root
     """Attach local files to a file input, through its file chooser.
 
     The files are checked before any page is touched, the thing that opens the
-    chooser is clicked with the real pointer, the chooser is answered after the
-    time a person takes to find and confirm a file - two of this session's
-    hesitations, drawn from the same persona its typing uses - and the input is
-    read back.
+    chooser is clicked with the real pointer, the chooser is answered through
+    the wrapper's standard `FileChooser.set_files` - which hands the files over
+    after the time a person takes to find and confirm one, drawn from the
+    session's own hand - and the input is read back.
     """
     named = uploadable(paths, env=env)
     page = session.page()
@@ -1335,8 +1334,6 @@ async def upload_files(session, selector: str, paths, *, env=None, snapshot_root
         raise RuntimeError(
             f"the chooser {opener} opened takes one file; nothing was attached. "
             "Upload them one at a time")
-    await asyncio.sleep(hesitation(session.seed, "mcp:file-chooser",
-                                   nonce=session.next_pause_nonce(), times=2))
     await chooser.set_files(files, timeout=ACTION_TIMEOUT_MS)
     held = await _held(chooser.element.evaluate(_FILE_NAMES_JS))
 
