@@ -38,7 +38,7 @@ from typing import Awaitable, Callable, Optional
 
 from invisible_playwright.async_api import TargetClosedError
 
-from . import DEFAULT_BROWSER_ID, GONE, NOT_OPEN, SUPPORT_BROWSER_ID, identity, plan, process, store
+from . import DEFAULT_BROWSER_ID, GONE, NOT_OPEN, SUPPORT_BROWSER_ID, certificates, identity, plan, process, store
 from ..quiet import swallow
 from .actions import NAVIGATION_TIMEOUT_MS
 from .session import StealthSession
@@ -290,7 +290,8 @@ class Work:
 
     async def open(self, role: str, *, seed: Optional[int] = None,
                    proxy: Optional[str] = None,
-                   profile: Optional[str] = None) -> str:
+                   profile: Optional[str] = None,
+                   accept_lan_certs: list[str] | None = None) -> str:
         """Open one of the two browsers as somebody, or reopen it as somebody
         else. Answers with the plan it made.
 
@@ -299,8 +300,9 @@ class Work:
         read here and nowhere else. A conversation reopened tomorrow, or an
         assistant reconnecting, calls `browser_open` and gets the same seed,
         the same exit and the same profile without having to know them. Any
-        argument means a decision, and a decision goes through the planner,
-        which refuses a conflict rather than guessing.
+        identity argument means a decision, and goes through the planner,
+        which refuses a conflict rather than guessing. Certificate acceptance
+        is this launch's explicit opt-in, never part of the remembered person.
         """
         if role not in (DEFAULT_BROWSER_ID, SUPPORT_BROWSER_ID):
             # ⛔ THE SCHEMA ALREADY REFUSES THIS AND THIS STILL REFUSES IT. The
@@ -354,6 +356,10 @@ class Work:
             exit_note = "this machine's own address, the same as main"
 
         self._refuse_a_held_profile(role, settings.get("profile_dir"))
+        if accept_lan_certs:
+            self._check_cert_profile(settings)
+        settings["cert_pins"] = await certificates.prepare(
+            accept_lan_certs or [], settings["lan_domains"])
 
         if self._engine is not None and not self._engine.ready():
             # ⛔ AFTER THE PLAN, AND NOT A LAUNCH: AN ANSWER. A plan that is
@@ -374,6 +380,7 @@ class Work:
                 return self._engine.describe()
 
         async with self._lock:
+            self._refuse_a_held_profile(role, settings.get("profile_dir"))
             # ⛔ The old browser is closed FIRST and unconditionally. Starting
             # the new one first would leave two browsers alive if the second
             # start failed, and the one still holding the profile directory
@@ -390,6 +397,11 @@ class Work:
                 self.remember()
         return "the %s browser is open. %s" % (role, plan.describe(
             settings, seed_from=seed_from, exit_note=exit_note, warnings=warnings))
+
+    def _check_cert_profile(self, settings: dict) -> None:
+        if not settings.get("profile_dir"):
+            raise ValueError("refused: accept_lan_certs requires a profile directory. "
+                             "Pass profile=\"/path/to/profile\" to store certificate exceptions.")
 
     async def _start(self, role: str, settings: dict) -> StealthSession:
         session = self._factory(**settings)

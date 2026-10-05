@@ -29,8 +29,13 @@ Known-bad inputs, each run against this file before it was trusted:
 from __future__ import annotations
 
 import pytest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from invisible_playwright.async_api import Error
 
 from invisible_playwright_mcp.mcp import actions
+from invisible_playwright_mcp.mcp.session import StealthSession
+from test_certificates import pin
 
 
 class _Response:
@@ -135,6 +140,89 @@ async def test_it_still_opens_a_tab_when_there_is_none():
     reply = await actions.navigate(session, "https://example.com/")
     assert session.new_pages == 1
     assert "HTTP 200" in reply
+
+
+@pytest.mark.parametrize("url", ["https://example.com/", "https://192.168.2.1/api"])
+async def test_pinning_does_not_restrict_navigation(tmp_path, url):
+    session = StealthSession(cert_pins=(pin(),), profile_dir=str(tmp_path))
+    page = _Page(_Response(url, 200))
+    session._context = SimpleNamespace(pages=[page])
+    assert "HTTP 200" in await actions.navigate(session, url)
+    assert len(page.goto_calls) == 1
+
+
+@pytest.mark.parametrize("error", ["SEC_ERROR_UNKNOWN_ISSUER", "SSL_ERROR_BAD_CERT_DOMAIN",
+                                  "MOZILLA_PKIX_ERROR_SELF_SIGNED_CERT"])
+@pytest.mark.parametrize("url,hint", [
+    ("https://192.168.2.1/api", "https://192.168.2.1:443"),
+    ("https://[fd00::1]/", "https://[fd00::1]:443"),
+    ("https://192.168.2.1:8443/", "https://192.168.2.1:8443"),
+    ("https://example.com/", None),
+    ("https://8.8.8.8/", None),
+    ("https://127.0.0.1/", None),
+])
+async def test_certificate_hint_only_for_lan(error, url, hint):
+    session = StealthSession()
+    page = _Page()
+    original = Error("Page.goto: " + error)
+    page.goto = AsyncMock(side_effect=original)
+    session._context = SimpleNamespace(pages=[page])
+    with pytest.raises(Error) as caught:
+        await actions.navigate(session, url)
+    if hint:
+        assert str(caught.value) == (
+            str(original) + "\nThis is a LAN host with an untrusted certificate: reopen "
+            'with browser_open(accept_lan_certs=["%s"]) to accept it.' % hint)
+        assert caught.value.__cause__ is original
+    else:
+        assert caught.value is original
+
+
+@pytest.mark.parametrize("ip,hint", [("192.168.2.1", True), ("8.8.8.8", False)])
+async def test_certificate_hint_for_configured_names_checks_dns(monkeypatch, ip, hint):
+    import asyncio
+    import socket
+
+    resolver = AsyncMock(return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 443))])
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", resolver)
+    session = StealthSession(lan_domains=("powellhouse.net",))
+    page = _Page()
+    page.goto = AsyncMock(side_effect=Error("Page.goto: SEC_ERROR_UNKNOWN_ISSUER"))
+    session._context = SimpleNamespace(pages=[page])
+    with pytest.raises(Error) as caught:
+        await actions.navigate(session, "https://base.powellhouse.net/")
+    assert ('accept_lan_certs=["https://base.powellhouse.net:443"]' in str(caught.value)) is hint
+
+
+@pytest.mark.parametrize("url,changed", [("https://192.168.2.1/api", True),
+                                        ("https://192.168.2.1:8443/", False),
+                                        ("https://10.0.0.1/", False)])
+async def test_changed_certificate_hint_matches_host_and_port(tmp_path, url, changed):
+    session = StealthSession(cert_pins=(pin(),), profile_dir=str(tmp_path))
+    page = _Page()
+    original = Error("Page.goto: SEC_ERROR_UNKNOWN_ISSUER")
+    page.goto = AsyncMock(side_effect=original)
+    session._context = SimpleNamespace(pages=[page])
+    with pytest.raises(Error) as caught:
+        await actions.navigate(session, url)
+    assert ("it changed" in str(caught.value)) is changed
+    assert caught.value.__cause__ is original
+    if changed:
+        assert str(caught.value) == (
+            str(original) + "\nThe certificate at 192.168.2.1:443 is not the one accepted at "
+            "browser_open (it changed): reopen with "
+            'browser_open(accept_lan_certs=["https://192.168.2.1:443"]) to accept the new one.')
+
+
+async def test_an_ordinary_navigation_error_is_unchanged():
+    session = StealthSession()
+    page = _Page()
+    error = Error("Page.goto: NS_ERROR_UNKNOWN_HOST")
+    page.goto = AsyncMock(side_effect=error)
+    session._context = SimpleNamespace(pages=[page])
+    with pytest.raises(Error) as caught:
+        await actions.navigate(session, "https://base.lan/")
+    assert caught.value is error
 
 
 async def test_the_engine_floor_is_high_enough_to_answer_at_all():

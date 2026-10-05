@@ -118,11 +118,13 @@ class OwnerWork(Work):
         return None
 
     async def open(self, role: str, *, seed: int | None = None,
-                   proxy: str | None = None, profile: str | None = None) -> str:
+                   proxy: str | None = None, profile: str | None = None,
+                   accept_lan_certs: list[str] | None = None) -> str:
         if profile is not None:
             raise ValueError("Persistent profile arguments are refused in owner mode; "
                              "leave profile out for an ephemeral browser.")
-        result = await super().open(role, seed=seed, proxy=proxy, profile="")
+        result = await super().open(role, seed=seed, proxy=proxy, profile="",
+                                    accept_lan_certs=accept_lan_certs)
         if self.upload_dir is not None:
             result += "\nupload dir: " + str(self.upload_dir)
         if self.download_dir is not None:
@@ -133,6 +135,10 @@ class OwnerWork(Work):
                 self.registry.handles[self.registry.handle_hash(self.fill_handle)] = self
             result += "\nfill handle: " + self.fill_handle
         return result
+
+    def _check_cert_profile(self, settings: dict) -> None:
+        # _start allocates the private owner profile before StealthSession.start.
+        pass
 
     def _ensure_upload_dir(self) -> None:
         try:
