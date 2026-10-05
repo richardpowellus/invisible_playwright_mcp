@@ -31,7 +31,7 @@ def fingerprint(der: bytes) -> str:
 
 
 async def resolve(endpoint: lan.Endpoint, domains: tuple[str, ...] = ()) -> list[str]:
-    """Refuse unless the name and every resolved address are explicitly LAN."""
+    """Refuse unless the name is LAN and it resolves to LAN addresses; return those only."""
     if not lan.in_scope(endpoint.url, domains):
         raise ValueError("host is outside LAN scope")
     if lan.address(endpoint.host) is not None:
@@ -43,9 +43,17 @@ async def resolve(endpoint: lan.Endpoint, domains: tuple[str, ...] = ()) -> list
     except (OSError, TimeoutError) as exc:
         raise ValueError("DNS lookup failed: %s" % exc) from exc
     addresses = list(dict.fromkeys(row[4][0] for row in answers))
-    if not addresses or not all(lan.private_address(ip) for ip in addresses):
-        raise ValueError("DNS must resolve exclusively to LAN addresses")
-    return addresses
+    private = [ip for ip in addresses if lan.private_address(ip)]
+    # A dual-stack LAN device also publishes its ISP-delegated global IPv6
+    # address. That address is skipped, never fetched from: the pin is the
+    # exact certificate the private address served. Any non-LAN IPv4 answer
+    # still refuses, because no LAN name should have one.
+    # (an unparsable answer counts as IPv4, and so refuses).
+    public_v4 = [ip for ip in addresses if ip not in private
+                 and getattr(lan.address(ip), "version", 4) == 4]
+    if not private or public_v4:
+        raise ValueError("DNS must resolve to LAN addresses (got %s)" % ", ".join(addresses or ["nothing"]))
+    return private
 
 
 def _names(der: bytes) -> tuple[str, str]:
