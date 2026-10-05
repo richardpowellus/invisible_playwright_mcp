@@ -153,6 +153,7 @@ between what the browser says it is and where it appears to be.
 | `STEALTHFOX_PROFILE_DIR` | A directory for a persistent profile for `main`, so logins survive across runs. `support` is not saved unless it is given a `profile` of its own. |
 | `STEALTHFOX_BINARY` | Path to an engine binary you already have. It must be the build the packaged seal pins, or startup refuses. |
 | `STEALTHFOX_HEADLESS` | `0` to run headed; headless by default. Decided by each launch: a saved session never records it, so a browser reopened by a headless server stays hidden even if it was last used headed. |
+| `STEALTHFOX_LAN_DOMAINS` | Extra LAN hostname suffixes, comma/space separated (e.g. `powellhouse.net`). Added to `local`, `home.arpa`, `internal`, `lan`; names must resolve exclusively to the LAN IP ranges below. Read at browser open; does not enable certificate acceptance. |
 | `STEALTHFOX_MCP_TRANSPORT` | `http` to serve over streamable HTTP instead of stdio. Default is stdio, which is what MCP clients expect. What else changes when you flip it, including the one thing that changes silently: [local or remote](local-vs-remote-mcp-server.md). |
 | `STEALTHFOX_MCP_HOST` | Bind address for the HTTP transport. Default `127.0.0.1`. |
 | `STEALTHFOX_MCP_PORT` | Port for the HTTP transport. Default `8766`. It used to be `8765`, the invisible_playwright_mcp interface's own default, so running both meant a bind error with nothing to explain it. |
@@ -198,6 +199,36 @@ browser is gone: it closed or crashed. Call browser_open to open it again;
 it comes back as the same person.` and is forgotten, so the next
 `browser_open` starts clean. `browser_close` frees the engine and keeps who
 the browser was, for the same reason.
+
+**LAN devices with untrusted certificates.** Open with
+`browser_open(accept_lan_certs=["https://192.168.2.1"], profile="/path/to/profile")`.
+Each entry is an HTTPS URL (paths are ignored), a hostname/IP, or `host:port`;
+IPv6 uses brackets and the default port is 443. Other schemes are refused.
+Only each exact certificate at its host and port is accepted; every other site
+keeps full certificate checks. There is no context-wide TLS bypass or browsing
+restriction. LAN IP ranges are `10.0.0.0/8`, `172.16.0.0/12`,
+`192.168.0.0/16`, `169.254.0.0/16`, `fc00::/7` and `fe80::/10`, including
+IPv4-mapped IPv6. Loopback, unspecified, carrier-grade NAT and public addresses
+are excluded. Hostnames must equal or end on a label boundary with a built-in
+or configured suffix (case-insensitive, trailing dot allowed), and every DNS
+answer must be in those ranges. Failed resolution refuses the open. DNS and
+certificate collection each have a five-second timeout; DNS is not cached.
+The certificate is fetched directly from this process, not through the browser's
+proxy. If any entry fails, the running browser is left untouched.
+
+The parameter defaults to `null`; an empty list is equivalent. The requested
+pins are not saved in the session store or inherited by `support`. They are
+merged atomically into the profile's `cert_override.txt` before launch, with
+mode 0600. Unrelated exceptions remain; the same host/port entry is replaced.
+**These are permanent Firefox profile exceptions:** reopening an explicit
+profile without the parameter does not delete its existing exceptions. In
+owner mode the private per-owner profile is used and removed on close. Outside
+owner mode, pinning without a profile is refused.
+
+Open/status replies list certificates pinned at that open, their addresses,
+SHA-256 fingerprints, subject CNs and issuer CNs. A LAN certificate error names
+the list entry needed to accept it; an error at an address pinned at this open
+says the certificate changed. Public hosts never get this advice.
 
 If the tools do not appear in your client, the fastest way to tell a broken
 registration from a broken server is to skip the client:
@@ -252,9 +283,9 @@ server serves exactly one session for its whole life.
 
 | Tool | Arguments | What it does |
 |---|---|---|
-| `browser_open` | `browser`, `seed`, `proxy`, `profile`, all optional | Opens `main` or `support`, or reopens one that is already up with those settings, which is how you change identity without changing which browser you are talking to. `support` left without a `proxy` goes out through `main`'s exit. |
+| `browser_open` | `browser`, `seed`, `proxy`, `profile`, `accept_lan_certs=null`, all optional | Opens `main` or `support`, or reopens one that is already up with those settings. `support` left without a `proxy` shares main's exit. `accept_lan_certs` lists LAN HTTPS addresses whose exact certificates are pinned into the profile before launch. |
 | `browser_close` | `browser` optional | Closes `main` or `support` and frees what it held. Its page goes with it; the other browser is not touched. Who it was is kept: `browser_open` with no arguments brings the same person back. Close `support` when you are done with it. |
-| `browser_status` | `browser` optional | Who is browsing right now: the seed, the exit, the profile and the page it is on. Starts nothing; a browser that is not open, or gone, is answered with the sentence that says which. |
+| `browser_status` | `browser` optional | Who is browsing right now: the seed, the exit, the profile, certificates pinned at this open and the page it is on. Starts nothing; a browser that is not open, or gone, is answered with the sentence that says which. |
 | `browser_list` | none | Which of the two browsers are open, where each one is, and which one you are working in. **Answers JSON**: `focus`, the browser your last command acted in, or "" when none is open; `note`, which says how many are open and that a command naming no browser goes to `main`; and `browsers` with `id`, the `url` it is on and the `urls` of every page it holds. Only open browsers are listed, so every row is one you can act on. Starts nothing, so asking is free. |
 
 `browser_open` is the first call of every session: nothing else opens a

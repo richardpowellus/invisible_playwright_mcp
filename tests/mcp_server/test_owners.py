@@ -24,7 +24,8 @@ from invisible_playwright_mcp.mcp.owner_transport import (
 from invisible_playwright_mcp.mcp.owners import (
     HANDLE_KEY, HANDLE_TOOLS, IDENTITY_ERROR, Owners,
 )
-from test_open_first import EVERY_TOOL, _Recording
+from test_open_first import EVERY_TOOL, _Recording, certificate_fetch as certificate_fetch
+from test_certificates import pin
 
 
 def identity(owner):
@@ -97,6 +98,41 @@ async def test_owner_status_keeps_the_no_page_marker_and_final_fill_handle(owner
     status = success(await call("A", "browser_status"))
     assert "no page open yet" in status
     assert status.splitlines()[-1] == "fill handle: " + handle(opened)
+
+
+async def test_owner_certificate_pins_keep_the_private_profile_and_isolation(owners, certificate_fetch):
+    opened = await call("A", "browser_open", {"accept_lan_certs": ["192.168.2.1"]})
+    assert "certificate pinned at this open: 192.168.2.1:443" in success(opened)
+    work = owners.entries["A"].work
+    session = work._open["main"]
+    assert session.kwargs["cert_pins"] == (pin(),)
+    directory = work.profiles["main"]
+    assert session.kwargs["profile_dir"] == str(directory)
+    assert session.kwargs["download_root"] == str(directory)
+    assert directory.is_dir()
+    assert owners.capacity.used == 1
+    assert handle(opened) == handle(await call("A", "browser_status"))
+    assert json.loads(success(await call("B", "browser_list")))["browsers"] == []
+    success(await call("A", "browser_open", {"browser": "support"}))
+    assert work._open["support"].kwargs["cert_pins"] == ()
+    success(await call("A", "browser_close"))
+    assert session.closed and not directory.exists()
+    success(await call("A", "browser_open"))
+    assert work._open["main"].kwargs["cert_pins"] == ()
+    assert "profile_dir" in work._open["main"].kwargs
+
+
+async def test_owner_pin_refusal_does_not_drop_browser_or_allocate_profile(owners, certificate_fetch):
+    opened = await call("A", "browser_open")
+    work = owners.entries["A"].work
+    before, directory = work._open["main"], work.profiles["main"]
+    certificate_fetch.side_effect = OSError("TLS failed")
+    result = await call("A", "browser_open", {"accept_lan_certs": ["192.168.2.1"]})
+    assert result.isError and "refused:" in text(result) and "TLS failed" in text(result)
+    assert work._open["main"] is before and not before.closed
+    assert work.profiles["main"] == directory
+    assert owners.capacity.used == 1
+    assert handle(opened) == handle(await call("A", "browser_status"))
 
 
 @pytest.mark.parametrize("ending", ["close", "session_ended", "idle"])

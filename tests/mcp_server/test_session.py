@@ -37,11 +37,13 @@ class _FakeBrowser:
     def __init__(self, connected=True):
         self.context_returned = _FakeContext()
         self._connected = connected
+        self.options = None
 
     def is_connected(self):
         return self._connected
 
-    async def new_context(self):
+    async def new_context(self, **options):
+        self.options = options
         return self.context_returned
 
 
@@ -98,6 +100,48 @@ async def test_attach_ephemeral_browser_calls_new_context():
     await s._attach(fake_browser)
     assert s._browser is fake_browser
     assert s._context is fake_browser.context_returned
+    assert fake_browser.options == {}
+
+
+async def test_pins_are_written_before_launch_and_not_sent_to_the_engine(monkeypatch, tmp_path):
+    import invisible_playwright_mcp.mcp.session as module
+    from test_certificates import pin
+
+    context = _FakeContext()
+    launches = []
+    profile = tmp_path / "profile"
+
+    class Engine:
+        def __init__(self, **kwargs):
+            assert pin().fingerprint in (profile / "cert_override.txt").read_text()
+            launches.append(kwargs)
+
+        async def __aenter__(self):
+            return context
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(module, "InvisiblePlaywright", Engine)
+    session = StealthSession(cert_pins=(pin(),), lan_domains=("powellhouse.net",),
+                             headless=True, profile_dir=str(profile))
+    try:
+        await session.start()
+        assert len(launches) == 1
+        assert not {"accept_lan_certs", "cert_pins", "lan_domains", "ignore_https_errors",
+                    "service_workers"} & launches[0].keys()
+        assert launches[0]["headless"] is True
+        assert launches[0]["profile_dir"] == str(profile)
+        assert session._context is context
+    finally:
+        await session.close()
+
+
+def test_pinning_requires_a_profile():
+    from test_certificates import pin
+
+    with pytest.raises(ValueError, match="refused:.*requires a profile"):
+        StealthSession(cert_pins=(pin(),))
 
 
 async def test_attach_persistent_context_used_directly():

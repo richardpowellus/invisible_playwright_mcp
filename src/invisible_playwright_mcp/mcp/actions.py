@@ -30,8 +30,9 @@ from pathlib import Path
 from typing import Any
 
 from invisible_playwright import hesitation
+from invisible_playwright.async_api import Error
 
-from . import clean, process
+from . import certificates, clean, lan, process
 from ..quiet import swallow
 
 # The character cap every text-returning action shares. Callers can lower it;
@@ -128,7 +129,28 @@ async def navigate(session, url: str, wait_until: str = "domcontentloaded") -> s
     if not session.pages():
         await session.new_page()
     page = session.page()
-    response = await page.goto(url, wait_until=wait_until, timeout=NAVIGATION_TIMEOUT_MS)
+    try:
+        response = await page.goto(url, wait_until=wait_until, timeout=NAVIGATION_TIMEOUT_MS)
+    except Error as exc:
+        if any(marker in str(exc) for marker in
+               ("SEC_ERROR_", "SSL_ERROR_", "MOZILLA_PKIX_ERROR_")):
+            try:
+                endpoint = lan.parse_entry(url)
+                await certificates.resolve(endpoint, getattr(session, "lan_domains", ()))
+            except ValueError:
+                # No LAN bypass advice when scope or DNS cannot establish LAN.
+                pass
+            else:
+                reopen = "browser_open(accept_lan_certs=%s)" % json.dumps([endpoint.url])
+                if any(pin.endpoint == endpoint for pin in getattr(session, "cert_pins", ())):
+                    hint = ("The certificate at %s is not the one accepted at browser_open "
+                            "(it changed): reopen with %s to accept the new one."
+                            % (endpoint.authority, reopen))
+                else:
+                    hint = ("This is a LAN host with an untrusted certificate: reopen with "
+                            "%s to accept it." % reopen)
+                raise type(exc)(str(exc) + "\n" + hint) from exc
+        raise
     if response is None:
         # A same-document navigation (an anchor, or the same url again) creates
         # no document and so has no response. Playwright answers None here and

@@ -12,12 +12,14 @@ from __future__ import annotations
 import contextlib
 import os
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from invisible_playwright.async_api import TargetClosedError
 
-from invisible_playwright_mcp.mcp import GONE, NOT_OPEN, actions, server, store
+from invisible_playwright_mcp.mcp import GONE, NOT_OPEN, actions, certificates, server, store
 from invisible_playwright_mcp.mcp.work import REMEMBERED, Work, profile_holder
+from test_certificates import pin
 
 
 class _Recording:
@@ -79,7 +81,8 @@ def work(monkeypatch):
     """The server's piece of work, with a factory that launches nothing and an
     environment that decides nothing, so the planner draws a fresh person."""
     for name in ("STEALTHFOX_SEED", "STEALTHFOX_PROXY", "STEALTHFOX_PROFILE_DIR",
-                 "STEALTHFOX_HEADLESS", "STEALTHFOX_BINARY", "STEALTHFOX_NO_PROXY"):
+                 "STEALTHFOX_HEADLESS", "STEALTHFOX_BINARY", "STEALTHFOX_NO_PROXY",
+                 "STEALTHFOX_LAN_DOMAINS"):
         monkeypatch.delenv(name, raising=False)
     w = Work("default", factory=_Recording)
     monkeypatch.setattr(server, "work", w)
@@ -282,6 +285,115 @@ async def test_the_file_is_written_at_open_and_not_on_every_command(work, monkey
         await server.browser_navigate(url)
 
     assert len(writes) == 1, "the file was written %d times for one open" % len(writes)
+
+
+@pytest.fixture
+def certificate_fetch(monkeypatch):
+    fetch = MagicMock(side_effect=lambda endpoint, ips: pin(endpoint.host, endpoint.port))
+    monkeypatch.setattr(certificates, "_fetch", fetch)
+    return fetch
+
+
+async def test_lan_parameter_schema_and_status(work, tmp_path, certificate_fetch):
+    tools = {tool.name: tool for tool in await server.mcp.list_tools()}
+    assert tools["browser_open"].annotations.openWorldHint is True
+    schema = tools["browser_open"].inputSchema
+    assert schema["properties"]["accept_lan_certs"] == {
+        "anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}],
+        "default": None, "title": "Accept Lan Certs"}
+    assert "accept_lan_certs" not in schema.get("required", [])
+    opened = await server.browser_open(accept_lan_certs=["192.168.2.1", "https://10.0.0.1:8443"],
+                                       profile=str(tmp_path / "profile"))
+    assert _session(work).kwargs["cert_pins"] == (pin(), pin("10.0.0.1", 8443))
+    for text in (opened, await server.browser_status()):
+        for address in ("192.168.2.1:443", "10.0.0.1:8443"):
+            assert address in text
+        assert pin().fingerprint in text
+        assert "subject CN 'device'" in text and "issuer CN 'factory'" in text
+        assert "Only these exact certificates at these addresses" in text
+        assert "every other site keeps full certificate checks" in text
+
+
+@pytest.mark.parametrize("restart", [False, True])
+async def test_lan_opt_in_is_never_remembered(work, monkeypatch, tmp_path, certificate_fetch, restart):
+    monkeypatch.setenv("STEALTHFOX_LAN_DOMAINS", "PowellHouse.net")
+    await server.browser_open(seed=4242, accept_lan_certs=["192.168.2.1"],
+                              profile=str(tmp_path / "profile"))
+    assert _session(work).kwargs["lan_domains"] == ("powellhouse.net",)
+    saved = store.load("default")["browsers"]["main"]
+    assert set(saved) == {"seed", "profile_dir"}
+    # Even a file from a different build cannot restore launch-only settings.
+    store.save("default", {"main": dict(saved, accept_lan_certs=["192.168.2.1"], cert_pins=["old"],
+                                      lan_domains=["stale.test"])}, focus="main")
+    monkeypatch.setenv("STEALTHFOX_LAN_DOMAINS", "new.test")
+    if restart:
+        await work.close_all()
+        work = Work("default", factory=_Recording)
+        monkeypatch.setattr(server, "work", work)
+    said = await server.browser_open()
+    assert _session(work).kwargs["seed"] == 4242
+    assert _session(work).kwargs["cert_pins"] == ()
+    assert _session(work).kwargs["lan_domains"] == ("new.test",)
+    assert "certificate pinned at this open" not in said
+    assert certificate_fetch.call_count == 1
+
+
+async def test_lan_opt_in_does_not_change_identity_or_spread_to_support(work, tmp_path, certificate_fetch):
+    await server.browser_open(seed=4242, profile=str(tmp_path / "main"))
+    await server.browser_open(accept_lan_certs=["192.168.2.1"])
+    assert _session(work).kwargs["seed"] == 4242
+    await server.browser_open(browser="support")
+    assert _session(work, "support").kwargs["cert_pins"] == ()
+    await server.browser_open(browser="support", accept_lan_certs=["192.168.2.1"],
+                              profile=str(tmp_path / "helper"))
+    assert _session(work, "support").kwargs["cert_pins"] == (pin(),)
+    await server.browser_open(browser="support")
+    assert _session(work, "support").kwargs["cert_pins"] == ()
+    assert _session(work).kwargs["cert_pins"] == (pin(),)
+
+
+@pytest.mark.parametrize("source", ["argument", "environment", "remembered"])
+async def test_pins_can_use_explicit_environment_or_remembered_profile(
+        work, monkeypatch, tmp_path, certificate_fetch, source):
+    profile = str(tmp_path / "profile")
+    await server.browser_open(seed=4242, **({"profile": profile} if source == "remembered" else {}))
+    if source == "environment":
+        monkeypatch.setenv("STEALTHFOX_PROFILE_DIR", profile)
+    args = ({"profile": profile} if source == "argument" else
+            {"seed": 4242} if source == "environment" else {})
+    await server.browser_open(accept_lan_certs=["192.168.2.1"], **args)
+    assert _session(work).kwargs["profile_dir"] == profile
+    assert _session(work).kwargs["cert_pins"] == (pin(),)
+
+
+async def test_missing_profile_refuses_without_dropping_or_connecting(work, certificate_fetch):
+    await server.browser_open(seed=4242)
+    before = _session(work)
+    with pytest.raises(ValueError, match="refused:.*requires a profile directory"):
+        await server.browser_open(accept_lan_certs=["192.168.2.1"])
+    assert _session(work) is before and not before.closed
+    certificate_fetch.assert_not_called()
+
+
+@pytest.mark.parametrize("bad", ["8.8.8.8", "http://192.168.2.1", "10.0.0.2"])
+async def test_a_failed_entry_preserves_running_browser_and_saved_identity(
+        work, tmp_path, certificate_fetch, bad):
+    await server.browser_open(seed=4242, profile=str(tmp_path / "profile"))
+    before, saved = _session(work), store.load("default")
+    certificate_fetch.side_effect = [pin(), OSError("TLS handshake failed")]
+    with pytest.raises(ValueError, match="^refused:") as caught:
+        await server.browser_open(accept_lan_certs=["192.168.2.1", bad])
+    assert repr(bad) in str(caught.value)
+    assert _session(work) is before and not before.closed
+    assert store.load("default") == saved
+    assert not (tmp_path / "profile" / "cert_override.txt").exists()
+
+
+@pytest.mark.parametrize("entries", [None, []])
+async def test_empty_certificate_list_needs_no_profile(work, certificate_fetch, entries):
+    await server.browser_open(accept_lan_certs=entries)
+    assert _session(work).kwargs["cert_pins"] == ()
+    certificate_fetch.assert_not_called()
 
 
 # --- the helper --------------------------------------------------------------------

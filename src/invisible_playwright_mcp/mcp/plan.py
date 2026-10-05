@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
-from . import identity
+from . import identity, lan
 from .proxy import proxy_from_url
 
 #: Passed for `profile` or `proxy` to mean "explicitly none", as opposed to
@@ -76,6 +76,12 @@ def describe(kwargs: Mapping[str, Any], seed_from: str = "",
         "profile: %s." % (profile or "none, so nothing survives this session"),
         "headless: %s." % ("yes" if kwargs.get("headless") else "no"),
     ]
+    if kwargs.get("cert_pins"):
+        parts.extend("certificate pinned at this open: %s; SHA-256 %s; subject CN %r; issuer CN %r."
+                     % (pin.endpoint.authority, pin.fingerprint, pin.subject_cn, pin.issuer_cn)
+                     for pin in kwargs["cert_pins"])
+        parts.append("Only these exact certificates at these addresses are accepted by this opt-in; "
+                     "every other site keeps full certificate checks.")
     return " ".join(parts) + "".join("\nwarning: " + w for w in warnings)
 
 
@@ -224,7 +230,7 @@ def engine_here(env: Optional[Mapping[str, str]] = None) -> dict:
 
 def launched_here(env: Optional[Mapping[str, str]] = None) -> dict:
     """What THIS process decides about every browser it starts, whoever the
-    browser is: the engine it runs on, and whether its window is shown.
+    browser is: its engine, whether its window is shown, and LAN name scope.
 
     ⛔ TWO THINGS A SAVED SESSION MUST NOT DECIDE, read in one place. The engine
     was already kept out of the file (`engine_here`, and the reason above).
@@ -239,6 +245,7 @@ def launched_here(env: Optional[Mapping[str, str]] = None) -> dict:
     env = os.environ if env is None else env
     decided: dict[str, Any] = {
         "headless": env.get("STEALTHFOX_HEADLESS", "1") != "0",
+        "lan_domains": lan.parse_domains(env.get("STEALTHFOX_LAN_DOMAINS", "")),
     }
     decided.update(engine_here(env))
     return decided

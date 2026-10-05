@@ -19,12 +19,19 @@ import time
 from typing import Any
 
 from ..quiet import swallow
+from . import certificates
 
 from invisible_playwright.async_api import InvisiblePlaywright, TargetClosedError
 
 
 class StealthSession:
-    def __init__(self, *, download_root: str | None = None, **kwargs: Any) -> None:
+    def __init__(self, *, download_root: str | None = None,
+                 cert_pins: tuple[certificates.Pin, ...] = (),
+                 lan_domains: tuple[str, ...] = (), **kwargs: Any) -> None:
+        if cert_pins and not kwargs.get("profile_dir"):
+            raise ValueError("refused: accept_lan_certs requires a profile directory.")
+        self.cert_pins = cert_pins
+        self.lan_domains = lan_domains
         # ⛔ NO FALLBACK TO THE ENVIRONMENT. This used to be
         # `kwargs or launch_kwargs(os.environ)`, which made this a THIRD place
         # that decided how a browser is configured, behind the tool arguments
@@ -84,6 +91,9 @@ class StealthSession:
         kwargs["extra_prefs"] = {**(kwargs.get("extra_prefs") or {}),
                                  **download_prefs(self.downloads)}
         try:
+            if self.cert_pins:
+                await asyncio.to_thread(
+                    certificates.write_overrides, kwargs["profile_dir"], self.cert_pins)
             self._ipw = InvisiblePlaywright(**kwargs)
             await self._attach(await self._ipw.__aenter__())
         except BaseException:

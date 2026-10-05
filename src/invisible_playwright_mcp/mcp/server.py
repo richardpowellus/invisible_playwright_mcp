@@ -422,17 +422,17 @@ Browser = Annotated[
 
 # --- the two browsers -------------------------------------------------------
 
-@mcp.tool(annotations=_says("Open a browser", destructive=True, open_world=False))
+@mcp.tool(annotations=_says("Open a browser", destructive=True))
 async def browser_open(browser: Browser = None, seed: int | None = None,
-                       proxy: str | None = None, profile: str | None = None) -> str:
+                       proxy: str | None = None, profile: str | None = None,
+                       accept_lan_certs: list[str] | None = None) -> str:
     """Open `main` or `support`, or reopen one as somebody else.
 
     `support` is yours to manage: open it when the task needs a second
     identity, and close it with browser_close as soon as the task no longer
     needs it, before you answer. It is not saved.
 
-    Called on a browser that is already up, this REOPENS it with the settings
-    given, and what it held is gone.
+    Reopening loses what it held. No arguments restores the same identity.
 
     seed     the identity; same seed, same fingerprint. Left out, one is drawn.
     profile  a directory keeping cookies, logins and the seed between opens;
@@ -443,6 +443,7 @@ async def browser_open(browser: Browser = None, seed: int | None = None,
              shares the exit `main` has. A profile does NOT pin its exit, and
              a login arriving from a new country is as visible as one arriving
              on new hardware.
+    accept_lan_certs  LAN HTTPS URLs or host[:port] list to pin; needs a profile.
     """
     # ⛔ THE DESCRIPTION ABOVE IS WHAT THE MODEL READS, AND IT IS CUT AT 1024
     # CHARACTERS BY THE API. The version before this one was 1996: the model
@@ -458,7 +459,7 @@ async def browser_open(browser: Browser = None, seed: int | None = None,
     # sentence is not free here; it is spent out of the same 1024 characters
     # as the rules that only this tool can state.
     return await _work().open(browser or DEFAULT_BROWSER_ID, seed=seed,
-                           proxy=proxy, profile=profile)
+                           proxy=proxy, profile=profile, accept_lan_certs=accept_lan_certs)
 
 
 @mcp.tool(annotations=_says("Close a browser", destructive=True, open_world=False))
