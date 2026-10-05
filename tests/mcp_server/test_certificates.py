@@ -36,22 +36,26 @@ async def test_out_of_scope_entries_are_refused_without_connecting(monkeypatch, 
 
 
 @pytest.mark.parametrize("addresses,allowed", [
-    (["192.168.2.1"], True),
-    (["10.1.1.1", "fd00::1", "::ffff:172.16.1.1"], True),
-    (["8.8.8.8"], False),
-    (["192.168.2.1", "8.8.8.8"], False),
-    (["192.168.2.1", "2001:4860:4860::8888"], False),
-    (["127.0.0.1"], False),
-    ([], False),
+    (["192.168.2.1"], ["192.168.2.1"]),
+    (["10.1.1.1", "fd00::1", "::ffff:172.16.1.1"], ["10.1.1.1", "fd00::1", "::ffff:172.16.1.1"]),
+    (["8.8.8.8"], None),
+    (["192.168.2.1", "8.8.8.8"], None),
+    # dual-stack device: its global IPv6 address is dropped, never fetched from
+    (["192.168.0.1", "192.168.20.1", "2601:600:8f01:e4c0::1"], ["192.168.0.1", "192.168.20.1"]),
+    (["2601:600:8f01:e4c0::1"], None),
+    (["192.168.2.1", "::ffff:8.8.8.8"], None),
+    (["127.0.0.1"], None),
+    (["::1"], None),
+    ([], None),
 ])
 async def test_scope_checks_every_dns_answer(monkeypatch, addresses, allowed):
     resolver = AsyncMock(return_value=answers(*addresses))
     monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", resolver)
     endpoint = lan.parse_entry("router.powellhouse.net")
     if allowed:
-        assert await certificates.resolve(endpoint, ("powellhouse.net",)) == addresses
+        assert await certificates.resolve(endpoint, ("powellhouse.net",)) == allowed
     else:
-        with pytest.raises(ValueError, match="DNS must resolve exclusively"):
+        with pytest.raises(ValueError, match="DNS must resolve to LAN addresses"):
             await certificates.resolve(endpoint, ("powellhouse.net",))
     resolver.assert_awaited_once_with("router.powellhouse.net", 443, type=socket.SOCK_STREAM)
 
@@ -78,7 +82,7 @@ async def test_dns_is_not_cached(monkeypatch):
     monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", resolver)
     endpoint = lan.Endpoint("router.local")
     assert await certificates.resolve(endpoint) == ["192.168.2.1"]
-    with pytest.raises(ValueError, match="DNS must resolve exclusively"):
+    with pytest.raises(ValueError, match="DNS must resolve to LAN addresses"):
         await certificates.resolve(endpoint)
 
 
