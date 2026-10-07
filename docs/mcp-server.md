@@ -379,6 +379,49 @@ action. Plain typing never automatically retries. Credential diagnostics
 contain no field value; a refusal after a previous write never claims that
 the whole call wrote nothing.
 
+`mask_value` is an optional JSON boolean, default `false`, declared in
+`browser_type`'s live input schema. `true` requires `expect_origin` and refuses
+nonempty text shorter than eight characters before writing:
+
+```text
+mask_value refused: requires expect_origin; nothing was written
+mask_value refused: text must be at least 8 characters; nothing was written
+```
+
+An empty clear registers nothing. Nonempty values are registered in Python
+memory before delivery, per owner's browser instance, until that browser closes
+or the owner session ends. Nothing is marked or stored in the page. Every tool
+result, including SDK errors and structured content, crosses one result scrubber.
+It merges overlapping or adjacent eight-character matches in the raw,
+HTML-escaped (with and without quotes), JSON-escaped (ASCII and Unicode), and
+URL-quoted (`quote` and `quote_plus`) forms into one eight-bullet mask.
+Truncated values are therefore masked too. A successful guarded reply remains
+exactly `typed into <selector>`.
+
+`browser_take_screenshot`, `browser_watch`, and the screenshot returned by
+`browser_click_at` refuse with this exact tool error while a raw eight-character
+fragment remains on the page:
+
+```text
+screenshot refused: a masked value is on the page; nothing was captured
+```
+
+The presence reader uses the engine's utility world, reads input/textarea values
+and body text through open shadow roots and same-origin frames, and compares
+in Python. An incomplete or failed check refuses. Clearing the field and removing
+mirrored text allows capture again. Existing live watches stop before a masked
+write; subsequent allowed watches capture fresh frames and stop rather than
+retaining a continuous stream. Fill handles may call `browser_take_screenshot`
+so credential fillers can positively verify this refusal. This server has no
+page-to-PDF or other screenshot-option tool; `browser_download` saves downloaded
+documents, not rendered page pixels.
+
+Known limit: page scripts and `browser_evaluate` can still compute over `.value`,
+such as `btoa`, or expose fragments shorter than eight characters. Redaction
+catches only the listed plain forms, just as password masking today is not an
+evaluation sandbox. Presence reads and capture are not an atomic page operation.
+Keep engine/RPC payload tracing disabled.
+
 `browser_download(selector=..., x=..., y=..., timeout_seconds=30, save_to=...)`
 clicks a selector or a point and saves a completed browser download or document
 navigation. Fetch/XHR responses and other existing tabs are not candidates.
@@ -392,7 +435,7 @@ only for the file is closed. The result is JSON with `saved`, `filename`,
 |---|---|---|
 | `browser_click` | `selector` | Clicks the first element matching a CSS selector, scrolling it into view and waiting for it to be clickable. The pointer approaches, hovers, presses and releases, the way a hand does. |
 | `browser_click_at` | `x`, `y`, `hold_seconds` (default 0) | Clicks a viewport coordinate instead of a selector: moves the pointer there, presses, holds if asked, releases, and returns a screenshot taken right after. For a slider track, a canvas-drawn challenge, a precise point inside a wider element. |
-| `browser_type` | `selector`, `text` | Types into a field, replacing whatever it holds: every character is a real key at the browser's human pace, after the pause a person takes once the field has the focus. The answer says what the field kept: all of it, the start a maxlength allowed, the text as the page reformatted it, nothing because the page took it out (a chip field), or one character because the page moved the focus on (a code split across boxes). Nothing is typed twice on its own. A text that takes longer than one answer may wait goes on typing in the background: actions on that browser are refused with how far it has got, reads still work, and `browser_status` says when it is done. |
+| `browser_type` | `selector`, `text`, `expect_origin`, `expect_input_type`, `mask_value` (default false) | Plain typing uses human-paced keys and reports what the field kept; long typing continues in the background. Origin-locked fills use guarded native autofill with terminal readback. `mask_value` protects concealed text in owner results and guards page captures; see the contract above. |
 | `browser_select_option` | `selector`, `value` | Chooses an option in a `<select>`, by its visible label or by its value. |
 | `browser_upload_files` | `selector`, `paths` | Attaches local files to a file input the way a person picks them: the input, or the button or label that opens its chooser, is clicked with the real pointer and the chooser is answered with `paths`. A hidden input is opened by clicking its label, and one with no label is refused with a request for the button that opens it: a hidden input is never fed files no click opened. The chooser is answered after the time a person takes to pick a file. Off unless `INVISIBLE_MCP_UPLOAD_DIRS` names the directories files may come from (absolute, separated by `:`, `;` on Windows); a path must be a regular file inside one of them, under no hidden directory, at most 50 MB, and on Windows never an alternate data stream (`a.pdf:Zone.Identifier`). The private copies sent to the browser are removed when it closes. |
 | `browser_press_key` | `key` | Presses a key on whatever has focus: `Enter`, `Tab`, `Escape`, `ArrowDown`, `Control+a`, or a single character. |
@@ -463,7 +506,7 @@ browser reopen, then disappear on owner expiry, session end or process exit.
 
 The main browser's final `fill handle` line is a secret generation-bound
 capability. A trusted filler passes it in `_meta["stealthfox/browser_handle"]`;
-it permits only main's status, reads, type and press-key tools. It cannot open,
+it permits only main's status, reads, screenshot, type and press-key tools. It cannot open,
 close, navigate, upload or download. Closing/reopening main revokes it; delegated
 status omits both directory paths. Initialize advertises
 `stealthfox/owner-isolation: {"version": 1}`.

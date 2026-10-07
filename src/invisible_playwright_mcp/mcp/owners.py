@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 
 import anyio
 
-from . import DEFAULT_BROWSER_ID, GONE, actions
+from . import DEFAULT_BROWSER_ID, GONE, actions, masked
 from .session import StealthSession
 from .owner_instances import Instances
 from .work import Work
@@ -33,6 +33,7 @@ HANDLE_KEY = "stealthfox/browser_handle"
 HANDLE_TOOLS = frozenset({
     "browser_status", "browser_evaluate", "browser_snapshot", "browser_read_html",
     "browser_read_text", "browser_type", "browser_press_key",
+    "browser_take_screenshot",
 })
 _HANDLE = re.compile(r"bh_[A-Za-z0-9_-]{43}")
 IDENTITY_ERROR = "Owner mode requires a valid mcpd/identity sessionId."
@@ -323,6 +324,7 @@ class OwnerWork(Work):
         session = self._open.get(role)
         if session is not None:
             await session.close()
+            masked.forget(session)
             self._open.pop(role, None)
         self._launched.pop(role, None)
         directory = self.profiles.get(role)
@@ -451,6 +453,18 @@ class Owners:
                 OwnerWork(self, factory=self.factory, engine=self.engine), self.clock())
         return self.entries[identity]
 
+    def redaction_windows(self, meta: dict) -> set[str]:
+        """Include policy refusals that happen before target() can yield."""
+        identity = owner_id(meta)
+        if HANDLE_KEY in meta:
+            try:
+                return masked.result_windows(self.resolve_handle(meta[HANDLE_KEY]))
+            except ValueError:
+                # target() still reports the original policy/handle refusal.
+                pass
+        entry = self.entries.get(identity)
+        return masked.result_windows(entry.work) if entry is not None else set()
+
     @asynccontextmanager
     async def target(self, meta: dict, tool: str, arguments: dict) -> AsyncIterator[OwnerWork]:
         identity = owner_id(meta)
@@ -500,7 +514,14 @@ class Owners:
         entry.ended = True
         entry.work.revoke()
         async with entry.lock:
-            await entry.work.close_all()
+            try:
+                await entry.work.close_all()
+            except Exception as exc:
+                raise RuntimeError(masked.redact_text(
+                    str(exc), masked.result_windows(entry.work))) from None
+            finally:
+                for session in entry.work._open.values():
+                    masked.forget(session)
             entry.work.remove_file_dirs()
             self.entries.pop(identity, None)
 
