@@ -178,6 +178,17 @@ upstream's no-retry behavior. Credential values never appear in diagnostics.
 This requires the companion fork engine's guard API; the ordinary upstream
 engine cannot perform guarded writes.
 
+`browser_type(mask_value=true)` also protects concealed values filled into text
+inputs. It requires `expect_origin` and at least eight characters (empty clears
+are allowed). Registration is Python-only, per browser, before writing, and is
+forgotten on browser close or owner-session end. Every owner tool result,
+including errors, masks raw, HTML/JSON-escaped and URL-quoted eight-character
+fragments with eight bullets. Screenshot, watch and coordinate-click captures
+refuse while the value is in an input, textarea or page text; unreadable presence
+checks also refuse. A masked fill stops an existing live watch before writing.
+As with password inputs, `browser_evaluate` can still compute other encodings
+over `.value` (for example `btoa`); these plain-form masks are not a sandbox.
+
 `browser_download` clicks a selector or point and keeps a completed file or a
 document navigation, not a page's fetch/XHR. Set `INVISIBLE_MCP_DOWNLOAD_DIRS`
 to absolute canonical directories, separated by the platform's path separator.

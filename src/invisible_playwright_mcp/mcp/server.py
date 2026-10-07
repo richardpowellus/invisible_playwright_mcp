@@ -50,9 +50,10 @@ import anyio
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ContentBlock, ToolAnnotations
+from mcp import types
 from pydantic import Field
 
-from . import __version__, actions, plan, store
+from . import __version__, actions, masked, plan, store
 from .. import env as environment
 from ..engine import Engine
 from ..quiet import swallow
@@ -99,6 +100,7 @@ work = Work(_SESSION_ID, engine=engine)
 
 owners = Owners.from_env(engine=engine)
 _selected_work: ContextVar[Work] = ContextVar("browser_owner_work")
+_result_windows: ContextVar[tuple[set[str], ...]] = ContextVar("browser_result_windows", default=())
 
 
 def _work() -> Work:
@@ -113,6 +115,44 @@ def _work() -> Work:
 class BrowserMCP(FastMCP):
     _owner_exit_watchdog: ExitWatchdog | None = None
 
+    def _setup_handlers(self) -> None:
+        super()._setup_handlers()
+        self._raw_tool_result = self._mcp_server.request_handlers[types.CallToolRequest]
+        self._mcp_server.request_handlers[types.CallToolRequest] = self._owner_tool_result
+
+    async def _owner_tool_result(self, request: types.CallToolRequest) -> types.ServerResult:
+        windows: list[set[str]] = []
+        log_token = _result_windows.set(())
+
+        async def dispatch(selected: Work):
+            token = _selected_work.set(selected)
+            windows.append(masked.result_windows(selected))
+            _result_windows.set(tuple(windows))
+            try:
+                return await self._raw_tool_result(request)
+            finally:
+                windows.append(masked.result_windows(selected))
+                _result_windows.set(tuple(windows))
+                _selected_work.reset(token)
+
+        try:
+            try:
+                if owners is None:
+                    result = await dispatch(work)
+                else:
+                    meta = request.params.meta
+                    metadata = meta.model_dump() if meta else {}
+                    windows.append(owners.redaction_windows(metadata))
+                    _result_windows.set(tuple(windows))
+                    async with owners.target(metadata, request.params.name,
+                                             request.params.arguments or {}) as selected:
+                        result = await dispatch(selected)
+            except Exception as exc:
+                result = self._mcp_server._make_error_result(str(exc))
+            return masked.redact_result(result, windows)
+        finally:
+            _result_windows.reset(log_token)
+
     def run(self, transport: Literal["stdio", "sse", "streamable-http"] = "stdio",
             mount_path: str | None = None) -> None:
         try:
@@ -125,22 +165,12 @@ class BrowserMCP(FastMCP):
 
     async def call_tool(self, name: str, arguments: dict[str, Any]
                         ) -> Sequence[ContentBlock] | dict[str, Any]:
-        if owners is None:
-            return await super().call_tool(name, arguments)
         try:
-            meta = self.get_context().request_context.meta
-        except ValueError:
-            raise ValueError(IDENTITY_ERROR) from None
-        async with owners.target(meta.model_dump() if meta else {}, name, arguments) as selected:
-            token = _selected_work.set(selected)
-            try:
-                return await super().call_tool(name, arguments)
-            except ToolError as exc:
-                if isinstance(exc.__cause__, CapacityExhausted):
-                    raise exc.__cause__ from None
-                raise
-            finally:
-                _selected_work.reset(token)
+            return await super().call_tool(name, arguments)
+        except ToolError as exc:
+            if isinstance(exc.__cause__, (CapacityExhausted, masked.MaskRefusal)):
+                raise exc.__cause__ from None
+            raise
 
     async def run_stdio_async(self) -> None:
         if owners is None:
@@ -326,6 +356,15 @@ Downloads use your private `download dir`; save_to must remain inside it.
 mcp = BrowserMCP("stealth", instructions=(
     OWNER_INSTRUCTIONS + PAGE_INSTRUCTIONS if owners is not None else INSTRUCTIONS),
     lifespan=_lifespan)
+
+
+def _redact_log(text: str) -> str:
+    works = [work] if owners is None else [entry.work for entry in owners.entries.values()]
+    windows = set().union(*_result_windows.get(), *(masked.result_windows(w) for w in works))
+    return masked.redact_text(text, windows)
+
+
+redact_sdk_logs(_redact_log)
 
 
 async def _session_ended(notification: SessionEnded) -> None:
@@ -660,7 +699,11 @@ async def browser_watch(browser: Browser = None) -> Image:
     # is not a schema pydantic will build - measured, five test modules
     # refuse to import. A refusal reaches a client as an error result
     # carrying the reason, which every client already handles.
-    jpeg = await _work().reading(lambda session: session.watch_frame(), role=browser)
+    async def capture(session):
+        await masked.guard_pixels(session)
+        return await session.watch_frame()
+
+    jpeg = await _work().reading(capture, role=browser)
     return Image(data=jpeg, format="jpeg")
 
 
@@ -703,24 +746,29 @@ async def browser_click_at(x: float, y: float, hold_seconds: float = 0.0,
 @mcp.tool(annotations=_says("Type into a field", destructive=True))
 async def browser_type(selector: str, text: str, browser: Browser = None,
                        expect_origin: str | None = None,
-                       expect_input_type: str | None = None) -> str:
+                       expect_input_type: str | None = None,
+                       mask_value: Annotated[bool, Field(strict=True)] = False) -> str:
     """Type into a field, replacing what it holds, key by key at a human pace.
 
-    The answer says what the field kept: all of it, a maxlength's cut, the
-    page's reformatting, nothing (the page took it out), or one box of a code
-    the page spreads over several. Nothing is retyped on its own. Text too long
-    to finish within one answer goes on in the background; until it ends,
-    actions on that browser are refused with its progress, and reads work.
+    Reports what the field kept, including truncation or reformatting. Plain
+    typing never retries. Long text continues in the background; until done,
+    other actions refuse with progress, while reads work.
 
-    For credentials, expect_origin requires the field's own page to have that
-    origin at the instant of writing. expect_input_type, with expect_origin,
-    also locks the input type. Writes without keystrokes; retries only an
-    observed empty field, at most three writes, guarding each. An unreadable
-    or changed value never reports success. Success is exactly 'typed into
-    <selector>', without background progress or other typing's news."""
+    expect_origin locks delivery to the field's origin. expect_input_type,
+    with expect_origin, also locks its type. Uses native autofill; retries only
+    an observed empty field, at most three guarded writes. Changed or unreadable
+    values fail. Success is exactly 'typed into <selector>', never progress.
+
+    mask_value hides text of at least eight characters from this owner's tool
+    results until this browser closes. Requires expect_origin; empty clears
+    are allowed. Page pixels are refused while masked text is present."""
+    if mask_value:
+        masked.validate(text, expect_origin)
     guard = {key: value for key, value in (
         ("expect_origin", expect_origin), ("expect_input_type", expect_input_type))
         if value is not None}
+    if mask_value:
+        guard["mask_value"] = True
     return await _work().typing(actions.type_text, selector, text, role=browser, **guard)
 
 

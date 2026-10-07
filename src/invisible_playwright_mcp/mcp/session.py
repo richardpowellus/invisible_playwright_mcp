@@ -239,6 +239,21 @@ class StealthSession:
         second old - and if it is older than STALE_AFTER the capture is
         started again, because the engine does not say when one ends.
         """
+        from . import masked
+
+        protected = bool(masked.registry(self).raw)
+        if not protected:
+            return await self._watch_frame(timeout)
+        await self.stop_watching()
+        await masked.guard_pixels(self)
+        try:
+            frame = await self._watch_frame(timeout, protected=True)
+        finally:
+            await self.stop_watching()
+        await masked.guard_pixels(self)
+        return frame
+
+    async def _watch_frame(self, timeout: float, *, protected: bool = False) -> bytes:
         page = self.page()
         key = id(page)
         state = self._watch.get(key)
@@ -255,11 +270,14 @@ class StealthSession:
                 state["at"] = self._clock()
                 state["arrived"].set()
 
+            self._watch[key] = state
             try:
                 await page.screencast.start(on_frame=on_frame,
                                             size=dict(self.WATCH_SIZE),
                                             fps=self.WATCH_FPS)
             except Exception as refused:
+                if not protected:
+                    self._watch.pop(key, None)
                 # The installed engine or wrapper predates the screencast.
                 # Say which feature is missing rather than surfacing a
                 # protocol sentence about a guid.
@@ -267,7 +285,6 @@ class StealthSession:
                     "the live window view needs invisible-playwright with "
                     "page.screencast and an engine from firefox-28 on: the "
                     "browser answered %s" % refused) from refused
-            self._watch[key] = state
         if not state["latest"]:
             try:
                 await asyncio.wait_for(state["arrived"].wait(), timeout)
@@ -278,11 +295,25 @@ class StealthSession:
                 # every later look wait on a capture that cannot answer. The
                 # next look starts its own, which succeeds the moment the window
                 # can be captured again.
-                await self._stop_watch(key)
+                if not protected:
+                    await self._stop_watch(key)
                 raise RuntimeError(
                     "the window capture started but no frame arrived in "
                     "%.0f s; a minimised window is captured as nothing" % timeout)
         return state["latest"]
+
+    async def stop_watching(self) -> None:
+        for key in list(self._watch):
+            state = self._watch[key]
+            try:
+                await state["page"].screencast.stop()
+            except Exception:
+                from .masked import MaskRefusal, SCREENSHOT_REFUSED
+
+                raise MaskRefusal(SCREENSHOT_REFUSED) from None
+            finally:
+                state["latest"] = b""
+            self._watch.pop(key, None)
 
     async def _stop_watch(self, key: int) -> None:
         state = self._watch.pop(key, None)
@@ -308,6 +339,9 @@ class StealthSession:
             self._browser = None
         self._forget_kept()
         self._drop_downloads()
+        from .masked import forget
+
+        forget(self)
 
     def _forget_kept(self) -> None:
         """Remove what was kept for the browser, now that nothing can read it."""

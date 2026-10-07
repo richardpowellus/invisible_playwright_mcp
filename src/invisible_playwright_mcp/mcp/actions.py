@@ -518,6 +518,9 @@ async def screenshot_png(session) -> bytes:
     Bytes rather than an MCP Image, because this is also what a live view in a
     browser tab needs, and that caller has no use for an MCP type.
     """
+    from .masked import guard_pixels
+
+    await guard_pixels(session)
     return await session.page().screenshot()
 
 
@@ -727,6 +730,9 @@ async def click_at(session, x: float, y: float, hold_seconds: float = 0.0) -> by
     Returns a screenshot taken right after release, so the result of the click
     is visible without a second round-trip.
     """
+    from .masked import guard_pixels
+
+    await guard_pixels(session)
     page = session.page()
     await page.mouse.move(x, y, steps=12)
     await page.mouse.down()
@@ -736,7 +742,7 @@ async def click_at(session, x: float, y: float, hold_seconds: float = 0.0) -> by
     # Give a post-click transition (checkmark, redirect, reflow) a moment to
     # start before the screenshot, so it reflects the outcome, not the click.
     await page.wait_for_timeout(400)
-    return await page.screenshot()
+    return await screenshot_png(session)
 
 
 #: What the page is asked about a field, before typing and after: what it holds,
@@ -817,7 +823,8 @@ def what_the_field_kept(selector: str, text: str, before: dict, after: dict) -> 
 
 async def type_text(session, selector: str, text: str,
                     expect_origin: str | None = None,
-                    expect_input_type: str | None = None) -> str:
+                    expect_input_type: str | None = None,
+                    mask_value: bool = False) -> str:
     """Type into a field the way a person does, and say what the field kept.
 
     The engine's `fill`: focus, the typist's pause (longer while the page is
@@ -843,6 +850,14 @@ async def type_text(session, selector: str, text: str,
     would outlast a client's patience goes on in the background
     (`Work.typing`), so typing it still finishes.
     """
+    if mask_value:
+        from . import masked
+
+        masked.validate(text, expect_origin)
+        masked.registry(session).register(text)
+        # A live watch must stop before the write, not just hide its next reply.
+        if text and hasattr(session, "stop_watching"):
+            await session.stop_watching()
     if expect_input_type is not None and expect_origin is None:
         raise ValueError("expect_input_type is only accepted together with expect_origin")
     page = session.page()

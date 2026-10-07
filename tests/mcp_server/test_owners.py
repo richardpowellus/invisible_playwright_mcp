@@ -617,6 +617,10 @@ async def test_allowed_handle_tools_reach_only_main(owners, monkeypatch, name, a
 
     for action in ("evaluate", "snapshot", "read_html", "read_text", "type_text", "press_key"):
         monkeypatch.setattr(actions, action, record)
+    async def screenshot(session):
+        touched.append(session)
+        return b"png"
+    monkeypatch.setattr(actions, "screenshot_png", screenshot)
     result = await call("B", name, args, meta={**identity("B"), HANDLE_KEY: old})
     assert not result.isError, text(result)
     if name == "browser_status":

@@ -38,7 +38,7 @@ from typing import Awaitable, Callable, Optional
 
 from invisible_playwright.async_api import TargetClosedError
 
-from . import DEFAULT_BROWSER_ID, GONE, NOT_OPEN, SUPPORT_BROWSER_ID, certificates, identity, plan, process, store
+from . import DEFAULT_BROWSER_ID, GONE, NOT_OPEN, SUPPORT_BROWSER_ID, certificates, identity, masked, plan, process, store
 from ..quiet import swallow
 from .actions import NAVIGATION_TIMEOUT_MS
 from .session import StealthSession
@@ -472,6 +472,7 @@ class Work:
             with swallow("a browser being closed may already be gone, and a "
                          "close that fails must not stop the next open"):
                 await session.close()
+            masked.forget(session)
 
     async def close_all(self) -> None:
         for role in list(self._open):
@@ -489,7 +490,9 @@ class Work:
         do only half of this: `session` locally, `acting` when an action
         raises a closed target, and `status` when the question does.
         """
-        self._open.pop(role, None)
+        session = self._open.pop(role, None)
+        if session is not None:
+            masked.forget(session)
         self._launched.pop(role, None)
         return RuntimeError(GONE % role)
 

@@ -111,25 +111,39 @@ class SessionEnded(types.Notification[SessionEndedParams, Literal[
 
 
 class CapabilityRedactor(logging.Filter):
+    def __init__(self, redact=None):
+        super().__init__()
+        self.redact = redact
+
     def filter(self, record: logging.LogRecord) -> bool:
         text = record.getMessage()
         if record.exc_info:
             text += "\n" + "".join(traceback.format_exception(*record.exc_info))
-        if HANDLE_KEY in text:
+        original = text
+        if "browser_type" in text or "mask_value" in text:
+            text = "MCP typing message (redacted)"
+        elif HANDLE_KEY in text:
             text = "MCP message containing a browser fill capability (redacted)"
         else:
             text = re.sub(r"bh_[A-Za-z0-9_-]{43}", "[browser fill capability]", text)
-        record.msg, record.args = text, ()
-        record.exc_info = record.exc_text = None
+        if self.redact is not None:
+            text = self.redact(text)
+        if text != original:
+            record.msg, record.args = text, ()
+            record.exc_info = record.exc_text = None
         return True
 
 
-def redact_sdk_logs() -> None:
+def redact_sdk_logs(redact=None) -> None:
     # These SDK loggers print entire requests, including _meta, at debug level.
     root = logging.getLogger()
     for target in (root, logging.getLogger("mcp.server.lowlevel.server"), *root.handlers):
-        if not any(isinstance(f, CapabilityRedactor) for f in target.filters):
-            target.addFilter(CapabilityRedactor())
+        filters = [f for f in target.filters if isinstance(f, CapabilityRedactor)]
+        if not filters:
+            target.addFilter(CapabilityRedactor(redact))
+        elif redact is not None:
+            for filter_ in filters:
+                filter_.redact = redact
 
 
 @asynccontextmanager
