@@ -252,11 +252,11 @@ async def test_click_checks_again_after_the_click_reveals_a_value(filled, monkey
     async def nothing(*args, **kwargs):
         pass
 
-    async def reveal():
+    async def reveal(*args, **kwargs):
         page.value = VALUE
 
     monkeypatch.setattr(page, "mouse", SimpleNamespace(
-        move=nothing, down=nothing, up=reveal), raising=False)
+        move=nothing, down=nothing, up=reveal, click=reveal), raising=False)
     monkeypatch.setattr(page, "wait_for_timeout", nothing, raising=False)
     result = await call("A", "browser_click_at", {"x": 10, "y": 10})
     assert result.isError and text(result) == REFUSAL
