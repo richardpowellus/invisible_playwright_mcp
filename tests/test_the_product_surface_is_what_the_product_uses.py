@@ -286,7 +286,8 @@ def test_the_gate_is_looking_at_the_whole_package():
     # what is excluded. It was written as 59 first - the count BEFORE the
     # exclusions - which is how a perimeter stops describing the gate that
     # carries it.
-    assert methods <= 120, "%d methods judged; the exclusions have stopped applying" % methods
+    # Network.capture and Work.network_capture add two reachable methods.
+    assert methods <= 122, "%d methods judged; the exclusions have stopped applying" % methods
     reached = set()
     for text in sources.values():
         reached.update(_on_an_object(ast.parse(text), known))

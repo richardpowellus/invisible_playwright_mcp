@@ -181,6 +181,12 @@ def test_a_browser_saves_downloads_privately_and_removes_them_with_it(monkeypatc
     class _Ctx:
         pages = []
 
+        def on(self, event, listener):
+            pass
+
+        def remove_listener(self, event, listener):
+            pass
+
         async def close(self):
             pass
 
@@ -224,11 +230,14 @@ class _Response:
 class _Context:
     def __init__(self):
         self.listeners = []
+        self.other_listeners = {}
         self._registered = {}
         self.page = None
 
     def on(self, event, fn):
-        assert event == "response"
+        if event != "response":
+            self.other_listeners.setdefault(event, []).append(fn)
+            return
         def emit(response):
             if not hasattr(response, "frame"):
                 response.frame = SimpleNamespace(page=self.page)
@@ -237,7 +246,10 @@ class _Context:
         self.listeners.append(emit)
 
     def remove_listener(self, event, fn):
-        self.listeners.remove(self._registered.pop(fn))
+        if event == "response":
+            self.listeners.remove(self._registered.pop(fn))
+        else:
+            self.other_listeners[event].remove(fn)
 
 
 class _Page:

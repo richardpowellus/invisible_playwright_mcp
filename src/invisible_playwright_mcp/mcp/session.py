@@ -19,7 +19,7 @@ import time
 from typing import Any
 
 from ..quiet import swallow
-from . import certificates
+from . import certificates, network
 
 from invisible_playwright.async_api import InvisiblePlaywright, TargetClosedError
 
@@ -27,7 +27,8 @@ from invisible_playwright.async_api import InvisiblePlaywright, TargetClosedErro
 class StealthSession:
     def __init__(self, *, download_root: str | None = None,
                  cert_pins: tuple[certificates.Pin, ...] = (),
-                 lan_domains: tuple[str, ...] = (), **kwargs: Any) -> None:
+                 lan_domains: tuple[str, ...] = (),
+                 network_limits: network.Limits | None = None, **kwargs: Any) -> None:
         if cert_pins and not kwargs.get("profile_dir"):
             raise ValueError("refused: accept_lan_certs requires a profile directory.")
         self.cert_pins = cert_pins
@@ -57,6 +58,7 @@ class StealthSession:
         self._kept: list[str] = []
         self.downloads: str | None = None
         self._download_root = download_root
+        self.network = network.Network(network_limits)
 
     @property
     def seed(self):
@@ -89,6 +91,7 @@ class StealthSession:
                     certificates.write_overrides, kwargs["profile_dir"], self.cert_pins)
             self._ipw = InvisiblePlaywright(**kwargs)
             await self._attach(await self._ipw.__aenter__())
+            self.network.attach(self._context)
         except BaseException:
             self._drop_downloads()
             raise
@@ -342,6 +345,7 @@ class StealthSession:
     # --- the end ----------------------------------------------------------------
 
     async def close(self) -> None:
+        await self.network.close()
         for key in list(self._watch):
             await self._stop_watch(key)
         if self._context is not None:

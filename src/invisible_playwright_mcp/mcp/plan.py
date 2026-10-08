@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
-from . import identity, lan
+from . import identity, lan, network
 from .proxy import proxy_from_url
 
 #: Passed for `profile` or `proxy` to mean "explicitly none", as opposed to
@@ -246,9 +246,28 @@ def launched_here(env: Optional[Mapping[str, str]] = None) -> dict:
     decided: dict[str, Any] = {
         "headless": env.get("STEALTHFOX_HEADLESS", "1") != "0",
         "lan_domains": lan.parse_domains(env.get("STEALTHFOX_LAN_DOMAINS", "")),
+        "network_limits": network.Limits(**{
+            field: _positive_integer(env, name, default)
+            for field, name, default in (
+                ("entries", "STEALTHFOX_NETWORK_ENTRIES", network.DEFAULT_ENTRIES),
+                ("body_bytes", "STEALTHFOX_NETWORK_BODY_BYTES", network.DEFAULT_BODY_BYTES),
+                ("total_body_bytes", "STEALTHFOX_NETWORK_TOTAL_BODY_BYTES",
+                 network.DEFAULT_TOTAL_BODY_BYTES),
+            )
+        }),
     }
     decided.update(engine_here(env))
     return decided
+
+
+def _positive_integer(env: Mapping[str, str], name: str, default: int) -> int:
+    try:
+        value = int(env.get(name, str(default)))
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    raise ValueError("%s must be a positive integer" % name)
 
 
 def plan_session(seed: Optional[int] = None, proxy: Optional[str] = None,
