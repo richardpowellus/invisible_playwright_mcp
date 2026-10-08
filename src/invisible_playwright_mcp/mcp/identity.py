@@ -14,9 +14,10 @@ writes it inside; every session after that reads it back. "This profile is this
 person" becomes true by construction, and the caller never has to remember a
 number to stay consistent.
 
-Without a profile there is nothing to remember, so the seed is drawn fresh and
-every session is a different stranger - which is the right default for somebody
-who has not thought about it.
+Without a profile the seed is drawn fresh. Owner mode keeps that resolved
+identity in memory per role until the owner expires, never on disk.
+Drawn identities must fit the current X display as a whole fingerprint;
+explicit and remembered identities are never resampled.
 
 ⛔ AND A DRAWN SEED IS ALWAYS REPORTED. A random identity that is not written
 down cannot be reproduced, and this project debugs by re-running the same seed.
@@ -27,7 +28,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 import random
+import re
+import subprocess
+from functools import lru_cache
 from pathlib import Path
 from typing import Mapping, Optional
 
@@ -40,6 +46,69 @@ IDENTITY_FILE = ".stealth-identity.json"
 #: short enough to read off a terminal and copy without mistakes, and the engine
 #: takes any int.
 SEED_MAX = 2 ** 31 - 1
+DRAW_ATTEMPTS = 256
+logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def display_size() -> tuple[int, int] | None:
+    """Read X11 once, inheriting XAUTHORITY rather than opening another display."""
+    display = os.environ.get("DISPLAY")
+    reason = "DISPLAY is unset"
+    if display:
+        try:
+            result = subprocess.run(
+                ["xdpyinfo", "-display", display], capture_output=True, text=True,
+                timeout=2, env={**os.environ, "LC_ALL": "C"}, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            reason = type(exc).__name__
+        else:
+            output = result.stdout
+            screen = re.search(r"default screen number:\s*(\d+)", output)
+            if screen:
+                output = output.split("screen #%s:" % screen[1], 1)[-1]
+            dimensions = re.search(r"dimensions:\s*(\d+)x(\d+)\s+pixels", output)
+            if result.returncode == 0 and dimensions:
+                width, height = map(int, dimensions.groups())
+                if width > 0 and height > 0:
+                    return width, height
+            reason = "xdpyinfo did not report valid dimensions (exit %s)" % result.returncode
+    logger.warning("X display size unavailable (%s); drawn fingerprints are unconstrained", reason)
+    return None
+
+
+def screen_pixels(seed: int) -> tuple[float, float]:
+    # Use the launcher's own generator: sampling or pinning screen alone would
+    # break its joint distribution with the other fingerprint fields.
+    from invisible_playwright import async_api
+
+    screen = async_api.generate_profile(seed).screen
+    return screen.width * screen.dpr, screen.height * screen.dpr
+
+
+def screen_warning(seed: int) -> str:
+    display = display_size()
+    if display is None:
+        return ""
+    width, height = screen_pixels(seed)
+    if width <= display[0] and height <= display[1]:
+        return ""
+    return ("the window is larger than the display: seed %s requires %gx%g pixels, "
+            "but X provides %dx%d. The requested identity is unchanged; screenshots "
+            "may not map 1:1 to click coordinates." % (seed, width, height, *display))
+
+
+def _draw_seed() -> int:
+    display = display_size()
+    for _ in range(DRAW_ATTEMPTS):
+        seed = random.randrange(1, SEED_MAX)
+        if display is None:
+            return seed
+        width, height = screen_pixels(seed)
+        if width <= display[0] and height <= display[1]:
+            return seed
+    raise ValueError("No drawn fingerprint fits the X display %dx%d after %d attempts; "
+                     "no browser was opened." % (*display, DRAW_ATTEMPTS))
 
 
 class IdentityConflict(ValueError):
@@ -206,7 +275,7 @@ def resolve_seed(explicit: Optional[int], profile: Optional[str],
                 % env["STEALTHFOX_SEED"])
         where = "STEALTHFOX_SEED"
     else:
-        seed, where = random.randrange(1, SEED_MAX), "drawn for this session"
+        seed, where = _draw_seed(), "drawn for this session"
 
     if directory is not None:
         _remember(directory, seed)

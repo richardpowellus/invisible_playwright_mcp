@@ -24,7 +24,7 @@ import anyio
 
 from invisible_playwright.async_api import TargetClosedError
 
-from . import DEFAULT_BROWSER_ID, GONE, actions, masked
+from . import DEFAULT_BROWSER_ID, GONE, actions, masked, plan
 from .session import StealthSession
 from .owner_instances import Instances
 from .work import Work
@@ -148,6 +148,7 @@ class OwnerWork(Work):
         self.registry = registry
         self.profiles: dict[str, Path] = {}
         self.dead: set[str] = set()
+        self._identities: dict[str, dict] = {}
         #: Browsers the sweep dropped because their Firefox exited: the
         #: owner's next call is told GONE once, not "not open".
         self.lost: set[str] = set()
@@ -159,12 +160,21 @@ class OwnerWork(Work):
     def owner_label(self) -> str:
         return self.owner or "(unknown)"
 
-    def remembered(self) -> None:
-        return None
+    def remembered(self, role: str = DEFAULT_BROWSER_ID) -> dict | None:
+        # Owner identities are kept in memory per role until the owner is
+        # reaped, never in the process-global store or on disk.
+        return self._identities.get(role)
 
-    def remember(self) -> None:
-        # Owner profiles and identities never enter the process-global store.
-        return None
+    def remember(self, role: str = DEFAULT_BROWSER_ID) -> None:
+        launched = self._launched.get(role)
+        if launched is not None:
+            self._identities[role] = {
+                key: launched[key] for key in ("seed", "proxy") if key in launched}
+
+    def _plan_session(self, **kwargs) -> plan.SessionPlan:
+        # Suppress the environment's profile AFTER deciding whether the caller
+        # asked for a new identity; the private profile is allocated in _start.
+        return super()._plan_session(**dict(kwargs, profile=""))
 
     async def open(self, role: str, *, seed: int | None = None,
                    proxy: str | None = None, profile: str | None = None,
@@ -173,7 +183,7 @@ class OwnerWork(Work):
             raise ValueError("Persistent profile arguments are refused in owner mode; "
                              "leave profile out for an ephemeral browser.")
         self.lost.discard(role)
-        result = await super().open(role, seed=seed, proxy=proxy, profile="",
+        result = await super().open(role, seed=seed, proxy=proxy, profile=profile,
                                     accept_lan_certs=accept_lan_certs)
         if self.upload_dir is not None:
             result += "\nupload dir: " + str(self.upload_dir)
