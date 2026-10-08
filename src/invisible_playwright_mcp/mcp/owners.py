@@ -22,6 +22,8 @@ from urllib.parse import urlsplit
 
 import anyio
 
+from invisible_playwright.async_api import TargetClosedError
+
 from . import DEFAULT_BROWSER_ID, GONE, actions, masked
 from .session import StealthSession
 from .owner_instances import Instances
@@ -40,6 +42,8 @@ IDENTITY_ERROR = "Owner mode requires a valid mcpd/identity sessionId."
 HANDLE_ERROR = "Invalid or revoked browser fill handle."
 MAX_ENDED_SESSIONS = 4096
 EXIT_CLOSE_SECONDS = 3.0
+#: How long the sweep waits for a browser it believes has exited to say why.
+EXITED_ROUND_TRIP_SECONDS = 5.0
 _delegated_call: ContextVar[bool] = ContextVar("browser_fill_delegated", default=False)
 
 
@@ -67,6 +71,43 @@ def _remove_directory(directory: Path) -> None:
         directory.unlink()
     elif directory.exists():
         shutil.rmtree(directory)
+
+
+def profile_in_use(directory: Path) -> bool | None:
+    """Whether a live process runs Firefox on this profile, read from /proc.
+
+    ⛔ ASKED OF THE OPERATING SYSTEM, BECAUSE THE SESSION CANNOT ANSWER IT.
+    `StealthSession.is_usable` goes on saying "connected" for seconds after the
+    engine is killed, and only a round trip notices, so a browser that died
+    while its owner was not calling held a capacity slot until that owner
+    called again or the idle reap ran: 2026-10-07, 16 minutes of "Browser
+    capacity exhausted". Firefox is launched with `-profile <dir>` and every
+    owner profile is private, so the argv names the browser exactly. A dead
+    child that has not been reaped yet is a zombie with an empty cmdline, and
+    counts as gone. None means /proc could not be read: nothing is dropped on
+    an answer nobody could give.
+    """
+    proc = Path("/proc")
+    try:
+        names = os.listdir(proc)
+    except OSError:
+        return None
+    wanted = {os.fsencode(str(directory))}
+    try:
+        wanted.add(os.fsencode(str(directory.resolve())))
+    except OSError:
+        pass
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            argv = (proc / name / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        for flag, value in zip(argv, argv[1:]):
+            if flag == b"-profile" and value in wanted:
+                return True
+    return False
 
 
 def owner_id(meta: dict) -> str:
@@ -107,9 +148,16 @@ class OwnerWork(Work):
         self.registry = registry
         self.profiles: dict[str, Path] = {}
         self.dead: set[str] = set()
+        #: Browsers the sweep dropped because their Firefox exited: the
+        #: owner's next call is told GONE once, not "not open".
+        self.lost: set[str] = set()
         self.fill_handle: str | None = None
         self.upload_dir: Path | None = None
         self.download_dir: Path | None = None
+        self.owner = ""
+
+    def owner_label(self) -> str:
+        return self.owner or "(unknown)"
 
     def remembered(self) -> None:
         return None
@@ -124,6 +172,7 @@ class OwnerWork(Work):
         if profile is not None:
             raise ValueError("Persistent profile arguments are refused in owner mode; "
                              "leave profile out for an ephemeral browser.")
+        self.lost.discard(role)
         result = await super().open(role, seed=seed, proxy=proxy, profile="",
                                     accept_lan_certs=accept_lan_certs)
         if self.upload_dir is not None:
@@ -319,6 +368,7 @@ class OwnerWork(Work):
             except Exception:
                 logger.exception("Background typing failed while its owner browser was closing")
         self.dead.add(role)
+        self.lost.discard(role)
         if role == DEFAULT_BROWSER_ID:
             self.revoke()
         session = self._open.get(role)
@@ -335,7 +385,8 @@ class OwnerWork(Work):
             await self.registry.capacity.release()
         self.dead.discard(role)
 
-    def gone(self, role: str) -> RuntimeError:
+    def gone(self, role: str, cause: BaseException | None = None) -> RuntimeError:
+        self.report_gone(role, cause)
         self.dead.add(role)
         if role == DEFAULT_BROWSER_ID:
             self.revoke()
@@ -344,7 +395,35 @@ class OwnerWork(Work):
     def session(self, role: str) -> StealthSession:
         if role in self.dead:
             raise RuntimeError(GONE % role)
+        if role in self.lost and role not in self._open:
+            self.lost.discard(role)
+            raise RuntimeError(GONE % role)
         return super().session(role)
+
+    async def exited(self, role: str) -> BaseException | None:
+        """The closed-target error of a browser whose process has exited, or
+        None while it is (or may be) alive.
+
+        Two independent observations, both required: /proc shows no process
+        on the private profile, AND a round trip raises a closed target. The
+        second never touches a page, because the process is gone; it is what
+        carries the exit code and Firefox's last output for the journal. A
+        browser that answers is alive whatever /proc said, and is kept.
+        """
+        directory = self.profiles.get(role)
+        session = self._open.get(role)
+        if directory is None or session is None:
+            return None
+        if await asyncio.to_thread(self.registry.process_probe, directory) is not False:
+            return None
+        try:
+            async with asyncio.timeout(EXITED_ROUND_TRIP_SECONDS):
+                await session.describe_pages()
+        except TargetClosedError as closed:
+            return closed
+        except Exception:
+            return None
+        return None
 
     async def reap_dead(self) -> None:
         for role in list(self.dead):
@@ -377,7 +456,8 @@ class Owners:
     def __init__(self, *, limit: int = 2, idle_seconds: float = 900.0,
                  factory: Callable[..., StealthSession] = StealthSession,
                  engine: Engine | None = None,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic,
+                 process_probe: Callable[[Path], bool | None] = profile_in_use) -> None:
         if os.name != "posix":
             raise RuntimeError("Owner mode requires POSIX filesystem locks")
         if not math.isfinite(idle_seconds) or idle_seconds <= 0:
@@ -387,6 +467,7 @@ class Owners:
         self.factory = factory
         self.engine = engine
         self.clock = clock
+        self.process_probe = process_probe
         self.upload_roots = actions.upload_dirs()
         self.download_roots = actions.download_dirs()
         profile_root = Path(tempfile.gettempdir()).resolve()
@@ -449,8 +530,9 @@ class Owners:
         if self.stopping.is_set() or identity in self.ended:
             raise ValueError("This browser owner session has ended.")
         if identity not in self.entries:
-            self.entries[identity] = Owner(
-                OwnerWork(self, factory=self.factory, engine=self.engine), self.clock())
+            work = OwnerWork(self, factory=self.factory, engine=self.engine)
+            work.owner = identity
+            self.entries[identity] = Owner(work, self.clock())
         return self.entries[identity]
 
     def redaction_windows(self, meta: dict) -> set[str]:
@@ -552,11 +634,50 @@ class Owners:
         if errors:
             raise ExceptionGroup("Could not close all idle browser owners", errors)
 
+    async def reap_exited(self) -> None:
+        """Release the capacity of every browser whose Firefox has exited,
+        whoever owns it, without waiting for that owner to call again.
+
+        ⛔ NEVER UNDER A CALL. An owner whose lock is held, who has a call
+        queued, or who is typing in the background is skipped exactly as
+        `reap_idle` skips it: that call notices the death itself and its own
+        `reap_dead` releases the slot. Live browsers are never dropped, because
+        `exited` needs the process gone AND a round trip that fails.
+        """
+        errors = []
+        for identity, entry in list(self.entries.items()):
+            work = entry.work
+            if (entry.ended or not work.profiles or entry.lock.locked()
+                    or entry.pending_calls
+                    or any(not rec.task.done() for rec in work._typing.values())):
+                continue
+            async with entry.lock:
+                if entry.ended or self.entries.get(identity) is not entry:
+                    continue
+                lost = []
+                for role in list(work.profiles):
+                    cause = await work.exited(role)
+                    if cause is not None:
+                        work.gone(role, cause)
+                        lost.append(role)
+                try:
+                    with anyio.CancelScope(shield=True):
+                        await work.reap_dead()
+                except Exception as exc:
+                    errors.append(exc)
+                work.lost.update(role for role in lost if role not in work._open)
+        if errors:
+            raise ExceptionGroup("Could not release exited owner browsers", errors)
+
     async def idle_loop(self) -> None:
         while not self.stopping.is_set():
             try:
                 await asyncio.wait_for(self.stopping.wait(), min(30, self.idle_seconds / 2))
             except TimeoutError:
+                try:
+                    await self.reap_exited()
+                except Exception:
+                    logger.exception("Failed to release exited owner browsers; capacity retained")
                 try:
                     await self.reap_idle()
                 except Exception:

@@ -30,6 +30,7 @@ A test builds its own with a factory that launches no browser.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from pathlib import Path
@@ -42,6 +43,8 @@ from . import DEFAULT_BROWSER_ID, GONE, NOT_OPEN, SUPPORT_BROWSER_ID, certificat
 from ..quiet import swallow
 from .actions import NAVIGATION_TIMEOUT_MS
 from .session import StealthSession
+
+logger = logging.getLogger(__name__)
 
 #: TWO browsers in one piece of work, with fixed roles, and the number is a
 #: decision rather than a measurement - the opposite of what it was until
@@ -480,7 +483,31 @@ class Work:
 
     # --- act ------------------------------------------------------------------
 
-    def gone(self, role: str) -> RuntimeError:
+    def owner_label(self) -> str:
+        """Who this work is for, as the journal names it."""
+        return self.session_id or "this process"
+
+    def report_gone(self, role: str, cause: Optional[BaseException]) -> None:
+        """Say in the journal WHY a browser is gone, which the sentence the
+        model gets does not.
+
+        ⛔ THE ENGINE KNOWS AND THIS IS THE ONLY PLACE IT IS KEPT. A closed
+        target's text carries `the browser exited with code N` and Firefox's
+        last output (`_juggler/connection.py`, `_why_closed`). The sentence
+        stays fixed for the model, and the profile is deleted when the browser
+        is dropped, so before this a death on 2026-10-07 left nothing to say
+        whether Firefox crashed, was killed or was closed. Redacted with the
+        masked values of this work's browsers, because Firefox's last output is
+        page-controlled text. Call it BEFORE the session is forgotten: the
+        masked values go with it.
+        """
+        if cause is None:
+            return
+        text = masked.redact_text(str(cause), masked.result_windows(self))
+        logger.warning("the %s browser of owner %s is gone: %s",
+                       role, self.owner_label(), text)
+
+    def gone(self, role: str, cause: Optional[BaseException] = None) -> RuntimeError:
         """Forget this browser, and answer the sentence that says it is gone.
 
         ⛔ ONE PLACE, BECAUSE IT IS ONE FACT WITH TWO HALVES: the model is
@@ -490,6 +517,7 @@ class Work:
         do only half of this: `session` locally, `acting` when an action
         raises a closed target, and `status` when the question does.
         """
+        self.report_gone(role, cause)
         session = self._open.pop(role, None)
         if session is not None:
             masked.forget(session)
@@ -674,8 +702,8 @@ class Work:
         self._acted = at
         try:
             return await fn(session, *args, **kwargs)
-        except TargetClosedError:
-            raise self.gone(at) from None
+        except TargetClosedError as closed:
+            raise self.gone(at, closed) from None
 
     # --- look -------------------------------------------------------------------
 
@@ -705,14 +733,14 @@ class Work:
             session = self._open[name]
             try:
                 pages = await session.describe_pages()
-            except TargetClosedError:
+            except TargetClosedError as closed:
                 # ⛔ NOT A ROW THAT CANNOT BE READ: A BROWSER THAT IS NOT THERE.
                 # Everything this answers is open by definition, so a browser
                 # whose engine has gone is dropped and forgotten rather than
                 # listed as running - the live panes draw this answer, and a
                 # pane over a browser that no longer exists is the frozen
                 # picture of [B202], one layer up.
-                self.gone(name)
+                self.gone(name, closed)
                 continue
             except Exception:
                 # Readable as a state rather than as an absence: a browser whose
@@ -749,14 +777,14 @@ class Work:
         launched = self._launched[role]
         try:
             rows = await session.describe_pages()
-        except TargetClosedError:
+        except TargetClosedError as closed:
             # ⛔ THE QUESTION IS WHAT NOTICED, and it must not answer anyway.
             # The identity below comes from the launch kwargs, which outlive
             # the browser, and the page from a url a dead page still holds in
             # memory - so without this the status of a browser whose engine had
             # been killed read exactly like the status of a healthy one.
             # Measured 2026-09-14 against firefox-30.
-            raise self.gone(role) from None
+            raise self.gone(role, closed) from None
         except Exception:
             # Any other failure is the page being difficult, not the browser
             # being gone: the identity is still worth reporting.
