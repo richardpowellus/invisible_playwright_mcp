@@ -93,6 +93,59 @@ async def test_a_b_negative_isolation(owners):
     assert "owner-a.invalid" in success(await call("A", "browser_status"))
 
 
+async def test_network_read_clear_and_capture_are_owner_and_browser_isolated(owners):
+    from test_network import Context, Request
+
+    owners.capacity.limit = 3
+    for owner, role in (("A", "main"), ("A", "support"), ("B", "main")):
+        success(await call(owner, "browser_open", {"browser": role}))
+        capture = owners.entries[owner].work._open[role].network
+        context = Context()
+        capture.attach(context)
+        context.emit("request", Request(url="https://%s-%s.invalid/private" % (owner, role)))
+    a = success(await call("A", "browser_network"))
+    b = success(await call("B", "browser_network"))
+    assert "A-main.invalid" in a and "B-main.invalid" not in a and "A-support.invalid" not in a
+    assert "B-main.invalid" in b and "A-main.invalid" not in b
+    enabled = success(await call("A", "browser_network_capture", {"request_bodies": True}))
+    assert json.loads(enabled) == {"request_bodies": True}
+    assert json.loads(success(await call("A", "browser_network")))["request_bodies"] is True
+    assert json.loads(success(await call("B", "browser_network")))["request_bodies"] is False
+    assert json.loads(success(await call("A", "browser_network", {
+        "browser": "support"})))["request_bodies"] is False
+    success(await call("B", "browser_network_capture", {"request_bodies": False}))
+    assert json.loads(success(await call("A", "browser_network")))["request_bodies"] is True
+    success(await call("B", "browser_network_clear"))
+    assert json.loads(success(await call("B", "browser_network")))["entries"] == []
+    assert "A-main.invalid" in success(await call("A", "browser_network"))
+    assert "A-support.invalid" in success(await call("A", "browser_network", {"browser": "support"}))
+    for tool, arguments in (("browser_network", {}), ("browser_network_clear", {}),
+                            ("browser_network_capture", {"request_bodies": True})):
+        missing = await call("C", tool, arguments)
+        assert missing.isError and NOT_OPEN % "main" in text(missing)
+        assert (await call(None, tool, arguments, meta={})).isError
+    capability = handle(await call("A", "browser_status"))
+    for tool, arguments in (("browser_network", {}), ("browser_network_clear", {}),
+                            ("browser_network_capture", {"request_bodies": True})):
+        refused = await call("B", tool, arguments, meta={**identity("B"), HANDLE_KEY: capability})
+        assert refused.isError
+
+
+async def test_capture_registration_error_reaches_the_tool_unchanged(owners):
+    from test_network import Context
+
+    success(await call("A", "browser_open"))
+    capture = owners.entries["A"].work._open["main"].network
+    context = Context()
+    context.route_error = "BrowserContext.route: service_workers='block'\nengine detail"
+    capture.attach(context)
+    result = await call("A", "browser_network_capture", {"request_bodies": True})
+    assert result.isError
+    assert text(result) == "Error executing tool browser_network_capture: " + context.route_error
+    assert not context.routes
+    assert json.loads(success(await call("A", "browser_network")))["request_bodies"] is False
+
+
 async def test_owner_status_keeps_the_no_page_marker_and_final_fill_handle(owners):
     opened = await call("A", "browser_open")
     status = success(await call("A", "browser_status"))
