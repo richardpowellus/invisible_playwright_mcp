@@ -9,6 +9,7 @@ only that owner's NEXT call released the slot, `browser_open` answered
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -34,9 +35,18 @@ class _Exits(_Recording):
     and only a round trip raises, carrying the engine's reason."""
 
     async def describe_pages(self):
+        # As the engine does: with no page open the list is local, so a dead
+        # browser that never navigated still answers [] here.
+        if self.dead and self.urls:
+            raise TargetClosedError(EXITED)
+        return [{"url": u, "title": "", "active": i == len(self.urls) - 1}
+                for i, u in enumerate(self.urls)]
+
+    async def round_trip(self):
+        # Never the page list: with no page open that answers locally
+        # (live, 2026-10-07). Only a call that reaches the browser raises.
         if self.dead:
             raise TargetClosedError(EXITED)
-        return await super().describe_pages()
 
 
 @pytest.fixture
@@ -124,3 +134,39 @@ def test_profile_in_use_reads_proc(tmp_path):
     if not os.path.isdir("/proc"):
         pytest.skip("needs /proc")
     assert profile_in_use(tmp_path) is False
+
+
+@pytest.mark.e2e
+async def test_a_killed_engine_is_released_and_its_exit_code_logged(monkeypatch, caplog):
+    """The real engine, killed before its first navigation: the case the fake
+    first got wrong (2026-10-07), because the page list answers locally."""
+    import signal
+    monkeypatch.setenv("STEALTHFOX_HEADLESS", "1")
+    registry = Owners(limit=1)
+    try:
+        work = registry.caller("A").work
+        await work.open("main")
+        directory = work.profiles["main"]
+        assert profile_in_use(directory) is True
+        want = os.fsencode(str(directory))
+        pids = []
+        for name in os.listdir("/proc"):
+            try:
+                argv = open("/proc/%s/cmdline" % name, "rb").read().split(b"\0")
+            except OSError:
+                continue
+            if any(a == b"-profile" and b == want for a, b in zip(argv, argv[1:])):
+                pids.append(int(name))
+        assert pids
+        for pid in pids:
+            os.kill(pid, signal.SIGKILL)
+        for _ in range(50):
+            if profile_in_use(directory) is False:
+                break
+            await asyncio.sleep(0.1)
+        with caplog.at_level(logging.WARNING):
+            await registry.reap_exited()
+        assert registry.capacity.used == 0 and not directory.exists()
+        assert any("exited with code -9" in r.getMessage() for r in caplog.records)
+    finally:
+        await registry.close_all()

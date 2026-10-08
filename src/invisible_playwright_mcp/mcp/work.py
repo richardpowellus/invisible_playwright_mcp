@@ -777,6 +777,11 @@ class Work:
         launched = self._launched[role]
         try:
             rows = await session.describe_pages()
+            if not rows:
+                # ⛔ NO PAGE, NO ROUND TRIP: the page list is local, so a
+                # browser killed before its first navigation answered "no page
+                # open yet" here (live, 2026-10-07). Ask the browser itself.
+                await session.round_trip()
         except TargetClosedError as closed:
             # ⛔ THE QUESTION IS WHAT NOTICED, and it must not answer anyway.
             # The identity below comes from the launch kwargs, which outlive

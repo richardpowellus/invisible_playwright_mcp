@@ -67,6 +67,10 @@ class _Recording:
         return [{"url": u, "title": "", "active": i == len(self.urls) - 1}
                 for i, u in enumerate(self.urls)]
 
+    async def round_trip(self):
+        if self.dead:
+            raise TargetClosedError("Target page, context or browser has been closed")
+
     async def watch_frame(self, timeout=3.0):
         return b"\xff\xd8\xff frame"
 

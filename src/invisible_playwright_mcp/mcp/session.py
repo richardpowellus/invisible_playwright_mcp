@@ -130,6 +130,22 @@ class StealthSession:
         except Exception:
             return False
 
+    async def round_trip(self) -> None:
+        """Ask the browser something, at the browser and not at a page.
+
+        ⛔ FOR THE SWEEP THAT RELEASES EXITED BROWSERS, AND ONLY AFTER /proc
+        SAID THE PROCESS IS GONE. `describe_pages` is not a round trip when no
+        page is open: it answers `[]` from the local list, so a browser killed
+        before its first navigation looked alive to it (measured live,
+        2026-10-07). The context's cookie jar lives in the browser process, so
+        reading it raises a closed target, carrying the exit code and the
+        browser's last output, whenever that process is gone - and touches no
+        page while it is not.
+        """
+        if self._context is None:
+            raise RuntimeError("this browser never finished starting")
+        await self._context.cookies()
+
     # --- the page ---------------------------------------------------------------
 
     def pages(self) -> list:

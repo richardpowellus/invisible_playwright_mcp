@@ -406,7 +406,8 @@ class OwnerWork(Work):
 
         Two independent observations, both required: /proc shows no process
         on the private profile, AND a round trip raises a closed target. The
-        second never touches a page, because the process is gone; it is what
+        second (`StealthSession.round_trip`) reads the browser's cookie jar and
+        touches no page; it is what
         carries the exit code and Firefox's last output for the journal. A
         browser that answers is alive whatever /proc said, and is kept.
         """
@@ -418,7 +419,7 @@ class OwnerWork(Work):
             return None
         try:
             async with asyncio.timeout(EXITED_ROUND_TRIP_SECONDS):
-                await session.describe_pages()
+                await session.round_trip()
         except TargetClosedError as closed:
             return closed
         except Exception:
