@@ -259,13 +259,15 @@ class Work:
             return self._acted
         return next(iter(self.roles()), "")
 
-    def remembered(self) -> Optional[dict]:
+    def remembered(self, role: str = DEFAULT_BROWSER_ID) -> Optional[dict]:
         """Who `main` was the last time this session opened it, from the file.
 
         The identity fields only. A file written by an older build can name
         eight browsers and call them anything: what comes back is the one the
         file says was in focus, else the first by name, and only its identity.
         """
+        if role != DEFAULT_BROWSER_ID:
+            return None
         saved = store.load(self.session_id)
         held = (saved or {}).get("browsers") or {}
         if not held:
@@ -273,7 +275,7 @@ class Work:
         keep = saved.get("focus") if saved.get("focus") in held else sorted(held)[0]
         return {k: v for k, v in held[keep].items() if k in WHO_A_BROWSER_IS}
 
-    def remember(self) -> None:
+    def remember(self, role: str = DEFAULT_BROWSER_ID) -> None:
         """Write down who `main` is. Called by `open` and by nothing else.
 
         The helper is never written down: a support browser that came back
@@ -282,7 +284,9 @@ class Work:
         built and correct, and a full disk must not turn a working
         `browser_open` into an error.
         """
-        launched = self._launched.get(DEFAULT_BROWSER_ID)
+        if role != DEFAULT_BROWSER_ID:
+            return
+        launched = self._launched.get(role)
         if launched is None:
             return
         who = {k: v for k, v in launched.items() if k in WHO_A_BROWSER_IS}
@@ -290,6 +294,9 @@ class Work:
             store.save(self.session_id, {DEFAULT_BROWSER_ID: who}, focus=DEFAULT_BROWSER_ID)
 
     # --- open and close -------------------------------------------------------
+
+    def _plan_session(self, **kwargs) -> plan.SessionPlan:
+        return plan.plan_session(**kwargs)
 
     async def open(self, role: str, *, seed: Optional[int] = None,
                    proxy: Optional[str] = None,
@@ -318,7 +325,7 @@ class Work:
                              "identity, and `support`, the helper beside it. "
                              "There is no %r." % role)
         asked = seed is not None or proxy is not None or profile is not None
-        remembered = None if asked or role != DEFAULT_BROWSER_ID else self.remembered()
+        remembered = None if asked else self.remembered(role)
         if remembered:
             # ⛔ THIS LAUNCH DECIDES THE ENGINE AND THE WINDOW, NOT THE FILE.
             # `launched_here` is written OVER the file's word, not under it: a
@@ -329,8 +336,8 @@ class Work:
             seed_from, exit_note, warnings = REMEMBERED, "", ()
         else:
             try:
-                chosen = plan.plan_session(seed=seed, proxy=proxy, profile=profile,
-                                           helper=role == SUPPORT_BROWSER_ID)
+                chosen = self._plan_session(seed=seed, proxy=proxy, profile=profile,
+                                            helper=role == SUPPORT_BROWSER_ID)
             except (identity.IdentityConflict, ValueError) as exc:
                 # Refused, not guessed. Every case here is one where continuing
                 # would hand the caller a different person than the one they
@@ -340,6 +347,9 @@ class Work:
                 raise ValueError("refused: %s" % exc)
             settings = chosen.kwargs
             seed_from, exit_note, warnings = chosen.seed_from, chosen.exit, chosen.warnings
+
+        if warning := identity.screen_warning(settings["seed"]):
+            warnings = (*warnings, warning)
 
         main_launched = self._launched.get(DEFAULT_BROWSER_ID)
         if role == SUPPORT_BROWSER_ID and proxy is None and main_launched is not None:
@@ -396,8 +406,7 @@ class Work:
             # where the next few commands are going, and the pane should say
             # so before the first of them arrives rather than after.
             self._acted = role
-            if role == DEFAULT_BROWSER_ID:
-                self.remember()
+            self.remember(role)
         return "the %s browser is open. %s" % (role, plan.describe(
             settings, seed_from=seed_from, exit_note=exit_note, warnings=warnings))
 
