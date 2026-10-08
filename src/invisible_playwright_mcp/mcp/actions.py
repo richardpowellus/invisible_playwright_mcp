@@ -723,22 +723,26 @@ async def click(session, selector: str) -> str:
 async def click_at(session, x: float, y: float, hold_seconds: float = 0.0) -> bytes:
     """Click (or press-and-hold) a raw viewport coordinate instead of a
     selector - for targets a selector cannot reliably reach: a slider track, a
-    canvas-drawn captcha, or a precise point inside a wider element. Moves the
-    pointer there first (no teleport), then down, then - if hold_seconds is 0 -
-    immediately up (a plain click); otherwise waits before releasing.
+    canvas-drawn captcha, or a precise point inside a wider element. Uses the
+    engine's humanised pointer travel (no teleport) and planned press dwell for
+    a plain click. A hold releases after hold_seconds, or sooner if cancelled.
 
-    Returns a screenshot taken right after release, so the result of the click
+    Returns a screenshot after a short post-click wait, so the result of the click
     is visible without a second round-trip.
     """
     from .masked import guard_pixels
 
     await guard_pixels(session)
     page = session.page()
-    await page.mouse.move(x, y, steps=12)
-    await page.mouse.down()
     if hold_seconds > 0:
-        await page.wait_for_timeout(int(hold_seconds * 1000))
-    await page.mouse.up()
+        await page.mouse.move(x, y)
+        await page.mouse.down()
+        try:
+            await page.wait_for_timeout(int(hold_seconds * 1000))
+        finally:
+            await page.mouse.up()
+    else:
+        await page.mouse.click(x, y)
     # Give a post-click transition (checkmark, redirect, reflow) a moment to
     # start before the screenshot, so it reflects the outcome, not the click.
     await page.wait_for_timeout(400)
@@ -1669,10 +1673,8 @@ def _response_name(response) -> str:
 
 
 async def _press_at(page, x: float, y: float) -> None:
-    """The click of browser_click_at, without its screenshot."""
-    await page.mouse.move(x, y, steps=12)
-    await page.mouse.down()
-    await page.mouse.up()
+    """The engine's humanised coordinate click, without a screenshot."""
+    await page.mouse.click(x, y)
 
 
 async def _arrival(session, landing: str, before: set, shown: list, deadline: float,
