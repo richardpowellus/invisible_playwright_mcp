@@ -161,6 +161,7 @@ between what the browser says it is and where it appears to be.
 | `STEALTHFOX_MCP_HOST` | Bind address for the HTTP transport. Default `127.0.0.1`. |
 | `STEALTHFOX_MCP_PORT` | Port for the HTTP transport. Default `8766`. It used to be `8765`, the invisible_playwright_mcp interface's own default, so running both meant a bind error with nothing to explain it. |
 | `STEALTHFOX_OWNER_MODE` | `mcpd` enables trusted stdio per-caller isolation; unset preserves single-owner behavior. Requires POSIX filesystem locks. |
+| `INVISIBLE_MCP_HOST_MANAGED` | `1` for a host that opens/closes its own browser and gives its model only page tools. Instructions contain only page rules, `browser` is hidden from tool schemas, and `support` is refused. Cannot be combined with `STEALTHFOX_OWNER_MODE=mcpd`. |
 | `STEALTHFOX_MAX_BROWSERS` | Owner mode's process-wide browser capacity, including pending launches and closes; default 2. |
 | `STEALTHFOX_OWNER_IDLE_SECONDS` | Idle owner expiry; default 900 seconds. Active background typing is not idle. |
 | `INVISIBLE_MCP_DOWNLOAD_DIRS` | Absolute canonical download roots, separated by the platform path separator. Empty means downloads are off. |
@@ -558,6 +559,11 @@ Enable `STEALTHFOX_OWNER_MODE=mcpd` only behind trusted mcpd stdio. mcpd supplie
 to a default owner. Direct HTTP owner mode is refused. Each caller owns an
 ephemeral main/support pair; persistent profile arguments and `file:` navigation
 are refused. The browser cap covers all callers and evicts nobody.
+
+Leave `INVISIBLE_MCP_HOST_MANAGED` unset in owner mode. That mode is for a
+host-managed single browser, not mcpd's per-caller main/support pairs; enabling
+both refuses startup. Owner instructions retain the same page rules as a
+standalone or host-managed server, plus the private-file and fill-handle rules.
 
 `browser_open` and `browser_status` report private upload/download directories.
 Only files staged in that caller's upload directory may use upstream's chooser
