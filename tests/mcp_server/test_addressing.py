@@ -73,7 +73,8 @@ def test_every_tool_that_drives_a_page_goes_through_the_funnel_and_names_its_bro
             "%s drives a page through %d calls into the funnel; it is one"
             % (tool.name, len(calls)))
         given = {k.arg: k.value for k in calls[0].keywords}
-        assert isinstance(given.get("role"), ast.Name) and given["role"].id == "browser", (
+        expected = "DEFAULT_BROWSER_ID" if tool.name == "browser_cookies_export" else "browser"
+        assert isinstance(given.get("role"), ast.Name) and given["role"].id == expected, (
             "%s does not hand `role=browser` to the funnel, so it acts on `main` "
             "whatever the caller asked" % tool.name)
         driving.append(tool.name)
@@ -113,7 +114,8 @@ def test_every_tool_that_reaches_a_browser_offers_a_way_to_name_it():
     Known-bad: delete `browser` from any tool but `browser_list`.
     """
     tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
-    needing = {t.name for t in _tools()} - {"browser_list"}
+    # Credential export is intentionally handle-bound to main, never role-selectable.
+    needing = {t.name for t in _tools()} - {"browser_list", "browser_cookies_export"}
     assert len(needing) >= 15, sorted(needing)
     mute = sorted(n for n in needing
                   if "browser" not in (tools[n].inputSchema.get("properties") or {}))

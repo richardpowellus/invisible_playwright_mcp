@@ -54,12 +54,13 @@ from mcp import types
 from pydantic import Field
 from pydantic.json_schema import SkipJsonSchema
 
-from . import __version__, actions, masked, network, plan, store
+from . import __version__, actions, cookies, masked, network, plan, store
 from .. import env as environment
 from ..engine import Engine
+from ..link import answer_of
 from ..quiet import swallow
 from .work import DEFAULT_BROWSER_ID, Work
-from .owners import CapacityExhausted, IDENTITY_ERROR, Owners
+from .owners import CapacityExhausted, HANDLE_ERROR, IDENTITY_ERROR, Owners
 from .owner_transport import (
     ExitWatchdog, SessionEnded, notifications, owner_stdio, redact_sdk_logs, shutdown_on_sigterm,
 )
@@ -124,6 +125,11 @@ class BrowserMCP(FastMCP):
     async def _owner_tool_result(self, request: types.CallToolRequest) -> types.ServerResult:
         windows: list[set[str]] = []
         log_token = _result_windows.set(())
+        exporting = request.params.name == cookies.TOOL
+        export_token = cookies.active.set(exporting)
+        payload_token = cookies.result.set(None)
+        if exporting:
+            redact_sdk_logs(_redact_log)
 
         async def dispatch(selected: Work):
             token = _selected_work.set(selected)
@@ -150,8 +156,18 @@ class BrowserMCP(FastMCP):
                         result = await dispatch(selected)
             except Exception as exc:
                 result = self._mcp_server._make_error_result(str(exc))
+            payload = cookies.result.get()
+            if exporting and payload is not None:
+                answer, failed = answer_of(result.root)
+                if (not failed and answer == payload and len(result.root.content) == 1
+                        and isinstance(result.root.content[0], types.TextContent)
+                        and result.root.structuredContent is None):
+                    # Only the exact, authorized export bypasses ordinary result masking.
+                    return result
             return masked.redact_result(result, windows)
         finally:
+            cookies.result.reset(payload_token)
+            cookies.active.reset(export_token)
             _result_windows.reset(log_token)
 
     def run(self, transport: Literal["stdio", "sse", "streamable-http"] = "stdio",
@@ -166,10 +182,13 @@ class BrowserMCP(FastMCP):
 
     async def call_tool(self, name: str, arguments: dict[str, Any]
                         ) -> Sequence[ContentBlock] | dict[str, Any]:
+        if name == cookies.TOOL:
+            # FastMCP otherwise coerces JSON strings into lists and ignores extra keys.
+            _cookie_export_arguments(arguments)
         try:
             return await super().call_tool(name, arguments)
         except ToolError as exc:
-            if isinstance(exc.__cause__, (CapacityExhausted, masked.MaskRefusal)):
+            if isinstance(exc.__cause__, (CapacityExhausted, masked.MaskRefusal, cookies.ExportError)):
                 raise exc.__cause__ from None
             raise
 
@@ -608,6 +627,37 @@ async def browser_status(browser: Browser = None) -> str:
     the sentence that says which.
     """
     return await _work().status(browser or DEFAULT_BROWSER_ID)
+
+
+def _cookie_export_arguments(arguments: dict[str, Any]) -> cookies.ExportArguments:
+    try:
+        if owners is None or owners.resolve_handle(arguments.get("browser_handle")) is not _work():
+            raise ValueError(HANDLE_ERROR)
+    except ValueError:
+        raise cookies.ExportError(HANDLE_ERROR) from None
+    return cookies.arguments(arguments)
+
+
+@mcp.tool(annotations=_says("Export browser cookies (credentials)", read_only=True,
+                            open_world=False), structured_output=False)
+async def browser_cookies_export(browser_handle: str, origins: list[str]) -> str:
+    """Export credentials from your own main browser's cookie jar (fork-only).
+
+    Requires its current fill handle and 1..8 https://<host> origins allowed by
+    STEALTHFOX_COOKIE_EXPORT_DOMAINS. Disabled when that allowlist is unset.
+    No support browser or delegated fill-handle access. Returns one JSON text
+    item with cookies, count, origins and exported_at; refuses above 200 cookies
+    or 256 KiB. Treat the result as credentials: never log or persist it.
+    """
+    args = _cookie_export_arguments({"browser_handle": browser_handle, "origins": origins})
+    hosts, suffixes = cookies.allowed_origins(args.origins)
+    payload = await _work().reading(cookies.export, args.origins, hosts, suffixes,
+                                    role=DEFAULT_BROWSER_ID)
+    _cookie_export_arguments({"browser_handle": browser_handle, "origins": origins})
+    return payload
+
+
+mcp._tool_manager.get_tool(cookies.TOOL).parameters = cookies.ExportArguments.model_json_schema()
 
 
 @mcp.tool(annotations=_says("Read captured network traffic", read_only=True, open_world=False))

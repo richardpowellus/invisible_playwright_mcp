@@ -170,6 +170,7 @@ async def test_every_registered_tool_and_a_new_tool_pass_the_result_boundary(
     try:
         from mcp.server.fastmcp.tools.base import Tool
 
+        capability = handle(await call("A", "browser_status"))
         for tool in server.mcp._tool_manager.list_tools():
             # Keep the SDK's normalization/error path; only replace the operation.
             stub = Tool.from_function(answer, name=tool.name)
@@ -177,7 +178,9 @@ async def test_every_registered_tool_and_a_new_tool_pass_the_result_boundary(
             monkeypatch.setattr(tool, "fn", stub.fn)
             monkeypatch.setattr(tool, "parameters", stub.parameters)
             before = len(seen)
-            result = await call("A", tool.name)
+            arguments = ({"browser_handle": capability, "origins": ["https://intuit.com"]}
+                         if tool.name == "browser_cookies_export" else {})
+            result = await call("A", tool.name, arguments)
             assert len(seen) == before + 1, tool.name
             assert result.isError == fails
             assert VALUE not in result.model_dump_json()

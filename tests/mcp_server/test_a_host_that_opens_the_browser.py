@@ -98,7 +98,8 @@ def test_a_standalone_client_still_gets_everything():
     assert hosted["page_rules"] in alone["instructions"]
     assert "support" in alone["instructions"] and "browser_open" in alone["instructions"]
     assert all("browser" in (s.get("properties") or {})
-               for name, s in alone["schemas"].items() if name != "browser_list")
+               for name, s in alone["schemas"].items()
+               if name not in {"browser_list", "browser_cookies_export"})
 
 
 @pytest.mark.skipif(os.name != "posix", reason="mcpd owner mode requires POSIX flock")
@@ -114,7 +115,7 @@ def test_owner_mode_keeps_its_rules_and_both_browsers():
     assert "pass a seed, a proxy or a profile" not in owned["served"]
     assert "brings back the person this session already was" not in owned["served"]
     for name, schema in owned["schemas"].items():
-        if name != "browser_list":
+        if name not in {"browser_list", "browser_cookies_export"}:
             browser = schema["properties"]["browser"]
             assert any(option.get("enum") == ["main", "support"]
                        for option in browser["anyOf"])
