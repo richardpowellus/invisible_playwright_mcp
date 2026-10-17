@@ -357,7 +357,19 @@ async def test_only_cookie_values_of_at_least_16_characters_are_registered(opene
     assert json.loads(success(await export(opened)))["cookies"][0]["value"] == value
     values = masked.registry(opened[1])
     assert values.redact(value) == (masked.MASKED_PASSWORD if length >= 16 else value)
-    assert values.raw == ({"V" * 8} if length >= 16 else set())
+    assert values.raw == ({value} if length >= 16 else set())
+
+
+async def test_url_valued_cookies_do_not_mask_the_pages_own_origin(opened):
+    # A return-URL cookie used to register every 8-character window of
+    # "qbo.intuit.com", so browser_evaluate read location.origin as bullets.
+    value = "https%3A%2F%2Fqbo.intuit.com%2Fapp%2Fhomepage"
+    opened[2].cookies.return_value = [cookie(value=value)]
+    success(await export(opened))
+    values = masked.registry(opened[1])
+    assert values.redact("https://qbo.intuit.com") == "https://qbo.intuit.com"
+    assert values.redact("next=" + value + ";") == "next=" + masked.MASKED_PASSWORD + ";"
+    assert values.redact("next=" + value[:-1]) == "next=" + value[:-1]
 
 
 async def test_short_cookie_values_leave_screenshots_available(opened, monkeypatch):
