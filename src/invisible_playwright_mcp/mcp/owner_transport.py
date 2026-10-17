@@ -19,6 +19,7 @@ from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 from pydantic import ValidationError
 
+from . import cookies
 from .owners import HANDLE_KEY, owner_id
 
 SESSION_ENDED = "notifications/mcpd/session_ended"
@@ -116,11 +117,22 @@ class CapabilityRedactor(logging.Filter):
         self.redact = redact
 
     def filter(self, record: logging.LogRecord) -> bool:
+        if cookies.active.get():
+            record.msg, record.args = "MCP cookie export message (redacted)", ()
+            record.exc_info = record.exc_text = None
+            record.stack_info = None
+            return True
         text = record.getMessage()
         if record.exc_info:
             text += "\n" + "".join(traceback.format_exception(*record.exc_info))
+        elif record.exc_text:
+            text += "\n" + record.exc_text
+        if record.stack_info:
+            text += "\n" + record.stack_info
         original = text
-        if "browser_type" in text or "mask_value" in text:
+        if cookies.TOOL in text or ("exported_at" in text and "cookies" in text):
+            text = "MCP cookie export message (redacted)"
+        elif "browser_type" in text or "mask_value" in text:
             text = "MCP typing message (redacted)"
         elif HANDLE_KEY in text:
             text = "MCP message containing a browser fill capability (redacted)"
@@ -131,6 +143,7 @@ class CapabilityRedactor(logging.Filter):
         if text != original:
             record.msg, record.args = text, ()
             record.exc_info = record.exc_text = None
+            record.stack_info = None
         return True
 
 

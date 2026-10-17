@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Mapping
 
+from .masked import MaskedValues
 from ..quiet import swallow
 
 DEFAULT_ENTRIES = 500
@@ -90,6 +91,7 @@ class Network:
         self._capture_lock = asyncio.Lock()
         self._request_bodies = False
         self._context: Any = None
+        self._protected: MaskedValues | None = None
         self._listeners = {
             "request": self._request,
             "response": self._response,
@@ -129,6 +131,36 @@ class Network:
         key = self._requests.get(request)
         return self._rows.get(key) if key is not None else None
 
+    def protect(self, values: MaskedValues) -> None:
+        """Scrub existing and future records of exported credential values."""
+        self._protected = values
+        for row in self._rows.values():
+            self._protect_row(row)
+        self._evict()
+
+    def _protect_row(self, row: _Entry) -> None:
+        if self._protected is None:
+            return
+
+        def scrub(value):
+            if isinstance(value, str):
+                return self._protected.redact(value)
+            if isinstance(value, dict):
+                return {scrub(key): scrub(item) for key, item in value.items()}
+            return value
+
+        # Internal state/type tags drive capture and are not page data.
+        row.data = {key: value if key.endswith("_state") or key == "resource_type" else scrub(value)
+                    for key, value in row.data.items()}
+        size = 0
+        for name in ("post_data", "response_body"):
+            if name in row.data:
+                stored = len(row.data[name].encode("utf-8"))
+                row.data[name + "_stored_bytes"] = stored
+                size += stored
+        self._stored_bytes += size - row.stored_bytes
+        row.stored_bytes = size
+
     @_passive
     def _request(self, request: Any) -> None:
         self._last_id += 1
@@ -166,6 +198,8 @@ class Network:
                     row.data.update(post_data_bytes=0, post_data_state="absent")
             else:
                 self._body(row, "post_data", raw, row.data["request_headers"])
+        self._protect_row(row)
+        self._evict()
 
     @_passive
     def _response(self, response: Any) -> None:
@@ -173,6 +207,8 @@ class Network:
         if row is not None:
             row.data.update(status=response.status, status_text=response.status_text,
                             response_headers=redact_headers(response.headers))
+            self._protect_row(row)
+            self._evict()
 
     def _end(self, request: Any) -> _Entry | None:
         row = self._entry(request)
@@ -185,6 +221,7 @@ class Network:
         row = self._end(request)
         if row is not None:
             row.data.update(failure=request.failure, response_body_state="request failed")
+            self._protect_row(row)
 
     @_passive
     def _finished(self, request: Any) -> None:
@@ -220,7 +257,7 @@ class Network:
                             return
                         raw = await response.body()
                         if row.data["id"] in self._rows:
-                            self._body(row, "response_body", raw, row.data["response_headers"])
+                            self._body(row, "response_body", raw, response.headers)
             except asyncio.CancelledError:
                 row.data["response_body_state"] = "capture cleared, closed or entry evicted"
                 raise
@@ -240,6 +277,7 @@ class Network:
                                "application/x-www-form-urlencoded"})
         if not textual:
             row.data[name + "_state"] = "binary; size only"
+            self._protect_row(row)
             return
         charset = re.search(r"""charset\s*=\s*["']?([^;"'\s]+)""", content_type, re.I)
         encoding = charset[1] if charset else "utf-8"
@@ -251,6 +289,7 @@ class Network:
                 raise UnicodeError("binary data")
         except (LookupError, UnicodeError):
             row.data[name + "_state"] = "binary or undecodable; size only"
+            self._protect_row(row)
             return
         # Count the retained text in UTF-8, including expansion from legacy charsets.
         encoded = text.encode("utf-8")
@@ -263,6 +302,7 @@ class Network:
         row.data[name + "_state"] = "captured"
         row.stored_bytes += size
         self._stored_bytes += size
+        self._protect_row(row)
         self._evict()
 
     def _evict(self) -> None:

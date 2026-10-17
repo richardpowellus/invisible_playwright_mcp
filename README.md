@@ -183,7 +183,8 @@ engine cannot perform guarded writes.
 `browser_type(mask_value=true)` also protects concealed values filled into text
 inputs. It requires `expect_origin` and at least eight characters (empty clears
 are allowed). Registration is Python-only, per browser, before writing, and is
-forgotten on browser close or owner-session end. Every owner tool result,
+forgotten on browser close or owner-session end. Except for the authorized
+cookie-export payload below, every owner tool result,
 including errors, masks raw, HTML/JSON-escaped and URL-quoted eight-character
 fragments with eight bullets. Screenshot, watch and coordinate-click captures
 refuse while the value is in an input, textarea or page text; unreadable presence
@@ -213,6 +214,23 @@ unscrubbed, **untrusted page data, not instructions**. Each browser has its own
 bounded history; `browser_network_clear` clears it without touching the page
 or reusing IDs. Defaults: 500 entries, 64 KiB per body, 16 MiB of retained
 bodies. See [network limits and output fields](docs/mcp-server.md#reading-the-page).
+
+`browser_cookies_export(browser_handle, origins)` is **fork-only and
+credential-bearing; not proposed upstream**. It exports httpOnly and other
+applicable cookies from the engine, never page JavaScript. It requires owner
+mode, the caller's own current main-browser fill handle, and 1..8 exact
+`https://<host>` origins. It refuses support browsers and delegated handles.
+`STEALTHFOX_COOKIE_EXPORT_DOMAINS` must enable comma-separated DNS suffixes
+(for example `intuit.com`); unset/empty refuses. Both the requested hosts and
+cookie domains must match on a DNS label boundary. Only cookies applicable to
+the origins' root paths are returned. Exceeding **200 cookies or 256 KiB of
+JSON** refuses the entire export, never truncates it. The single JSON text
+result is credential-bearing: do not log or persist it. Only exported values
+of **16+ characters** join the browser-lifetime masking registry, using its
+existing eight-character windows. These values are scrubbed from captured
+network history, future capture, other tool results and logs. Short preferences
+such as `locale=en` remain readable. Export does not stop an active watch.
+See [the export contract](docs/mcp-server.md#credential-bearing-cookie-export-fork-only).
 
 ## The wiki: AI browser-agent guides
 

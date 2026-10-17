@@ -161,6 +161,7 @@ between what the browser says it is and where it appears to be.
 | `STEALTHFOX_MCP_HOST` | Bind address for the HTTP transport. Default `127.0.0.1`. |
 | `STEALTHFOX_MCP_PORT` | Port for the HTTP transport. Default `8766`. It used to be `8765`, the invisible_playwright_mcp interface's own default, so running both meant a bind error with nothing to explain it. |
 | `STEALTHFOX_OWNER_MODE` | `mcpd` enables trusted stdio per-caller isolation; unset preserves single-owner behavior. Requires POSIX filesystem locks. |
+| `STEALTHFOX_COOKIE_EXPORT_DOMAINS` | Fork-only credential export allowlist of comma-separated DNS suffixes, e.g. `intuit.com`. Unset/empty disables export. Requires owner mode and the caller's own main-browser fill handle. No wildcard, URL, port, IP or leading dot. |
 | `INVISIBLE_MCP_HOST_MANAGED` | `1` for a host that opens/closes its own browser and gives its model only page tools. Instructions contain only page rules, `browser` is hidden from tool schemas, and `support` is refused. Cannot be combined with `STEALTHFOX_OWNER_MODE=mcpd`. |
 | `STEALTHFOX_MAX_BROWSERS` | Owner mode's process-wide browser capacity, including pending launches and closes; default 2. |
 | `STEALTHFOX_OWNER_IDLE_SECONDS` | Idle owner expiry; default 900 seconds. Active background typing is not idle. |
@@ -178,7 +179,8 @@ a browser gets when nobody says anything.
 `browser_take_screenshot`, `browser_watch`, `browser_click`, `browser_click_at`,
 `browser_type`, `browser_select_option`, `browser_press_key`,
 `browser_upload_files`, `browser_download`, `browser_evaluate`,
-`browser_network`, `browser_network_clear`, `browser_network_capture`.
+`browser_network`, `browser_network_clear`, `browser_network_capture`,
+`browser_cookies_export` (fork-only, credential-bearing).
 
 Tool names mirror the Microsoft Playwright MCP, so prompts written for it work
 here too, with one deliberate departure: **there are no tab tools.** Three
@@ -245,7 +247,7 @@ the protocol also has resources and prompts, and
 [who controls each](mcp-tools-resources-and-prompts.md) is why a browser fits
 the first and not the other two.
 
-**Every tool below also takes `browser`, optional, and it never appears in the
+**Except for `browser_cookies_export`, every tool below also takes `browser`, optional, and it never appears in the
 tables because the answer is the same for all of them.** Leave it out and you
 get `main`, which is what a client that never mentions it has always got and
 always will.
@@ -426,6 +428,56 @@ pixels: feed `browser_take_screenshot` to `browser_click_at`, not this. It needs
 an engine from `firefox-28` on; an older engine answers with a sentence saying
 so.
 
+### Credential-bearing cookie export (fork-only)
+
+`browser_cookies_export` is a **credential-bearing, fork-only tool**, not
+proposed upstream. It reads the browser context's cookie API through the
+engine, including httpOnly cookies; it does not evaluate page JavaScript,
+navigate, issue HTTP requests or record the exported jar.
+
+The only arguments are `browser_handle` (required string, the current fill
+handle from your own main browser's `browser_open`/`browser_status`) and
+`origins` (required array of 1..8 strings, each exactly `https://<host>`).
+Unknown arguments, coercible strings in place of arrays, paths, trailing
+slashes, credentials, ports, queries, fragments and non-HTTPS URLs are refused.
+There is no `browser` argument. Support browsers, another owner's handle,
+delegated `_meta` handles and non-owner mode cannot export.
+Invalid or revoked handles return `Invalid or revoked browser fill handle.`
+
+The server operator must set `STEALTHFOX_COOKIE_EXPORT_DOMAINS`, for example
+`intuit.com,example.com`; unset/empty returns
+`cookie export is not enabled on this server`. Each requested hostname must
+match a suffix on a DNS label boundary: `sub.intuit.com` matches `intuit.com`,
+`evilintuit.com` does not. The engine filters by the requested URLs, and the
+server additionally restricts cookie domains to the allowlist and the requested
+hosts, root path and unexpired/session cookies. Secure and non-secure cookies
+can both apply to HTTPS. Host-only cookies do not apply to child hosts.
+
+The response is exactly one JSON text content item, with no structured duplicate:
+
+```json
+{"cookies":[{"name":"session","value":"<credential>","domain":".intuit.com","path":"/","expires":-1,"http_only":true,"secure":true,"same_site":"Lax"}],"count":1,"origins":["https://sub.intuit.com"],"exported_at":"2026-10-17T03:00:00Z"}
+```
+
+`expires` is Unix seconds (`-1` for session cookies); `same_site` is `Lax`,
+`Strict` or `None`. `count` equals the number of cookies. Hard caps are **200
+cookies and 256 KiB of UTF-8 JSON**, including the envelope and escaping.
+Exceeding either refuses the entire export; no truncation or partial jar.
+
+**Never log, persist or publish the result.** Server diagnostics during export
+are suppressed, errors contain no engine data, and result logging is scrubbed.
+Only exported values of **16+ characters** join the browser's Python-only
+masking registry, using its unchanged eight-character windows. Other tool
+results, snapshots and logs mask these values' plain and escaped forms.
+Existing network history and future capture are scrubbed at storage time,
+not just when returned. Short preferences such as `locale=en`, `ivid=1` and
+`x=true` remain readable and do not trigger pixel refusals.
+Export does not start or stop a watch. When pixels are requested, the existing
+masked-fill guards still refuse if a registered value is on the page, and
+watch reads discard cached frames before checking. The same plain-form
+limitation as masked fills applies: this is not a sandbox against page code
+computing other encodings of a value.
+
 ### Acting on the page
 
 The fork adds optional `expect_origin` and `expect_input_type` to `browser_type`.
@@ -451,8 +503,9 @@ mask_value refused: text must be at least 8 characters; nothing was written
 
 An empty clear registers nothing. Nonempty values are registered in Python
 memory before delivery, per owner's browser instance, until that browser closes
-or the owner session ends. Nothing is marked or stored in the page. Every tool
-result, including SDK errors and structured content, crosses one result scrubber.
+or the owner session ends. Nothing is marked or stored in the page. Except for
+the authorized cookie-export payload above, every tool result, including SDK
+errors and structured content, crosses one result scrubber.
 It merges overlapping or adjacent eight-character matches in the raw,
 HTML-escaped (with and without quotes), JSON-escaped (ASCII and Unicode), and
 URL-quoted (`quote` and `quote_plus`) forms into one eight-bullet mask.
@@ -545,7 +598,7 @@ ordering reverses:
 
 ## The second browser
 
-Every tool above takes a `browser` argument, and the session holds two: `main`
+Except for `browser_cookies_export`, every tool above takes a `browser` argument, and the session holds two: `main`
 and `support`. They are two identities rather than two windows, they share one
 exit unless you give the second its own proxy, and a command that names neither
 goes to `main` even when the focus is elsewhere.
