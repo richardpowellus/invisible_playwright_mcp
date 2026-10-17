@@ -122,7 +122,7 @@ async def export(session, origins: list[str], hosts: list[str], suffixes: list[s
         values = masked.registry(session)
         for cookie in selected:
             if len(cookie["value"]) >= 16:
-                values.register(cookie["value"])
+                values.register_exact(cookie["value"])
         session.network.protect(values)
         result.set(payload)
         return payload

@@ -29,6 +29,13 @@ def _windows(text: str) -> set[str]:
     return {text[i:i + 8] for i in range(len(text) - 7)}
 
 
+def _forms(value: str) -> tuple[str, ...]:
+    return (value, html.escape(value, quote=True), html.escape(value, quote=False),
+            json.dumps(value, ensure_ascii=True)[1:-1],
+            json.dumps(value, ensure_ascii=False)[1:-1],
+            quote(value, safe=""), quote_plus(value))
+
+
 class MaskedValues:
     def __init__(self) -> None:
         self.raw: set[str] = set()
@@ -38,11 +45,22 @@ class MaskedValues:
         if not value:
             return
         self.raw.update(_windows(value))
-        for form in (value, html.escape(value, quote=True), html.escape(value, quote=False),
-                     json.dumps(value, ensure_ascii=True)[1:-1],
-                     json.dumps(value, ensure_ascii=False)[1:-1],
-                     quote(value, safe=""), quote_plus(value)):
+        for form in _forms(value):
             self.forms.update(_windows(form))
+
+    def register_exact(self, value: str) -> None:
+        """Mask a value (16+ characters) only where it appears whole.
+
+        A typed secret is masked by every 8-character window, so a fragment
+        cannot leak. An exported cookie is not typed by anyone and is often
+        not random - a return URL, a locale list - and its windows then mask
+        ordinary text: a cookie holding an encoded QBO URL masked the page's
+        own origin. Entries longer than a window are matched whole.
+        """
+        if len(value) <= 8:
+            return
+        self.raw.add(value)
+        self.forms.update(form for form in _forms(value) if len(form) > 8)
 
     def clear(self) -> None:
         self.raw.clear()
@@ -72,6 +90,10 @@ def result_windows(work) -> set[str]:
 def redact_text(text: str, windows: set[str]) -> str:
     if not windows:
         return text
+    # Whole values (register_exact) first, longest first, so one containing
+    # another is masked as a unit; then the 8-character windows.
+    for whole in sorted((w for w in windows if len(w) > 8), key=len, reverse=True):
+        text = text.replace(whole, MASKED_PASSWORD)
     out = []
     copied = 0
     start = end = -1
@@ -154,8 +176,10 @@ async def guard_pixels(session) -> None:
             session.page().eval_on_selector("html", PRESENCE_JS), 5)
         if not isinstance(fields, list) or not all(isinstance(v, str) for v in fields):
             raise MaskRefusal(SCREENSHOT_REFUSED)
+        wholes = [w for w in values.raw if len(w) > 8]
         if any(field[i:i + 8] in values.raw
-               for field in fields for i in range(len(field) - 7)):
+               for field in fields for i in range(len(field) - 7)) or any(
+                   whole in field for field in fields for whole in wholes):
             raise MaskRefusal(SCREENSHOT_REFUSED)
     except Exception:
         # A failed presence read is never permission to capture, and its

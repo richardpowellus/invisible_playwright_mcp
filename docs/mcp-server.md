@@ -467,8 +467,11 @@ Exceeding either refuses the entire export; no truncation or partial jar.
 **Never log, persist or publish the result.** Server diagnostics during export
 are suppressed, errors contain no engine data, and result logging is scrubbed.
 Only exported values of **16+ characters** join the browser's Python-only
-masking registry, using its unchanged eight-character windows. Other tool
-results, snapshots and logs mask these values' plain and escaped forms.
+masking registry, and they are masked **whole**, not by the eight-character
+windows a typed secret uses: a cookie is often not random (an encoded return
+URL, a locale list), and its windows masked ordinary page text, including
+the page's own `location.origin`. Other tool results, snapshots and logs mask
+these values' plain and escaped forms wherever one appears in full.
 Existing network history and future capture are scrubbed at storage time,
 not just when returned. Short preferences such as `locale=en`, `ivid=1` and
 `x=true` remain readable and do not trigger pixel refusals.
