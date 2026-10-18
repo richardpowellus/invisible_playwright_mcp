@@ -39,7 +39,7 @@ from typing import Awaitable, Callable, Optional
 
 from invisible_playwright.async_api import TargetClosedError
 
-from . import DEFAULT_BROWSER_ID, GONE, NOT_OPEN, SUPPORT_BROWSER_ID, certificates, identity, masked, plan, process, store
+from . import DEFAULT_BROWSER_ID, GONE, NOT_OPEN, SUPPORT_BROWSER_ID, actions, certificates, identity, masked, network, plan, process, store
 from ..quiet import swallow
 from .actions import NAVIGATION_TIMEOUT_MS
 from .session import StealthSession
@@ -716,8 +716,22 @@ class Work:
 
     # --- look -------------------------------------------------------------------
 
-    async def network(self, role: str, **filters) -> dict:
-        return self.session(role).network.entries(**filters)
+    def _download_env(self) -> dict[str, str] | None:
+        return None
+
+    async def network(self, role: str, *, to_file: bool = False, save_to: str | None = None,
+                      max_entries: int = network.DEFAULT_MAX_ENTRIES,
+                      max_bytes: int | None = None, **filters) -> dict:
+        net = self.session(role).network
+        if to_file:
+            env = self._download_env()
+            file_cap = int(os.environ.get("STEALTHFOX_NETWORK_FILE_BYTES", 256 * 1024 * 1024))
+            return {
+                **actions.write_network_ndjson(net.stream(**filters), save_to=save_to,
+                                               env=env, max_bytes=file_cap),
+                **net.metadata(),
+            }
+        return net.entries(max_entries=max_entries, max_bytes=max_bytes, **filters)
 
     async def network_clear(self, role: str) -> dict:
         return self.session(role).network.clear()

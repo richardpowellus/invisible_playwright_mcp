@@ -202,9 +202,16 @@ randomly named `.part` files keep a landing directory pending until completion.
 Downloads work on Windows and POSIX; owner mode itself requires POSIX locks.
 
 `browser_network` reads traffic recorded automatically from browser
-open, including site-opened pages. Filter URLs/resource types, paginate with
-`since_id`, and return captured text with `include_bodies=true`. Recording is
-passive by default. To record POST/PUT bodies, enable
+open, including site-opened pages. Results omit header maps and OPTIONS
+preflights by default; request headers with `include_headers=true` or a
+case-insensitive name list, and preflights with `include_preflight=true`.
+Filter URLs/resource types/methods, strip output queries with `strip_query`,
+paginate with `since_id`, and return captured text with `include_bodies=true`.
+`max_bytes` can lower the 256 KiB inline entry budget. `to_file=true` instead
+writes all filtered entries as NDJSON to the caller's download root (or an
+allowed `save_to` directory), returning only path, `written` count, bytes,
+truncation and capture metadata. The disk cap is `STEALTHFOX_NETWORK_FILE_BYTES`,
+default 256 MiB. Recording is passive by default. To record POST/PUT bodies, enable
 `browser_network_capture(request_bodies=true)` before the interaction, and turn
 it off when done. This adds one unchanged pass-through route: invisible to page
 JavaScript, but bypassing HTTP cache and making requests slightly slower.

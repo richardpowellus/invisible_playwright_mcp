@@ -104,7 +104,8 @@ async def test_request_bodies_off_on_off_with_xhr_popup_redaction_and_owner_isol
         try:
             async with asyncio.timeout(30):
                 while True:
-                    output = success(await call("A", "browser_network", {"include_bodies": True}))
+                    output = success(await call("A", "browser_network", {
+                        "include_bodies": True, "include_headers": True}))
                     assert COOKIE not in output and AUTHORIZATION not in output
                     data = json.loads(output)
                     matches = [row for row in data["entries"] if row["url"] == url + path
@@ -191,7 +192,7 @@ async def test_request_bodies_off_on_off_with_xhr_popup_redaction_and_owner_isol
         assert own["request_bodies"] is True
 
         summary = success(await call("A", "browser_network"))
-        assert all("post_data" not in row and "response_body" not in row
+        assert all(not {"post_data", "response_body", "request_headers", "response_headers"} & row.keys()
                    for row in json.loads(summary)["entries"])
         success(await call("A", "browser_click", {"selector": "#popup"}))
         child, _ = await read_complete("ExecuteAction")
