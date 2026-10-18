@@ -5,12 +5,16 @@ import asyncio
 import gc
 import json
 import logging
+import os
+import re
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from invisible_playwright_mcp.mcp import network, plan, server
+from invisible_playwright_mcp.mcp import actions, network, plan, server
+from invisible_playwright_mcp.mcp.owners import OwnerWork
 from invisible_playwright_mcp.mcp.session import StealthSession
 from invisible_playwright_mcp.mcp.work import Work
 
@@ -93,7 +97,7 @@ async def finish(capture, context, request):
 
 
 def rows(capture, **kwargs):
-    return capture.entries(include_bodies=True, **kwargs)["entries"]
+    return capture.entries(include_bodies=True, include_headers=True, **kwargs)["entries"]
 
 
 async def test_full_entry_and_lengths_only_default():
@@ -139,6 +143,68 @@ async def test_header_redaction_is_at_capture_time_and_case_insensitive():
         assert got["X-Keep"] == "visible"
 
 
+@pytest.mark.parametrize("include_headers,expected", [
+    (False, None), (True, {"Cookie": "[redacted]", "AUTHORIZATION": "[redacted]",
+                           "X-Keep": "visible"}),
+    (["cOoKiE", "authorization"], {"Cookie": "[redacted]", "AUTHORIZATION": "[redacted]"}),
+    (["missing"], {}), ([], None),
+])
+async def test_header_projection_is_optional_redacted_and_shared(include_headers, expected):
+    capture, context = recorder()
+    request = Request(headers={"Cookie": "cookie-secret", "AUTHORIZATION": "auth-secret",
+                               "X-Keep": "visible"})
+    request.reply.headers = request.headers
+    context.emit("request", request)
+    await finish(capture, context, request)
+    default = capture.entries()["entries"][0]
+    assert "request_headers" not in default and "response_headers" not in default
+    out = capture.entries(include_headers=include_headers)["entries"]
+    assert out == list(capture.stream(include_headers=include_headers))
+    row = out[0]
+    for field in ("request_headers", "response_headers"):
+        if expected is None:
+            assert field not in row
+        else:
+            assert row[field] == expected
+            row[field].clear()
+            assert rows(capture)[0][field]["Cookie"] == "[redacted]"
+    assert "post_data" not in row and "response_body" not in row
+
+
+@pytest.mark.parametrize("method", ["OPTIONS", "options"])
+def test_preflights_are_opt_in_and_filters_still_combine(method):
+    capture, context = recorder()
+    for verb in (method, "GET"):
+        context.emit("request", Request(method=verb))
+    assert [row["id"] for row in capture.entries()["entries"]] == [2]
+    assert [row["id"] for row in capture.stream()] == [2]
+    assert [row["id"] for row in capture.entries(include_preflight=True)["entries"]] == [1, 2]
+    assert [row["id"] for row in capture.stream(include_preflight=True)] == [1, 2]
+    assert capture.entries(methods=["options"])["entries"] == []
+    out = capture.entries(methods=["options"], include_preflight=True, max_entries=1)
+    assert [row["id"] for row in out["entries"]] == [1] and out["more"] is False
+
+
+@pytest.mark.parametrize("methods,expected", [(["post"], [2, 3]), ([], [])])
+def test_methods_are_case_insensitive(methods, expected):
+    capture, context = recorder()
+    for method in ("GET", "POST", "post", "DELETE"):
+        context.emit("request", Request(method=method))
+    assert [row["id"] for row in capture.entries(methods=methods)["entries"]] == expected
+    assert [row["id"] for row in capture.stream(methods=methods)] == expected
+
+
+def test_query_stripping_does_not_change_matching_or_stored_urls():
+    capture, context = recorder()
+    url = "https://site.test/api?token=secret?extra=1"
+    context.emit("request", Request(url=url))
+    filters = {"url_contains": "token=secret", "strip_query": True}
+    out = capture.entries(**filters)["entries"]
+    assert out == list(capture.stream(**filters))
+    assert out[0]["url"] == "https://site.test/api"
+    assert capture.entries()["entries"][0]["url"] == url
+
+
 def test_ring_eviction_filters_and_paging_oldest_first():
     capture, context = recorder(entries=3)
     requests = [Request(url="https://site.test/" + str(i),
@@ -156,11 +222,20 @@ def test_ring_eviction_filters_and_paging_oldest_first():
     assert capture.entries()["capacity"] == 3
 
 
-@pytest.mark.parametrize("kwargs", [{"max_entries": 0}, {"max_entries": -1}, {"since_id": -1}])
+@pytest.mark.parametrize("kwargs", [
+    {"max_entries": 0}, {"max_entries": -1}, {"since_id": -1},
+    {"max_bytes": 0}, {"max_bytes": -1},
+])
 def test_invalid_filters_refuse(kwargs):
     capture, _ = recorder()
     with pytest.raises(ValueError):
         capture.entries(**kwargs)
+
+
+def test_stream_refuses_negative_since_id():
+    capture, _ = recorder()
+    with pytest.raises(ValueError, match="since_id"):
+        list(capture.stream(since_id=-1))
 
 
 async def test_aggregate_budget_counts_both_bodies_and_evicts_oldest():
@@ -353,7 +428,7 @@ def test_body_capable_methods_without_data_while_off_name_the_opt_in(method):
     capture, context = recorder()
     request = Request(method=method, body=None)
     context.emit("request", request)
-    assert rows(capture)[0]["post_data_state"] == network.REQUEST_BODIES_HINT
+    assert rows(capture, include_preflight=True)[0]["post_data_state"] == network.REQUEST_BODIES_HINT
     assert capture.entries()["request_bodies"] is False
 
 
@@ -596,8 +671,15 @@ async def test_tools_preserve_large_json_shape_and_browser_isolation(monkeypatch
     assert json.loads(await server.browser_network())["entries"] == []
     assert len(json.loads(await server.browser_network(browser="support"))["entries"]) == 1
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
-    assert tools["browser_network"].inputSchema["properties"]["max_entries"]["default"] == (
-        network.DEFAULT_MAX_ENTRIES)
+    properties = tools["browser_network"].inputSchema["properties"]
+    assert properties["max_entries"]["default"] == network.DEFAULT_MAX_ENTRIES
+    for name in ("include_headers", "include_preflight", "strip_query", "to_file"):
+        assert properties[name]["default"] is False
+    for name in ("methods", "max_bytes", "save_to"):
+        assert properties[name]["default"] is None
+    assert {choice["type"] for choice in properties["include_headers"]["anyOf"]} == {
+        "boolean", "array"}
+    assert tools["browser_network"].annotations.readOnlyHint is True
     assert tools["browser_network_capture"].inputSchema["required"] == ["request_bodies"]
     for name in ("browser_network", "browser_network_clear", "browser_network_capture"):
         assert tools[name].annotations.openWorldHint is False
@@ -612,7 +694,7 @@ def test_a_large_answer_stops_early_and_says_there_is_more():
     for i in range(1, 6):
         capture._last_id = i
         capture._rows[i] = net._Entry({"id": i, "url": "https://a/%d" % i,
-                                       "resource_type": "xhr", "response_body": big})
+                                       "method": "GET", "resource_type": "xhr", "response_body": big})
     first = capture.entries(include_bodies=True)
     assert first["more"] is True
     assert 1 <= len(first["entries"]) < 5
@@ -621,3 +703,199 @@ def test_a_large_answer_stops_early_and_says_there_is_more():
     plain = capture.entries(max_entries=2)
     assert [e["id"] for e in plain["entries"]] == [1, 2] and plain["more"] is True
     assert capture.entries()["more"] is False
+    assert capture.entries(include_bodies=True, max_bytes=net.RESPONSE_BYTES * 2) == first
+    assert len(list(capture.stream(include_bodies=True))) == 5
+
+
+def test_tiny_inline_budget_keeps_one_match_and_a_usable_cursor():
+    capture, context = recorder()
+    for _ in range(3):
+        context.emit("request", Request())
+    since_id = None
+    for key in range(1, 4):
+        out = capture.entries(max_bytes=1, since_id=since_id)
+        assert [row["id"] for row in out["entries"]] == [key]
+        assert out["more"] is (key < 3)
+        since_id = out["next_since_id"]
+        assert since_id == key
+    assert capture.entries(max_bytes=1, since_id=since_id)["entries"] == []
+
+
+@pytest.mark.parametrize("include_bodies,include_headers", [
+    (False, False), (True, True), (True, ["cookie"]),
+])
+async def test_file_mode_streams_all_matches_with_metadata_only(
+        monkeypatch, tmp_path, include_bodies, include_headers):
+    monkeypatch.setenv(actions.DOWNLOAD_DIRS_ENV, str(tmp_path))
+    monkeypatch.delenv("STEALTHFOX_NETWORK_FILE_BYTES", raising=False)
+    capture, context = recorder()
+    url = "https://site.test/api?token=\u20ac"
+    context.emit("request", Request(url=url))
+    for method, resource_type, where in (
+            ("OPTIONS", "fetch", url), ("GET", "fetch", url),
+            ("POST", "xhr", url), ("POST", "fetch", "https://site.test/other")):
+        context.emit("request", Request(url=where, method=method, resource_type=resource_type))
+    for _ in range(60):
+        request = Request(url=url, body=("\u20ac" * 2500).encode(),
+                          headers={"Cookie": "cookie-secret", "X-Keep": "visible"})
+        request.reply.headers = {"Authorization": "auth-secret"}
+        context.emit("request", request)
+        await finish(capture, context, request)
+    work = Work("network-file-test")
+    work._open["main"] = SimpleNamespace(network=capture, is_usable=lambda: True)
+    monkeypatch.setattr(server, "work", work)
+    monkeypatch.setattr(server, "owners", None)
+    filters = dict(url_contains="token=", resource_types=["fetch"], methods=["post"],
+                   since_id=1, include_headers=include_headers, include_bodies=include_bodies,
+                   strip_query=True)
+    out = json.loads(await server.browser_network(
+        to_file=True, max_entries=1, max_bytes=1, **filters))
+    assert set(out) == {"path", "written", "bytes", "truncated", "dropped", "capacity",
+                        "stored_body_bytes", "note", "request_bodies"}
+    for key, value in capture.metadata().items():
+        assert out[key] == value
+    path = Path(out["path"])
+    assert path.is_absolute() and path.parent == tmp_path
+    assert re.fullmatch(r"network-\d{8}T\d{6}Z-[0-9a-f]{6}\.ndjson", path.name)
+    if os.name == "posix":
+        assert path.stat().st_mode & 0o777 == 0o600
+    raw = path.read_bytes()
+    saved = [json.loads(line) for line in raw.splitlines()]
+    assert saved == list(capture.stream(**filters))
+    assert len(saved) == out["written"] == 60
+    assert out["bytes"] == len(raw) and out["truncated"] is False
+    assert all(row["url"] == "https://site.test/api" for row in saved)
+    assert b"cookie-secret" not in raw and b"auth-secret" not in raw
+    if include_headers:
+        assert saved[0]["request_headers"]["Cookie"] == "[redacted]"
+    else:
+        assert "request_headers" not in saved[0] and "response_headers" not in saved[0]
+    if include_bodies:
+        assert out["bytes"] > network.RESPONSE_BYTES
+        assert "\u20ac".encode() in raw and b"\\u20ac" not in raw
+    else:
+        assert "post_data" not in saved[0] and "response_body" not in saved[0]
+    inline = json.loads(await server.browser_network(max_entries=1, max_bytes=1, **filters))
+    assert inline["entries"] == saved[:1] and inline["more"] is True
+    monkeypatch.setenv("STEALTHFOX_NETWORK_FILE_BYTES", str(len(raw.splitlines(keepends=True)[0])))
+    small = json.loads(await server.browser_network(to_file=True, **filters))
+    assert small["written"] == 1 and small["truncated"] is True
+    assert Path(small["path"]).read_bytes() == raw.splitlines(keepends=True)[0]
+    assert small["path"] != out["path"]
+    await capture.close()
+
+
+@pytest.mark.parametrize("max_bytes,written,truncated", [
+    (1, 0, True), (13, 1, True), (25, 1, True), (26, 2, False),
+])
+def test_ndjson_budget_counts_utf8_and_newlines(tmp_path, max_bytes, written, truncated):
+    out = actions.write_network_ndjson([{"x": "\u20ac"}] * 2, save_to=None,
+                                       env={actions.DOWNLOAD_DIRS_ENV: str(tmp_path)},
+                                       max_bytes=max_bytes)
+    assert set(out) == {"path", "written", "bytes", "truncated"}
+    assert out["written"] == written and out["truncated"] is truncated
+    assert out["bytes"] == written * 13
+    assert Path(out["path"]).read_bytes() == ('{"x": "\u20ac"}\n'.encode() * written)
+
+
+def test_ndjson_empty_capture_is_an_empty_nontruncated_file(tmp_path):
+    out = actions.write_network_ndjson([], save_to=None,
+                                       env={actions.DOWNLOAD_DIRS_ENV: str(tmp_path)}, max_bytes=1)
+    assert out["written"] == out["bytes"] == 0 and out["truncated"] is False
+    assert Path(out["path"]).read_bytes() == b""
+
+
+@pytest.mark.parametrize("max_bytes", [0, -1])
+def test_ndjson_refuses_nonpositive_budget_without_creating_files(tmp_path, max_bytes):
+    with pytest.raises(ValueError, match="max_bytes"):
+        actions.write_network_ndjson([], save_to=None,
+                                     env={actions.DOWNLOAD_DIRS_ENV: str(tmp_path)},
+                                     max_bytes=max_bytes)
+    assert not list(tmp_path.iterdir())
+
+
+def test_ndjson_download_errors_propagate(tmp_path):
+    root = tmp_path / "downloads"
+    root.mkdir()
+    env = {actions.DOWNLOAD_DIRS_ENV: str(root)}
+    with pytest.raises(RuntimeError, match="downloads are off"):
+        actions.write_network_ndjson([], save_to=None, env={}, max_bytes=100)
+    with pytest.raises(ValueError, match="absolute"):
+        actions.write_network_ndjson([], save_to="relative", env=env, max_bytes=100)
+    with pytest.raises(PermissionError, match="not inside"):
+        actions.write_network_ndjson([], save_to=str(tmp_path), env=env, max_bytes=100)
+    assert not list(root.iterdir())
+    target = root / "nested" / "capture"
+    out = actions.write_network_ndjson([], save_to=str(target), env=env, max_bytes=100)
+    assert Path(out["path"]).parent == target
+
+
+def test_ndjson_removes_partial_file_and_propagates_stream_failure(tmp_path):
+    def broken():
+        yield {"id": 1}
+        raise RuntimeError("stream failed")
+
+    with pytest.raises(RuntimeError, match="stream failed"):
+        actions.write_network_ndjson(broken(), save_to=None,
+                                     env={actions.DOWNLOAD_DIRS_ENV: str(tmp_path)}, max_bytes=100)
+    assert not list(tmp_path.iterdir())
+
+
+def test_ndjson_removes_partial_file_and_propagates_disk_failure(monkeypatch, tmp_path):
+    def failed_sync(fd):
+        raise OSError("disk failed")
+
+    monkeypatch.setattr(actions.os, "fsync", failed_sync)
+    with pytest.raises(OSError, match="disk failed"):
+        actions.write_network_ndjson([{"id": 1}], save_to=None,
+                                     env={actions.DOWNLOAD_DIRS_ENV: str(tmp_path)}, max_bytes=100)
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="symlink creation requires POSIX")
+@pytest.mark.parametrize("symlink", [False, True])
+def test_ndjson_never_overwrites_existing_files_or_follows_links(monkeypatch, tmp_path, symlink):
+    monkeypatch.setattr(actions.time, "strftime", lambda *args: "20261018T000000Z")
+    monkeypatch.setattr(actions.secrets, "token_hex", lambda size: "abcdef")
+    target = tmp_path / "network-20261018T000000Z-abcdef.ndjson"
+    original = tmp_path / "original"
+    original.write_bytes(b"keep")
+    if symlink:
+        target.symlink_to(original)
+    else:
+        target.write_bytes(b"keep")
+    with pytest.raises(FileExistsError):
+        actions.write_network_ndjson([{"id": 1}], save_to=None,
+                                     env={actions.DOWNLOAD_DIRS_ENV: str(tmp_path)}, max_bytes=100)
+    assert original.read_bytes() == target.read_bytes() == b"keep"
+    assert target.is_symlink() is symlink
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "abc", "1.5"])
+async def test_file_mode_refuses_invalid_environment_cap(monkeypatch, tmp_path, bad):
+    monkeypatch.setenv(actions.DOWNLOAD_DIRS_ENV, str(tmp_path))
+    monkeypatch.setenv("STEALTHFOX_NETWORK_FILE_BYTES", bad)
+    capture, _ = recorder()
+    work = Work("network-file-test")
+    work._open["main"] = SimpleNamespace(network=capture, is_usable=lambda: True)
+    with pytest.raises(ValueError):
+        await work.network("main", to_file=True)
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="owner mode requires POSIX")
+async def test_owner_network_export_uses_only_its_private_download_directory(monkeypatch, tmp_path):
+    monkeypatch.setenv(actions.DOWNLOAD_DIRS_ENV, str(tmp_path))
+    monkeypatch.delenv("STEALTHFOX_NETWORK_FILE_BYTES", raising=False)
+    capture, _ = recorder()
+    work = OwnerWork(SimpleNamespace(), factory=StealthSession, engine=None)
+    work.download_dir = tmp_path / "private"
+    work.download_dir.mkdir()
+    work._open["main"] = SimpleNamespace(network=capture, is_usable=lambda: True)
+    out = await work.network("main", to_file=True)
+    assert Path(out["path"]).parent == work.download_dir
+    with pytest.raises(PermissionError, match="not inside"):
+        await work.network("main", to_file=True, save_to=str(tmp_path))
+    work.download_dir = None
+    with pytest.raises(RuntimeError, match="no private download directory"):
+        await work.network("main", to_file=True)

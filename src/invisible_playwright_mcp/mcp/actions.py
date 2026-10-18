@@ -20,6 +20,7 @@ import json
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import stat
 import tempfile
@@ -1544,6 +1545,37 @@ def download_target(save_to=None, env=None) -> str:
     if not os.access(named, os.W_OK | os.X_OK):
         raise PermissionError(f"{save_to} is not writable")
     return named
+
+
+def write_network_ndjson(rows, *, save_to, env, max_bytes: int) -> dict:
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive integer")
+    directory = download_target(save_to, env)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    name = "network-%s-%s.ndjson" % (stamp, secrets.token_hex(3))
+    path = os.path.join(directory, name)
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+             | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    written, size, truncated = 0, 0, False
+    with _download_directory(directory, os.environ if env is None else env) as dir_fd:
+        fd = os.open(name if dir_fd is not None else path, flags, 0o600, dir_fd=dir_fd)
+        try:
+            with os.fdopen(fd, "wb") as out:
+                for row in rows:
+                    line = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
+                    if size + len(line) > max_bytes:
+                        truncated = True
+                        break
+                    out.write(line)
+                    written += 1
+                    size += len(line)
+                out.flush()
+                os.fsync(out.fileno())
+        except BaseException:
+            with swallow("a partial network file that cannot be removed is reported by the raise"):
+                os.unlink(name if dir_fd is not None else path, dir_fd=dir_fd)
+            raise
+    return {"path": path, "written": written, "bytes": size, "truncated": truncated}
 
 
 def _named_dirs(var: str, what: str, env=None, *, error_type=RuntimeError) -> list[str]:
