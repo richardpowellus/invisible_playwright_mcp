@@ -333,7 +333,26 @@ def login_page():
         if (++window.renders === 1) queueMicrotask(() => { field.value = ''; });
     });
     </script></body></html>"""
-    pages = {"/vuetify": vuetify, "/wipes-first-input": wipes_input}
+    # A password input in a CLOSED shadow root ahead of its open-root twin.
+    # Page script sees only the open one; the engine sees both. The page keeps
+    # the closed input in a variable only so the test can read it back.
+    closed_twin = b"""<html><body><script>
+    customElements.define('x-sealed', class extends HTMLElement {
+        constructor() {
+            super();
+            const root = this.attachShadow({mode: 'closed'});
+            root.innerHTML = '<input id=pw type=password>';
+            window.sealedInput = root.querySelector('input');
+        }
+    });
+    customElements.define('x-open', class extends HTMLElement {
+        constructor() {
+            super();
+            this.attachShadow({mode: 'open'}).innerHTML = '<input id=pw type=password>';
+        }
+    });
+    </script><x-sealed id=sealed></x-sealed><x-open id=host></x-open></body></html>"""
+    pages = {"/vuetify": vuetify, "/wipes-first-input": wipes_input, "/closed-twin": closed_twin}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -451,4 +470,47 @@ async def test_vuetify_first_focus_render_keeps_the_fillers_guarded_delivery(
         password = next(el for el in snapshot["interactive_elements"] if el["selector"] == "#p")
         assert password["text"] == "\u2022" * 8
         assert "hunter2" not in json.dumps(snapshot)
+        await ctx.close()
+
+
+@pytest.mark.e2e
+async def test_strict_refuses_a_twin_in_a_closed_shadow_root(login_page):
+    """What page script resolves and what the guarded write resolves differ by
+    closed shadow roots. Non-strict, the write takes whichever the engine meets
+    first; strict refuses before writing, and a chain through the open host
+    still reaches the one input page script checked."""
+    from invisible_playwright.async_api import InvisiblePlaywright
+
+    pinned = 'css=input:is(#pw):visible:enabled:not([readonly])[type="password" i]'
+    chain = 'css=:is(#host) >> ' + pinned
+    values = """() => ({sealed: window.sealedInput.value,
+        open: document.querySelector('#host').shadowRoot.querySelector('input').value})"""
+    async with InvisiblePlaywright(seed=1, headless=True) as browser:
+        ctx = await browser.new_context()
+        page = await ctx.new_page()
+
+        class _S:
+            def page(self):
+                return page
+
+        s = _S()
+        await page.goto(login_page + "/closed-twin")
+        # Page script: one match, the open twin. (Closed roots are invisible to it.)
+        assert await page.evaluate("""() => [...document.querySelectorAll('*')]
+            .flatMap(e => e.shadowRoot ? [...e.shadowRoot.querySelectorAll('#pw')] : []).length""") == 1
+
+        with pytest.raises(RuntimeError) as refused:
+            await actions.type_text(s, pinned, "hunter2", login_page, "password", strict=True)
+        assert "nothing was written" in str(refused.value) and "hunter2" not in str(refused.value)
+        assert await page.evaluate(values) == {"sealed": "", "open": ""}
+
+        assert await actions.type_text(s, chain, "hunter2", login_page, "password", strict=True) == \
+            "typed into " + chain
+        assert await page.evaluate(values) == {"sealed": "", "open": "hunter2"}
+
+        # The defect strict closes: non-strict, the same pinned selector writes
+        # into the closed twin, which page script never checked.
+        await page.goto(login_page + "/closed-twin")
+        assert await actions.type_text(s, pinned, "hunter2", login_page, "password") == "typed into " + pinned
+        assert await page.evaluate(values) == {"sealed": "hunter2", "open": ""}
         await ctx.close()
