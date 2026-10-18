@@ -30,7 +30,8 @@ class _Page:
     async def fill(self, selector, text, **kw):
         self.calls.append((selector, text, kw))
 
-    async def eval_on_selector(self, selector, expression, arg=None):
+    async def eval_on_selector(self, selector, expression, arg=None, **kw):
+        self.reads = getattr(self, "reads", []) + [kw]
         assert arg == {"origin": "https://login.example.com", "text": self.calls[-1][1]}
         return {"kept": True, "empty": not bool(self.calls[-1][1])}
 
@@ -73,6 +74,48 @@ def test_expect_input_type_rides_with_expect_origin():
                                     "expect_input_type": "password"}
     with pytest.raises(ValueError):
         asyncio.run(actions.type_text(s, "#p", "secret", None, "password"))
+
+
+def test_strict_reaches_the_write_and_the_read_back():
+    # The engine resolves from a world where closed shadow roots are open, so a
+    # caller that checked the field from page script asks for strict: a second
+    # match, seen or not, refuses the write instead of taking the first.
+    s = _Session()
+    asyncio.run(actions.type_text(s, "#p", "secret", "https://login.example.com", "password",
+                                  strict=True))
+    assert s._page.calls[-1][2] == {"timeout": 15_000, "expect_origin": "https://login.example.com",
+                                    "expect_input_type": "password", "strict": True}
+    assert s._page.reads and all(kw == {"strict": True} for kw in s._page.reads)
+
+
+def test_without_strict_the_guarded_write_is_unchanged():
+    s = _Session()
+    asyncio.run(actions.type_text(s, "#p", "secret", "https://login.example.com"))
+    assert "strict" not in s._page.calls[-1][2]
+    assert all(kw == {} for kw in s._page.reads)
+
+
+def test_a_strict_violation_is_a_refusal_that_wrote_nothing():
+    class Ambiguous(_Page):
+        async def fill(self, selector, text, **kw):
+            raise RuntimeError("strict mode violation: locator('#p') resolved to 2 elements: <input value=x>")
+
+    s = _Session()
+    s._page = Ambiguous()
+    with pytest.raises(RuntimeError) as refused:
+        asyncio.run(actions.type_text(s, "#p", "secret", "https://login.example.com", strict=True))
+    assert "nothing was written" in str(refused.value) and "value=x" not in str(refused.value)
+    # Without strict the same text is not taken as a refusal.
+    s._page = Ambiguous()
+    with pytest.raises(RuntimeError) as unknown:
+        asyncio.run(actions.type_text(s, "#p", "secret", "https://login.example.com"))
+    assert "outcome is unknown" in str(unknown.value)
+
+
+def test_strict_needs_expect_origin():
+    with pytest.raises(ValueError):
+        asyncio.run(actions.type_text(_Session(), "#p", "secret", strict=True))
+    assert "strict" in inspect.signature(server.browser_type).parameters
 
 
 def test_the_tool_declares_it_as_optional():
@@ -290,7 +333,26 @@ def login_page():
         if (++window.renders === 1) queueMicrotask(() => { field.value = ''; });
     });
     </script></body></html>"""
-    pages = {"/vuetify": vuetify, "/wipes-first-input": wipes_input}
+    # A password input in a CLOSED shadow root ahead of its open-root twin.
+    # Page script sees only the open one; the engine sees both. The page keeps
+    # the closed input in a variable only so the test can read it back.
+    closed_twin = b"""<html><body><script>
+    customElements.define('x-sealed', class extends HTMLElement {
+        constructor() {
+            super();
+            const root = this.attachShadow({mode: 'closed'});
+            root.innerHTML = '<input id=pw type=password>';
+            window.sealedInput = root.querySelector('input');
+        }
+    });
+    customElements.define('x-open', class extends HTMLElement {
+        constructor() {
+            super();
+            this.attachShadow({mode: 'open'}).innerHTML = '<input id=pw type=password>';
+        }
+    });
+    </script><x-sealed id=sealed></x-sealed><x-open id=host></x-open></body></html>"""
+    pages = {"/vuetify": vuetify, "/wipes-first-input": wipes_input, "/closed-twin": closed_twin}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -408,4 +470,47 @@ async def test_vuetify_first_focus_render_keeps_the_fillers_guarded_delivery(
         password = next(el for el in snapshot["interactive_elements"] if el["selector"] == "#p")
         assert password["text"] == "\u2022" * 8
         assert "hunter2" not in json.dumps(snapshot)
+        await ctx.close()
+
+
+@pytest.mark.e2e
+async def test_strict_refuses_a_twin_in_a_closed_shadow_root(login_page):
+    """What page script resolves and what the guarded write resolves differ by
+    closed shadow roots. Non-strict, the write takes whichever the engine meets
+    first; strict refuses before writing, and a chain through the open host
+    still reaches the one input page script checked."""
+    from invisible_playwright.async_api import InvisiblePlaywright
+
+    pinned = 'css=input:is(#pw):visible:enabled:not([readonly])[type="password" i]'
+    chain = 'css=:is(#host) >> ' + pinned
+    values = """() => ({sealed: window.sealedInput.value,
+        open: document.querySelector('#host').shadowRoot.querySelector('input').value})"""
+    async with InvisiblePlaywright(seed=1, headless=True) as browser:
+        ctx = await browser.new_context()
+        page = await ctx.new_page()
+
+        class _S:
+            def page(self):
+                return page
+
+        s = _S()
+        await page.goto(login_page + "/closed-twin")
+        # Page script: one match, the open twin. (Closed roots are invisible to it.)
+        assert await page.evaluate("""() => [...document.querySelectorAll('*')]
+            .flatMap(e => e.shadowRoot ? [...e.shadowRoot.querySelectorAll('#pw')] : []).length""") == 1
+
+        with pytest.raises(RuntimeError) as refused:
+            await actions.type_text(s, pinned, "hunter2", login_page, "password", strict=True)
+        assert "nothing was written" in str(refused.value) and "hunter2" not in str(refused.value)
+        assert await page.evaluate(values) == {"sealed": "", "open": ""}
+
+        assert await actions.type_text(s, chain, "hunter2", login_page, "password", strict=True) == \
+            "typed into " + chain
+        assert await page.evaluate(values) == {"sealed": "", "open": "hunter2"}
+
+        # The defect strict closes: non-strict, the same pinned selector writes
+        # into the closed twin, which page script never checked.
+        await page.goto(login_page + "/closed-twin")
+        assert await actions.type_text(s, pinned, "hunter2", login_page, "password") == "typed into " + pinned
+        assert await page.evaluate(values) == {"sealed": "hunter2", "open": ""}
         await ctx.close()

@@ -911,7 +911,7 @@ def what_the_field_kept(selector: str, text: str, before: dict, after: dict) -> 
 async def type_text(session, selector: str, text: str,
                     expect_origin: str | None = None,
                     expect_input_type: str | None = None,
-                    mask_value: bool = False) -> str:
+                    mask_value: bool = False, strict: bool = False) -> str:
     """Type into a field the way a person does, and say what the field kept.
 
     The engine's `fill`: focus, the typist's pause (longer while the page is
@@ -947,9 +947,11 @@ async def type_text(session, selector: str, text: str,
             await session.stop_watching()
     if expect_input_type is not None and expect_origin is None:
         raise ValueError("expect_input_type is only accepted together with expect_origin")
+    if strict and expect_origin is None:
+        raise ValueError("strict is only accepted together with expect_origin")
     page = session.page()
     if expect_origin is not None:
-        return await _type_on_origin(page, selector, text, expect_origin, expect_input_type)
+        return await _type_on_origin(page, selector, text, expect_origin, expect_input_type, strict)
     before = await _on_selector(session, selector, "typing",
                                 lambda: _field_state(page, selector))
     await _on_selector(session, selector, "typing",
@@ -967,11 +969,23 @@ _GUARDED_STATE_JS = """(el, expected) => {
 }"""
 
 
-async def _type_on_origin(page, selector, text, expect_origin, expect_input_type) -> str:
+async def _type_on_origin(page, selector, text, expect_origin, expect_input_type,
+                          strict=False) -> str:
+    """Origin-locked write, then a read back of the same field.
+
+    strict makes the engine refuse a selector that matches more than one
+    element, before anything is written. A caller that checked the field from
+    page script needs it: the engine resolves from a privileged world in which
+    closed shadow roots are open, so a non-strict write can land on a matching
+    input inside one, which that caller never saw. The read back is strict too,
+    so it cannot confirm a different field than the one written.
+    """
     began = time.monotonic()
     kwargs = {"timeout": ACTION_TIMEOUT_MS, "expect_origin": expect_origin}
     if expect_input_type is not None:
         kwargs["expect_input_type"] = expect_input_type
+    if strict:
+        kwargs["strict"] = True
     for attempt in range(GUARD_ATTEMPTS):
         try:
             await page.fill(selector, text, **kwargs)
@@ -980,6 +994,13 @@ async def _type_on_origin(page, selector, text, expect_origin, expect_input_type
                 raise RuntimeError(
                     "expect_origin refused: the field's page is not on the expected origin "
                     "or the field changed; nothing was written") from None
+            # The engine resolves strictly before it writes anything, so a
+            # strict violation on the first attempt is a refusal, not an
+            # unknown outcome. Its text lists the matches; it is not quoted.
+            if attempt == 0 and strict and "strict mode violation" in str(exc):
+                raise RuntimeError(
+                    "expect_origin refused: the selector matches more than one element, "
+                    "counting closed shadow roots; nothing was written") from None
             # A repeat refusal cannot undo an earlier write. Engine diagnostics
             # can contain the credential, so neither quote nor diagnose them.
             raise RuntimeError(
@@ -989,7 +1010,8 @@ async def _type_on_origin(page, selector, text, expect_origin, expect_input_type
         while True:
             try:
                 state = await asyncio.wait_for(page.eval_on_selector(
-                    selector, _GUARDED_STATE_JS, {"origin": expect_origin, "text": text}), 5)
+                    selector, _GUARDED_STATE_JS, {"origin": expect_origin, "text": text},
+                    **({"strict": True} if strict else {})), 5)
             except Exception:
                 raise RuntimeError(
                     "the origin-locked field could not be read back; the write outcome is unknown") from None
