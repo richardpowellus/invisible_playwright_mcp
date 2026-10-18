@@ -288,7 +288,9 @@ def test_the_gate_is_looking_at_the_whole_package():
     # carries it.
     # Cookie export adds Network.protect and Network._protect_row, and
     # MaskedValues.register_exact for whole-value cookie masking.
-    assert methods <= 125, "%d methods judged; the exclusions have stopped applying" % methods
+    # browser_network compact/file export adds Network.stream, Network.metadata
+    # and Work._download_env.
+    assert methods <= 128, "%d methods judged; the exclusions have stopped applying" % methods
     reached = set()
     for text in sources.values():
         reached.update(_on_an_object(ast.parse(text), known))
