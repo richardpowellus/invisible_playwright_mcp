@@ -30,7 +30,8 @@ class _Page:
     async def fill(self, selector, text, **kw):
         self.calls.append((selector, text, kw))
 
-    async def eval_on_selector(self, selector, expression, arg=None):
+    async def eval_on_selector(self, selector, expression, arg=None, **kw):
+        self.reads = getattr(self, "reads", []) + [kw]
         assert arg == {"origin": "https://login.example.com", "text": self.calls[-1][1]}
         return {"kept": True, "empty": not bool(self.calls[-1][1])}
 
@@ -73,6 +74,48 @@ def test_expect_input_type_rides_with_expect_origin():
                                     "expect_input_type": "password"}
     with pytest.raises(ValueError):
         asyncio.run(actions.type_text(s, "#p", "secret", None, "password"))
+
+
+def test_strict_reaches_the_write_and_the_read_back():
+    # The engine resolves from a world where closed shadow roots are open, so a
+    # caller that checked the field from page script asks for strict: a second
+    # match, seen or not, refuses the write instead of taking the first.
+    s = _Session()
+    asyncio.run(actions.type_text(s, "#p", "secret", "https://login.example.com", "password",
+                                  strict=True))
+    assert s._page.calls[-1][2] == {"timeout": 15_000, "expect_origin": "https://login.example.com",
+                                    "expect_input_type": "password", "strict": True}
+    assert s._page.reads and all(kw == {"strict": True} for kw in s._page.reads)
+
+
+def test_without_strict_the_guarded_write_is_unchanged():
+    s = _Session()
+    asyncio.run(actions.type_text(s, "#p", "secret", "https://login.example.com"))
+    assert "strict" not in s._page.calls[-1][2]
+    assert all(kw == {} for kw in s._page.reads)
+
+
+def test_a_strict_violation_is_a_refusal_that_wrote_nothing():
+    class Ambiguous(_Page):
+        async def fill(self, selector, text, **kw):
+            raise RuntimeError("strict mode violation: locator('#p') resolved to 2 elements: <input value=x>")
+
+    s = _Session()
+    s._page = Ambiguous()
+    with pytest.raises(RuntimeError) as refused:
+        asyncio.run(actions.type_text(s, "#p", "secret", "https://login.example.com", strict=True))
+    assert "nothing was written" in str(refused.value) and "value=x" not in str(refused.value)
+    # Without strict the same text is not taken as a refusal.
+    s._page = Ambiguous()
+    with pytest.raises(RuntimeError) as unknown:
+        asyncio.run(actions.type_text(s, "#p", "secret", "https://login.example.com"))
+    assert "outcome is unknown" in str(unknown.value)
+
+
+def test_strict_needs_expect_origin():
+    with pytest.raises(ValueError):
+        asyncio.run(actions.type_text(_Session(), "#p", "secret", strict=True))
+    assert "strict" in inspect.signature(server.browser_type).parameters
 
 
 def test_the_tool_declares_it_as_optional():

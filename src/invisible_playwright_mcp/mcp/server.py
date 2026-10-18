@@ -905,7 +905,8 @@ async def browser_click_at(x: float, y: float, hold_seconds: float = 0.0,
 async def browser_type(selector: str, text: str, browser: Browser = None,
                        expect_origin: str | None = None,
                        expect_input_type: str | None = None,
-                       mask_value: Annotated[bool, Field(strict=True)] = False) -> str:
+                       mask_value: Annotated[bool, Field(strict=True)] = False,
+                       strict: Annotated[bool, Field(strict=True)] = False) -> str:
     """Type into a field, replacing what it holds, key by key at a human pace.
 
     Reports what the field kept, including truncation or reformatting. Plain
@@ -919,7 +920,11 @@ async def browser_type(selector: str, text: str, browser: Browser = None,
 
     mask_value hides text of at least eight characters from this owner's tool
     results until this browser closes. Requires expect_origin; empty clears
-    are allowed. Page pixels are refused while masked text is present."""
+    are allowed. Page pixels are refused while masked text is present.
+
+    strict, with expect_origin, refuses unless the selector matches exactly one
+    element, counting those in closed shadow roots, which page script cannot
+    see; nothing is written when it matches more."""
     if mask_value:
         masked.validate(text, expect_origin)
     guard = {key: value for key, value in (
@@ -927,6 +932,8 @@ async def browser_type(selector: str, text: str, browser: Browser = None,
         if value is not None}
     if mask_value:
         guard["mask_value"] = True
+    if strict:
+        guard["strict"] = True
     return await _work().typing(actions.type_text, selector, text, role=browser, **guard)
 
 
