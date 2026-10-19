@@ -564,8 +564,11 @@ evaluation sandbox. Presence reads and capture are not an atomic page operation.
 Keep engine/RPC payload tracing disabled.
 
 `browser_download(selector=..., x=..., y=..., timeout_seconds=30, save_to=...)`
-clicks a selector or a point and saves a completed browser download or document
-navigation. Fetch/XHR responses and other existing tabs are not candidates.
+clicks a selector or a point and saves a completed browser download or shown
+document, including a `blob:` PDF in the browser's viewer, even after its URL
+is revoked. The viewer's loaded PDF bytes are read when no saved file or
+response body arrives; its Save button also works through this path.
+Fetch/XHR responses and other existing tabs are not candidates.
 `save_to` is an absolute directory within a configured root; it is created if
 missing. Names are sanitized, existing files are never overwritten, empty files
 are refused, and size and SHA-256 are verified after flushing. A new tab used

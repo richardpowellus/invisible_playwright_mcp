@@ -15,6 +15,7 @@ acts on it.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import mimetypes
@@ -1819,13 +1820,66 @@ async def _press_at(page, x: float, y: float) -> None:
     await page.mouse.click(x, y)
 
 
+async def _pdf_viewer_ready(page, deadline: float) -> bool:
+    with swallow("a PDF viewer not ready or a tab that will not answer is polled again"):
+        async with asyncio.timeout(min(0.5, max(0, deadline - time.monotonic()))):
+            return await page.evaluate("""async () => {
+                if (document.contentType !== 'application/pdf' ||
+                    typeof PDFViewerApplication !== 'object') return false;
+                await PDFViewerApplication.initializedPromise;
+                return !!PDFViewerApplication.pdfDocument;
+            }""") is True
+    return False
+
+
+async def _pdf_viewer_data(page, deadline: float) -> tuple[bytes, str, str]:
+    async with asyncio.timeout(max(0, deadline - time.monotonic())):
+        result = await page.evaluate("""async maxBytes => {
+            if (document.contentType !== 'application/pdf') throw new Error('not a PDF');
+            const app = PDFViewerApplication, doc = app.pdfDocument, url = location.href;
+            const name = app._contentDispositionFilename || app._docFilename || '';
+            const bytes = await doc.getData();
+            if (app.pdfDocument !== doc || location.href !== url)
+                throw new Error('the PDF viewer changed documents');
+            if (!bytes.length) throw new Error('empty PDF');
+            if (bytes.length > maxBytes)
+                throw new Error(`the file is over the ${maxBytes}-byte limit`);
+            if (String.fromCharCode(...bytes.subarray(0, 5)) !== '%PDF-')
+                throw new Error('not a PDF');
+            const chunks = [];
+            // A multiple of three keeps padding out of all but the last chunk.
+            for (let i = 0; i < bytes.length; i += 32766)
+                chunks.push(btoa(String.fromCharCode(...bytes.subarray(i, i + 32766))));
+            return {data: chunks.join(''), name, url};
+        }""", DOWNLOAD_MAX_BYTES)
+    if len(result["data"]) > 4 * ((DOWNLOAD_MAX_BYTES + 2) // 3):
+        raise ValueError(f"the file is over the {DOWNLOAD_MAX_BYTES}-byte limit")
+    body = base64.b64decode(result["data"], validate=True)
+    if not body:
+        raise ValueError("empty PDF")
+    if len(body) > DOWNLOAD_MAX_BYTES:
+        raise ValueError(f"the file is over the {DOWNLOAD_MAX_BYTES}-byte limit")
+    if not body.startswith(b"%PDF-"):
+        raise ValueError("not a PDF")
+    name = result["name"]
+    url = result["url"]
+    if not name and urllib.parse.urlsplit(url).scheme in ("http", "https"):
+        name = urllib.parse.unquote(urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1])
+    name = safe_filename(name, "document.pdf")
+    if not name.lower().endswith(".pdf"):
+        name = safe_filename(name + ".pdf")
+    return body, name, url
+
+
 async def _arrival(session, landing: str, before: set, shown: list, deadline: float,
-                   failures: list, *, env=None):
+                   failures: list, *, page, pages_before: set, env=None):
     """Wait for the file: ("download", path) once the browser has saved one
     and its size has held for a poll, or ("page", (body, response)) once the
-    click showed a document and no saved copy followed it."""
+    click showed a document and no saved copy followed it, or
+    ("viewer", (body, name, url)) from a PDF viewer without a response."""
     sizes: dict = {}
     shown_at = None
+    viewer_at: dict = {}
     tries = 0
     while time.monotonic() < deadline:
         for path, size in landed(landing, before, env=env):
@@ -1856,6 +1910,28 @@ async def _arrival(session, landing: str, before: set, shown: list, deadline: fl
                         # to read here; its saved copy is what to wait for.
                         shown.pop()
                         shown_at, tries = None, 0
+        if not shown:
+            candidates = [p for p in session.pages() if p is page or id(p) not in pages_before]
+            ready = await asyncio.gather(*(_pdf_viewer_ready(p, deadline) for p in candidates))
+            for candidate, loaded in zip(candidates, ready):
+                key = (id(candidate), candidate.url)
+                if not loaded:
+                    viewer_at.pop(key, None)
+                    continue
+                first_seen = viewer_at.setdefault(key, time.monotonic())
+                if time.monotonic() - first_seen < SAVED_COPY_GRACE_S:
+                    continue
+                # A saved copy or response can arrive while a viewer answers.
+                if shown or landed(landing, before, env=env):
+                    break
+                try:
+                    got = await _pdf_viewer_data(candidate, deadline)
+                except Exception as exc:
+                    failures.append(f"{candidate.url}: {exc}".splitlines()[0][:200])
+                    continue
+                if shown or landed(landing, before, env=env):
+                    break
+                return "viewer", got
         await asyncio.sleep(_POLL_S)
     return None, None
 
@@ -1896,7 +1972,8 @@ async def download(session, selector=None, x=None, y=None,
         else:
             await _press_at(page, float(x), float(y))
         how, got = await _arrival(session, landing, before, shown,
-                                  time.monotonic() + float(timeout_seconds), failures, env=env)
+                                  time.monotonic() + float(timeout_seconds), failures,
+                                  page=page, pages_before=pages_before, env=env)
     finally:
         with swallow("a context already gone has no listener to remove"):
             context.remove_listener("response", on_response)
@@ -1929,6 +2006,10 @@ async def download(session, selector=None, x=None, y=None,
             with swallow("the browser's own copy goes with the browser either way"):
                 os.unlink(got)
         url, declared = "", None
+    elif how == "viewer":
+        body, name, url = got
+        declared = "application/pdf"
+        saved = save_download(directory, name, [body], env=env)
     else:
         body, response = got
         url, declared = response.url, response.headers.get("content-type")
@@ -1945,13 +2026,14 @@ async def download(session, selector=None, x=None, y=None,
             with swallow("a tab the site already closed"):
                 await opened.close()
                 notes.append("closed the tab the file opened in")
-    if how == "page" and page.url == url:
+    if how in ("page", "viewer") and page.url == url:
         notes.append("this page now shows the file; browser_navigate to leave it")
     return json.dumps({
         "saved": saved["path"], "filename": saved["filename"], "size": saved["size"],
         "mime": sniff_mime(saved["head"], saved["filename"], declared),
         "sha256": saved["sha256"],
-        "from": "the browser's download" if how == "download" else "the document the page showed",
+        "from": {"download": "the browser's download", "page": "the document the page showed",
+                 "viewer": "the PDF the browser's viewer showed"}[how],
         "url": url, "notes": notes}, ensure_ascii=False)
 
 

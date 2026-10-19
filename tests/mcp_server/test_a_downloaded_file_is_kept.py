@@ -11,6 +11,7 @@ ones hold every shape against a real engine.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import http.server
 import json
@@ -277,6 +278,30 @@ class _Page:
     async def up(self):
         await self.effect(self)
 
+    async def evaluate(self, js, *args):
+        return None
+
+
+class _Viewer(_Page):
+    def __init__(self, session, effect=None, *, data=b"%PDF-1.4 viewer",
+                 name="statement.pdf", url="blob:https://bank.example/statement"):
+        super().__init__(session, effect)
+        self.url, self.data, self.name = url, data, name
+        self.reads = 0
+        self.ready = True
+
+    async def evaluate(self, js, *args):
+        if js == "document.contentType":
+            return "application/pdf"
+        if "getData()" in js:
+            self.reads += 1
+            return {"data": base64.b64encode(self.data).decode("ascii"),
+                    "name": self.name, "url": self.url}
+        return self.ready
+
+    async def close(self):
+        self.session.extra.remove(self)
+
 
 class _Session:
     def __init__(self, landing, effect):
@@ -351,6 +376,204 @@ def test_a_document_only_shown_is_taken_from_the_response(env):
     assert (root / "doc.pdf").read_bytes() == b"%PDF-1.4 shown"
 
 
+def test_a_pdf_viewer_without_a_response_is_kept(env):
+    root, landing = env
+
+    async def opens(page):
+        page.session.extra.append(_Viewer(page.session))
+
+    session = _Session(landing, opens)
+    out = _download(session, selector="#pdf", timeout_seconds=1)
+    assert out["from"] == "the PDF the browser's viewer showed"
+    assert out["url"] == "blob:https://bank.example/statement"
+    assert out["mime"] == "application/pdf"
+    assert Path(out["saved"]).read_bytes() == b"%PDF-1.4 viewer"
+    assert len(session.pages()) == 1
+
+
+def test_a_saved_copy_still_wins_over_a_pdf_viewer(env):
+    root, landing = env
+    viewers = []
+
+    async def opens(page):
+        viewer = _Viewer(page.session)
+        page.session.extra.append(viewer)
+        viewers.append(viewer)
+
+        async def later():
+            await asyncio.sleep(0.15)
+            (landing / "saved.pdf").write_bytes(b"%PDF-1.4 saved")
+        asyncio.get_running_loop().create_task(later())
+
+    out = _download(_Session(landing, opens), selector="#pdf", timeout_seconds=1)
+    assert out["from"] == "the browser's download"
+    assert Path(out["saved"]).read_bytes() == b"%PDF-1.4 saved"
+    assert viewers[0].reads == 0
+
+
+def test_a_response_backed_document_still_wins_over_a_pdf_viewer(env):
+    root, landing = env
+    viewers = []
+
+    async def opens(page):
+        viewer = _Viewer(page.session)
+        page.session.extra.append(viewer)
+        viewers.append(viewer)
+        for fn in page.context.listeners:
+            fn(_Response("https://bank.example/response.pdf",
+                         {"content-type": "application/pdf"}))
+
+    out = _download(_Session(landing, opens), selector="#pdf", timeout_seconds=1)
+    assert out["from"] == "the document the page showed"
+    assert Path(out["saved"]).read_bytes() == b"%PDF-1.4 shown"
+    assert viewers[0].reads == 0
+
+
+@pytest.mark.parametrize("arrival", ["download", "response"])
+def test_an_arrival_while_reading_a_pdf_viewer_still_takes_precedence(env, arrival):
+    root, landing = env
+
+    class Later(_Viewer):
+        async def evaluate(self, js, *args):
+            if "getData()" in js:
+                if arrival == "download":
+                    (landing / "saved.pdf").write_bytes(b"%PDF-1.4 saved")
+                else:
+                    for fn in self.session.page().context.listeners:
+                        fn(_Response("https://bank.example/response.pdf",
+                                     {"content-type": "application/pdf"}))
+            return await super().evaluate(js, *args)
+
+    async def opens(page):
+        page.session.extra.append(Later(page.session))
+
+    out = _download(_Session(landing, opens), selector="#pdf", timeout_seconds=2)
+    if arrival == "download":
+        assert out["from"] == "the browser's download"
+        assert Path(out["saved"]).read_bytes() == b"%PDF-1.4 saved"
+    else:
+        assert out["from"] == "the document the page showed"
+        assert Path(out["saved"]).read_bytes() == b"%PDF-1.4 shown"
+
+
+@pytest.mark.parametrize("data,reason", [(b"", "empty"), (b"not a PDF", "not a PDF")])
+def test_invalid_pdf_viewer_data_is_refused_and_reported(env, data, reason):
+    root, landing = env
+
+    async def opens(page):
+        page.session.extra.append(_Viewer(page.session, data=data))
+
+    with pytest.raises(RuntimeError) as err:
+        _download(_Session(landing, opens), selector="#pdf", timeout_seconds=0.6)
+    assert "could not be read:" in str(err.value)
+    assert reason in str(err.value)
+    assert "a new tab is on blob:https://bank.example/statement" in str(err.value)
+    assert list(root.iterdir()) == []
+
+
+def test_pdf_viewer_data_over_the_limit_is_refused(env, monkeypatch):
+    root, landing = env
+    monkeypatch.setattr(actions, "DOWNLOAD_MAX_BYTES", 5)
+
+    async def opens(page):
+        page.session.extra.append(_Viewer(page.session))
+
+    with pytest.raises(RuntimeError, match="over the 5-byte limit"):
+        _download(_Session(landing, opens), selector="#pdf", timeout_seconds=0.6)
+    assert list(root.iterdir()) == []
+
+
+@pytest.mark.parametrize("name,url,want", [
+    ("../../report", "blob:https://bank.example/id", "report.pdf"),
+    ("", "https://bank.example/Aug%202026?token=1", "Aug 2026.pdf"),
+    ("", "blob:https://bank.example/id", "document.pdf"),
+    ("x" * 220, "blob:https://bank.example/id", None),
+])
+def test_pdf_viewer_names_are_safe_and_end_in_pdf(env, name, url, want):
+    root, landing = env
+
+    async def opens(page):
+        page.session.extra.append(_Viewer(page.session, name=name, url=url))
+
+    out = _download(_Session(landing, opens), selector="#pdf", timeout_seconds=1)
+    assert out["filename"].endswith(".pdf")
+    assert len(out["filename"].encode("utf-8")) <= 200
+    if want:
+        assert out["filename"] == want
+
+
+def test_an_existing_other_pdf_viewer_is_not_kept(env):
+    root, landing = env
+
+    async def nothing(page):
+        pass
+
+    session = _Session(landing, nothing)
+    viewer = _Viewer(session)
+    session.extra.append(viewer)
+    with pytest.raises(RuntimeError, match="nothing was saved"):
+        _download(session, selector="#inert", timeout_seconds=0.6)
+    assert viewer.reads == 0
+    assert list(root.iterdir()) == []
+
+
+def test_a_pdf_viewer_is_polled_until_the_document_is_loaded(env):
+    root, landing = env
+
+    async def opens(page):
+        viewer = _Viewer(page.session)
+        viewer.ready = False
+        page.session.extra.append(viewer)
+
+        async def later():
+            await asyncio.sleep(0.15)
+            viewer.ready = True
+        asyncio.get_running_loop().create_task(later())
+
+    out = _download(_Session(landing, opens), selector="#pdf", timeout_seconds=1)
+    assert Path(out["saved"]).read_bytes() == b"%PDF-1.4 viewer"
+
+
+def test_an_unresponsive_tab_does_not_block_a_pdf_viewer(env):
+    root, landing = env
+
+    class Unresponsive(_Viewer):
+        async def evaluate(self, js, *args):
+            await asyncio.sleep(10)
+
+    async def opens(page):
+        page.session.extra.extend([Unresponsive(page.session), _Viewer(page.session)])
+
+    async def run():
+        return json.loads(await asyncio.wait_for(
+            actions.download(_Session(landing, opens), "#pdf", timeout_seconds=2), 3))
+
+    out = asyncio.run(run())
+    assert Path(out["saved"]).read_bytes() == b"%PDF-1.4 viewer"
+
+
+def test_pdf_viewer_probe_obeys_the_download_deadline(env):
+    root, landing = env
+
+    class Unresponsive(_Viewer):
+        async def evaluate(self, js, *args):
+            await asyncio.sleep(10)
+
+    async def nothing(page):
+        pass
+
+    session = _Session(landing, nothing)
+    session._page = Unresponsive(session, nothing)
+
+    async def run():
+        with pytest.raises(RuntimeError, match="nothing was saved"):
+            await asyncio.wait_for(
+                actions.download(session, "#downloadButton", timeout_seconds=0.1), 0.5)
+
+    asyncio.run(run())
+    assert list(root.iterdir()) == []
+
+
 def test_a_response_with_no_body_waits_for_its_saved_copy(env):
     root, landing = env
 
@@ -407,6 +630,7 @@ def test_the_target_is_a_selector_or_a_point(env, kw):
 PDF = (b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj 2 0 obj<</Type/Pages"
        b"/Kids[3 0 R]/Count 1>>endobj 3 0 obj<</Type/Page/Parent 2 0 R/MediaBox"
        b"[0 0 200 200]>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n")
+LARGE_PDF = PDF + b"\n%" + b"padding" * 40000 + b"\n"
 
 PAGE = b"""<!doctype html><html><body>
 <a id="attachment" href="/attachment.pdf">attachment</a>
@@ -415,6 +639,11 @@ PAGE = b"""<!doctype html><html><body>
 <a id="tab" href="/inline.pdf" target="_blank">new tab</a>
 <button id="opener" onclick="window.open('/inline.pdf')">window.open</button>
 <a id="same" href="/inline.pdf">same tab</a>
+<button id="blob-tab" disabled onclick="window.open(blobUrl, '_blank')">blob PDF tab</button>
+<button id="blob-revoked" disabled onclick="
+ window.open(blobUrl, '_blank');
+ setTimeout(() => URL.revokeObjectURL(blobUrl), 500)">revoked blob PDF tab</button>
+<button id="blob-same" disabled onclick="location.href = blobUrl">blob PDF same tab</button>
 <button id="inert">nothing</button>
 <button id="fetch" onclick="fetch('/binary')">fetch data</button>
 <button id="xhr" onclick="let r=new XMLHttpRequest();r.open('GET','/binary');r.send()">XHR data</button>
@@ -422,6 +651,16 @@ PAGE = b"""<!doctype html><html><body>
  const url=window.URL.createObjectURL(new Blob(['blob-'.repeat(262144)], {type:'text/plain'}));
  const a=document.createElement('a');a.href=url;a.download='blob.txt';a.click();
  setTimeout(() => window.URL.revokeObjectURL(url), 0)">blob</button>
+<script>
+let blobUrl;
+fetch(location.search === '?large' ? '/large.pdf' : '/inline.pdf')
+.then(response => response.blob()).then(blob => {
+ blobUrl = URL.createObjectURL(blob);
+ for (const id of ['blob-tab', 'blob-revoked', 'blob-same']) {
+  document.getElementById(id).disabled = false;
+ }
+});
+</script>
 </body></html>"""
 
 
@@ -441,6 +680,9 @@ def url():
             elif self.path == "/inline.pdf":
                 self.send_header("Content-Type", "application/pdf")
                 body = PDF
+            elif self.path == "/large.pdf":
+                self.send_header("Content-Type", "application/pdf")
+                body = LARGE_PDF
             elif self.path == "/binary":
                 self.send_header("Content-Type", "application/octet-stream")
                 body = b"not a download"
@@ -502,6 +744,88 @@ def test_every_shape_of_hand_over_is_kept(url, root, monkeypatch):
             assert out["size"] == len(PDF), sel
     after_home = set(os.listdir(home)) if os.path.isdir(home) else set()
     assert after_home == before_home, "a download still went to ~/Downloads"
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("selector", ["#blob-tab", "#blob-revoked", "#blob-same"])
+def test_a_blob_pdf_viewer_is_kept(url, root, monkeypatch, selector):
+    monkeypatch.setenv(actions.DOWNLOAD_DIRS_ENV, str(root))
+
+    async def body(session):
+        await session.page().wait_for_selector(selector + ":not([disabled])")
+        out = json.loads(await actions.download(session, selector, timeout_seconds=8))
+        assert out["from"] == "the PDF the browser's viewer showed"
+        assert out["url"].startswith("blob:" + url)
+        assert out["filename"].endswith(".pdf")
+        assert out["mime"] == "application/pdf"
+        assert Path(out["saved"]).read_bytes() == PDF
+        assert out["size"] == len(PDF)
+        assert out["sha256"] == hashlib.sha256(PDF).hexdigest()
+        assert len(session.pages()) == 1
+        if selector == "#blob-same":
+            assert out["notes"] == ["this page now shows the file; browser_navigate to leave it"]
+        else:
+            assert session.page().url == url
+            assert out["notes"] == ["closed the tab the file opened in"]
+
+    asyncio.run(_with_browser(url, body))
+
+
+@pytest.mark.e2e
+def test_a_large_blob_pdf_viewer_is_kept_byte_for_byte(url, root, monkeypatch):
+    monkeypatch.setenv(actions.DOWNLOAD_DIRS_ENV, str(root))
+
+    async def body(session):
+        await session.page().wait_for_selector("#blob-tab:not([disabled])")
+        out = json.loads(await actions.download(session, "#blob-tab", timeout_seconds=8))
+        assert Path(out["saved"]).read_bytes() == LARGE_PDF
+        assert out["size"] == len(LARGE_PDF) > 256 * 1024
+        assert len(session.pages()) == 1
+
+    asyncio.run(_with_browser(url + "?large", body))
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("blob", [False, True])
+def test_a_pdf_viewers_save_button_keeps_its_bytes(url, root, monkeypatch, blob):
+    monkeypatch.setenv(actions.DOWNLOAD_DIRS_ENV, str(root))
+
+    async def body(session):
+        if blob:
+            await session.page().wait_for_selector("#blob-same:not([disabled])")
+            await actions.click(session, "#blob-same")
+        else:
+            await actions.navigate(session, url + "inline.pdf")
+        page = session.page()
+        async def loaded():
+            # The same-tab navigation can tear down the context mid-call.
+            try:
+                return await page.evaluate("""async () => {
+                    if (typeof PDFViewerApplication !== 'object') return false;
+                    await PDFViewerApplication.initializedPromise;
+                    return !!PDFViewerApplication.pdfDocument;
+                }""")
+            except Exception:
+                return False
+
+        async with asyncio.timeout(10):
+            while not await loaded():
+                await asyncio.sleep(0.1)
+        names = await page.evaluate("""() => ({
+            doc: PDFViewerApplication._docFilename,
+            disposition: PDFViewerApplication._contentDispositionFilename
+        })""")
+        print("Firefox pdf.js filename properties:", names)
+        if not blob:
+            assert names["doc"] == "inline.pdf"
+        out = json.loads(await actions.download(session, "#downloadButton", timeout_seconds=8))
+        assert out["from"] == "the PDF the browser's viewer showed"
+        assert Path(out["saved"]).read_bytes() == PDF
+        assert out["url"] == page.url
+        assert out["notes"] == ["this page now shows the file; browser_navigate to leave it"]
+        assert len(session.pages()) == 1
+
+    asyncio.run(_with_browser(url, body))
 
 
 class _Flaky(_Response):

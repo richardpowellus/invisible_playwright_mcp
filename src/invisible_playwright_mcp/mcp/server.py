@@ -976,8 +976,8 @@ async def browser_download(selector: str | None = None, x: float | None = None,
     """Click a link or button and keep the file it downloads or shows.
 
     Give `selector`, or `x` and `y` from browser_snapshot. Waits up to
-    `timeout_seconds` for a completed download or a document navigation
-    (including a PDF in a new tab). A fetch or XHR is not a download.
+    `timeout_seconds` for a completed download or a shown document, including
+    a `blob:` PDF in the browser's viewer. A fetch or XHR is not a download.
     A tab opened only for the file is closed again.
 
     `save_to` is an absolute directory, made if missing, inside
