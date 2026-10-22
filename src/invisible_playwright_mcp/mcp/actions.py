@@ -1137,12 +1137,50 @@ _HAND_CAN_AIM_JS = clean.STYLE_HIDES_JS + """
   }
 """
 
+#: `overlay` is a file input drawn at opacity 0 and stretched over the drop
+#: zone it belongs to - react-dropzone and most Tailwind uploaders. It is laid
+#: out, not display:none or visibility:hidden, and it is what a person's click
+#: lands on, so the click on it is the person's own: "hit" when it is the hit
+#: target at its own centre, "offscreen" when its centre is outside the
+#: viewport and only the click (which scrolls first and hit-tests again) can
+#: tell. Only the input itself may be transparent: a drop zone that is itself
+#: at opacity 0 is not one a person can see to click. Something else on top
+#: is reported as `covered_by`, and the input stays hidden.
+#:
+#: Measured 2026-10-21 on Helcim's product import: its one file input is
+#: exactly this, over the "browse" link, so the input was refused as hidden
+#: and "text=browse" was refused as covered by it, and no selector reached it.
 _FILE_INPUT_JS = """el => {""" + _HAND_CAN_AIM_JS + """
-  return {
-    file: el.tagName === "INPUT" && (el.type || "").toLowerCase() === "file",
-    multiple: !!el.multiple,
-    shown: handCanAim(el),
-  };
+  const file = el.tagName === "INPUT" && (el.type || "").toLowerCase() === "file";
+  const out = {file: file, multiple: !!el.multiple, shown: handCanAim(el), overlay: false};
+  if (!file || out.shown) return out;
+  const r = el.getBoundingClientRect();
+  if (!(r.width > 1 && r.height > 1)) return out;
+  const s = getComputedStyle(el);
+  if (s.display === "none" || s.visibility === "hidden" || s.pointerEvents === "none") return out;
+  if (el.disabled) return out;
+  // display:none or visibility:hidden on an ancestor; opacity is left out on
+  // purpose, because the input's own opacity is the one being excused.
+  if (typeof el.checkVisibility === "function"
+      && !el.checkVisibility({visibilityProperty: true})) return out;
+  for (let n = el.parentElement || (el.getRootNode() || {}).host; n;
+       n = n.parentElement || (n.getRootNode() || {}).host) {
+    if (transparent(getComputedStyle(n))) return out;
+  }
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  if (!(cx >= 0 && cy >= 0 && cx < innerWidth && cy < innerHeight)) {
+    out.overlay = "offscreen";
+    return out;
+  }
+  const root = el.getRootNode ? el.getRootNode() : document;
+  const hit = (root.elementFromPoint ? root : document).elementFromPoint(cx, cy);
+  if (hit === el) {
+    out.overlay = "hit";
+  } else if (hit) {
+    out.covered_by = hit.tagName.toLowerCase() + (hit.id ? "#" + hit.id : "")
+      + ((hit.innerText || "").trim() ? " (" + hit.innerText.trim().replace(/\\s+/g, " ").slice(0, 40) + ")" : "");
+  }
+  return out;
 }"""
 _FILE_NAMES_JS = "el => el.files ? Array.from(el.files, f => f.name) : null"
 
@@ -1400,14 +1438,25 @@ _OPENER_JS = """el => {""" + _HAND_CAN_AIM_JS + """
 async def _opener(page, selector: str, target: dict) -> str:
     """The selector a person would click to open this input's chooser.
 
-    The input itself when it is shown; for a hidden one, the label in front of
-    it. A hidden input with no shown label is refused with what to pass
+    The input itself when it is shown, or when it is a transparent overlay a
+    person's click lands on (see `_FILE_INPUT_JS`); for a hidden one, the label
+    in front of it. A hidden input with no shown label is refused with what to pass
     instead: whatever opens it is a button the page wired by script, and only
     the caller can see which one it is.
     """
-    if not target["file"] or target["shown"]:
+    if not target["file"] or target["shown"] or target.get("overlay") == "hit":
         return selector
     found = await page.eval_on_selector(selector, _OPENER_JS)
+    if not found and target.get("overlay") == "offscreen":
+        # The click scrolls it into view and refuses it if it is covered there.
+        return selector
+    if not found and target.get("covered_by"):
+        raise RuntimeError(
+            f"{selector} is a transparent file input, and {target['covered_by']} "
+            "covers it, so a click would land on that instead and no label on "
+            "the page opens it. Deal with what is on top first, or give the "
+            "selector of the button or link that opens it (browser_snapshot "
+            "lists it).")
     if not found:
         raise RuntimeError(
             f"{selector} is a hidden file input, and no label on the page opens "
