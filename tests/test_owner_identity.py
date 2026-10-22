@@ -1,6 +1,5 @@
 """An owner's browser keeps who it was across close, crash and reopen - in
 memory only, for as long as the owner lives."""
-import asyncio
 import os
 
 import pytest
