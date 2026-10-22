@@ -291,6 +291,35 @@ def test_a_hidden_input_with_no_label_is_refused_and_nothing_is_copied(env, tmp_
     assert os.listdir(tmp_path / "snapshots") == []
 
 
+@pytest.mark.parametrize("overlay", ["hit", "offscreen"])
+def test_a_transparent_input_over_its_drop_zone_is_clicked_itself(env, overlay):
+    """react-dropzone and most Tailwind uploaders stretch an opacity-0 input
+    over the zone, so a person's click lands on the input. Known-bad, before
+    2026-10-21: Helcim's product import was refused as "a hidden file input"
+    and its "browse" link as covered by that input - no selector reached it."""
+    page = _Page({"file": True, "multiple": False, "shown": False,
+                  "overlay": overlay}, label=None)
+    out = _upload(page, [str(env / "a.pdf")])
+    assert [c for c in page.calls if c[0] == "click"] == [("click", "#f")]
+    assert out == "attached 1 file to #f (picked in the file chooser): a.pdf"
+
+
+def test_a_transparent_input_with_something_on_top_is_still_refused(env, tmp_path):
+    page = _Page({"file": True, "multiple": False, "shown": False, "overlay": False,
+                  "covered_by": "div#lid (Lid)"}, label=None)
+    with pytest.raises(RuntimeError, match="div#lid \\(Lid\\) covers it"):
+        _upload(page, [str(env / "a.pdf")])
+    assert page.calls == []
+    assert os.listdir(tmp_path / "snapshots") == []
+
+
+def test_a_covered_transparent_input_is_opened_by_its_shown_label(env):
+    page = _Page({"file": True, "multiple": False, "shown": False, "overlay": False,
+                  "covered_by": "label#pick"}, label={"how": "wrap"})
+    _upload(page, [str(env / "a.pdf")])
+    assert page.calls[0] == ("click", "#f >> xpath=ancestor::label[1]")
+
+
 def test_the_chooser_is_answered_through_the_standard_set_files(env):
     """The pause before the files arrive is the wrapper's, inside the standard
     `FileChooser.set_files`: the server draws none of its own, and reaches for
@@ -360,13 +389,26 @@ PAGE = b"""<!doctype html><html><body>
 <input id="behind" type="file" style="display:none">
 <button id="add" type="button" onclick="document.getElementById('hidden').click()">Add Document</button>
 <button id="inert" type="button">Nothing</button>
+<div id="zone" style="position:relative;width:320px;height:90px;border:1px dashed #888">
+  Drop a CSV here or <span id="browse">browse</span>
+  <input id="overlay" type="file" accept=".csv,text/csv" aria-label="file uploader"
+         style="position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer">
+</div>
+<div style="position:relative;width:320px;height:90px">
+  <input id="covered" type="file" style="position:absolute;inset:0;width:100%;height:100%;opacity:0">
+  <div id="lid" style="position:absolute;inset:0;background:#eee">Lid</div>
+</div>
+<div style="opacity:0;position:relative;width:320px;height:90px">
+  <input id="ghost" type="file" style="position:absolute;inset:0;width:100%;height:100%;opacity:0">
+</div>
+<input id="gone" type="file" style="display:none">
 <script>
 // What a page sees: the change event, whether it was trusted, and the names.
 window.seen = {};
 window.order = [];
 document.addEventListener("click", e => order.push(["click", e.target.id, e.isTrusted,
                                                     performance.now()]), true);
-for (const id of ["one", "many", "hidden", "behind"]) {
+for (const id of ["one", "many", "hidden", "behind", "overlay", "covered", "ghost", "gone"]) {
   document.getElementById(id).addEventListener("change", e => {
     window.seen[id] = {trusted: e.isTrusted, names: Array.from(e.target.files, f => f.name),
                        sizes: Array.from(e.target.files, f => f.size)};
@@ -464,6 +506,43 @@ def test_a_hidden_input_with_no_label_is_refused_and_the_page_hears_nothing(url,
     async def body(session):
         with pytest.raises(RuntimeError, match="no label on the page opens it"):
             await actions.upload_files(session, "#hidden", [str(env / "a.pdf")])
+        return await session.page().evaluate("JSON.stringify([seen, order])")
+
+    assert asyncio.run(_with_browser(url, body)) == "[{},[]]"
+
+
+@pytest.mark.e2e
+def test_a_transparent_overlay_input_takes_a_trusted_click_and_change(url, env):
+    """The Helcim shape (2026-10-21): an opacity-0 input stretched over its
+    drop zone is what a person clicks. The page hears a trusted click on the
+    input itself, then a trusted change."""
+    async def body(session):
+        out = await actions.upload_files(
+            session, "input[aria-label='file uploader']", [str(env / "a.pdf")])
+        return out, await session.page().evaluate("JSON.stringify([seen, order])")
+
+    import json
+    out, raw = asyncio.run(_with_browser(url, body))
+    seen, order = json.loads(raw)
+    assert out == ("attached 1 file to input[aria-label='file uploader'] "
+                   "(picked in the file chooser): a.pdf"), out
+    assert seen == {"overlay": {"trusted": True, "names": ["a.pdf"], "sizes": [10]}}, seen
+    clicks = [e for e in order if e[0] == "click"]
+    assert clicks and clicks[0][1] == "overlay" and clicks[0][2], order
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("selector,why", [
+    ("#gone", "no label on the page opens it"),
+    ("#covered", "div#lid \\(Lid\\) covers it"),
+    ("#ghost", "no label on the page opens it"),
+])
+def test_truly_hidden_inputs_are_still_refused_and_the_page_hears_nothing(url, env, selector, why):
+    """display:none, covered by something else, or inside a transparent zone:
+    nobody can click those, so nothing is clicked and nothing changes."""
+    async def body(session):
+        with pytest.raises(RuntimeError, match=why):
+            await actions.upload_files(session, selector, [str(env / "a.pdf")])
         return await session.page().evaluate("JSON.stringify([seen, order])")
 
     assert asyncio.run(_with_browser(url, body)) == "[{},[]]"
