@@ -29,65 +29,19 @@ import time
 import urllib.parse
 from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import Any
 
 from invisible_playwright.async_api import Error
 
 from . import certificates, clean, lan, process
 from ..quiet import swallow
 
-# The character cap every text-returning action shares. Callers can lower it;
-# it exists so one enormous page cannot fill a model's context by itself.
-DEFAULT_MAX_CHARS = 6000
-
-
-def json_capped(obj: Any, limit: int | None = DEFAULT_MAX_CHARS) -> str:
-    """Serialize obj as JSON, capped at `limit` chars.
-
-    Never slices an already-serialized string, which would yield invalid JSON.
-    When the payload is too big it returns a small, always-valid envelope.
-    Use None for data already bounded by its producer, preserving its schema.
-
-    For anything that is not a list of elements this is the best that can be
-    done. `capped_elements` below is what the snapshot uses, and it exists
-    because this envelope was throwing away the whole page.
-    """
-    s = json.dumps(obj)
-    if limit is None or len(s) <= limit:
-        return s
-    return json.dumps({"truncated": True, "chars": len(s), "preview": s[:limit]})
-
-
-def capped_elements(head: dict, elements: list, limit: int = DEFAULT_MAX_CHARS) -> str:
-    """As many elements as fit under `limit`, and a count of what did not.
-
-    The snapshot used to serialize everything and then hand back an envelope
-    with a slice of the JSON string inside when it was too long. The slice is
-    not parseable, so on any page above the cap the caller received zero usable
-    elements. Not the first fifty: zero. Measured on a page with 160 elements at
-    about 112 characters each, a 6000-character cap returned nothing at all,
-    and a real results page passes that easily.
-
-    So the list is what gets shortened, in document order, and the answer says
-    how many were left out. A partial list a model can act on beats a complete
-    one it cannot parse.
-    """
-    out = list(elements)
-    while True:
-        payload = dict(head)
-        payload["interactive_elements"] = out
-        omitted = len(elements) - len(out)
-        if omitted:
-            payload["omitted_elements"] = omitted
-            payload["hint"] = "raise max_chars to see the rest"
-        s = json.dumps(payload)
-        if len(s) <= limit or not out:
-            return s
-        # Drop roughly the overflow rather than one at a time: a page with two
-        # thousand elements would otherwise re-serialize two thousand times.
-        overflow = len(s) - limit
-        drop = max(1, int(len(out) * overflow / len(s)) + 1)
-        out = out[:-drop]
+# ⛔ NO CAP ON ANY ANSWER, since 0.72.0. `DEFAULT_MAX_CHARS` (6000) cut the
+# text a read returned, `json_capped` the value of an evaluation and the list of
+# browsers, `capped_elements` the snapshot's elements, each with a marker
+# telling the model to raise `max_chars`. A cut answer is an answer the model
+# acts on as if it were the page, and asking it to raise a number is a second
+# call to get what the first should have given: the owner's decision is that
+# answers come back whole. A caller who wants less narrows the selector.
 
 
 # --- pages -----------------------------------------------------------------
@@ -161,17 +115,8 @@ async def navigate(session, url: str, wait_until: str = "domcontentloaded") -> s
     return f"navigated to {response.url} (HTTP {response.status})"
 
 
-async def read_text(session, selector: str = "body", max_chars: int = DEFAULT_MAX_CHARS) -> str:
-    """The visible text of an element, and an honest word when it did not fit.
-
-    ⛔ THE CUT USED TO BE SILENT, alone among the capped actions. `json_capped`
-    returns `{"truncated": true, "chars": N}` and `capped_elements` reports how
-    many elements it dropped, but this one simply sliced. A caller then read
-    prose that stopped mid-sentence with nothing to distinguish it from a page
-    that really ends there, and the natural next move - answering from what came
-    back - is answering from a fragment while believing it is the whole thing.
-
-    A cap is fine; a cap nobody can see is not.
+async def read_text(session, selector: str = "body") -> str:
+    """The visible text of an element, whole.
 
     ⛔ THE SELECTOR IS RESOLVED BY THE ENGINE, AS EVERY OTHER TOOL RESOLVES IT.
     It was `document.querySelector`, which knows neither a shadow root nor
@@ -180,16 +125,23 @@ async def read_text(session, selector: str = "body", max_chars: int = DEFAULT_MA
     ten failed reads in the saved runs of invisible_dots (2026-10-10) was a
     selector the click tools would have taken. `DIAGNOSE_JS` was moved off
     `querySelectorAll` for the same reason on 2026-09-30.
+
+    ⛔ FOUND AND READ IN ONE CALL. It was `count()` and then
+    `first.evaluate(...)`: two calls with a navigation able to fall between them,
+    and right after `browser_navigate` on a page that replaces itself (a
+    redirect, a JavaScript challenge) the read failed with "Failed to find
+    execution context" - 9 in 10 in the invisible_dots VMs on a page that
+    redirects 50 ms after load (2026-10-12). `all_inner_texts()` is one call of
+    values that finds and reads together, and from invisible-playwright 0.35.0
+    a page that moved on under it is read again on the page that took its
+    place. It answers NOW: nothing matching is still "(no element matches ...)"
+    at once, not a wait to the timeout, because the caller deciding whether to
+    look again is the agent, which has just been told what is there.
     """
-    found = session.page().locator(selector)
-    if await found.count() == 0:
+    texts = await session.page().locator(selector).first.all_inner_texts()
+    if not texts:
         return f"(no element matches {selector!r})"
-    txt = await found.first.evaluate("(el) => el.innerText")
-    if len(txt) <= max_chars:
-        return txt
-    return txt[:max_chars] + (
-        "\n\n[cut after %d of %d characters. Raise max_chars, or narrow the "
-        "selector to the part you need.]" % (max_chars, len(txt)))
+    return texts[0]
 
 
 #: Where an element sits, as a string that names it and nothing else: its
@@ -303,14 +255,22 @@ SNAPSHOT_JS = """() => {
     // With the count, the two cases separate on sight: one odd element leaves
     // 199 results and `unmeasurable: 1`, while a shadowed prototype leaves zero
     // results and `unmeasurable: 412`.
+    //
+    // Since firefox-49 a page's replacement no longer gets here: this runs in
+    // the caller's world, where a name the standard defines is the browser's
+    // own whatever the page did to it ([B322], B335 of the engine's docs), so
+    // the page's broken method is not the one called. The count stays for the
+    // failures that are still real, a measuring that raises.
     let unmeasurable = 0;
 
     function shown(el) {
         // getBoundingClientRect can fail to give a rectangle on a real page:
         // measured on one, the snapshot died with "can't access property
         // width, r is undefined" and the caller got NOTHING for the whole
-        // document. A page can shadow or replace this method, and some do.
-        // One odd element must not cost the other two hundred.
+        // document. A page can shadow or replace this method, and some do;
+        // in the caller's world (firefox-49) that replacement is not what runs
+        // here, and what can still fail is counted, not fatal. One odd element
+        // must not cost the other two hundred.
         let r = null;
         try { r = el.getBoundingClientRect(); } catch (err) { unmeasurable++; return false; }
         if (!r || typeof r.width !== 'number') { unmeasurable++; return false; }
@@ -555,7 +515,7 @@ SNAPSHOT_JS = """() => {
 }"""
 
 
-async def snapshot(session, max_chars: int = 0) -> str:
+async def snapshot(session) -> str:
     """Title, url, and the interactive elements that are actually visible.
 
     Not the accessibility tree, and the reason is measured rather than
@@ -567,12 +527,15 @@ async def snapshot(session, max_chars: int = 0) -> str:
     dropdown.
     """
     page = session.page()
-    d = await page.evaluate(SNAPSHOT_JS)
+    # ⛔ `evaluate_read`, NOT `evaluate`: the snapshot is a read without
+    # effects, and a page that navigates under it is read again on the page
+    # that replaced it. `evaluate` sends the code once and raises Playwright's
+    # navigation error, which is right for the model's code (`evaluate` below)
+    # and wrong for a read right after `browser_navigate` on a page that
+    # replaces itself (invisible-playwright 0.35.2, [B285]).
+    d = await page.evaluate_read(SNAPSHOT_JS)
     await _resolve_nth(page, d.get("interactive_elements", []))
-    if not max_chars:
-        return json.dumps(d)
-    elements = d.pop("interactive_elements", [])
-    return capped_elements(d, elements, limit=max_chars)
+    return json.dumps(d)
 
 
 async def read_html(session, mode: str = "form") -> str:
@@ -592,7 +555,9 @@ async def read_html(session, mode: str = "form") -> str:
     mode="text"  the prose, with the markup gone
     mode="full"  noise removed and attributes slimmed, structure kept
     """
-    html = await session.page().evaluate(clean.VISIBLE_HTML_JS)
+    # A read without effects, read again on the page that replaced the one it
+    # went to: see `snapshot`.
+    html = await session.page().evaluate_read(clean.VISIBLE_HTML_JS)
     return clean.clean_page(html, mode)
 
 
@@ -858,9 +823,17 @@ async def _field_state(page, selector: str) -> dict:
 
 
 def _shown(value: str, secret: bool) -> str:
+    """What the field holds, as the answer quotes it: whole.
+
+    ⛔ IT STOPPED AT 120 CHARACTERS UNTIL 0.72.1, with "..." in place of the
+    rest. These sentences exist to say how the field differs from what was
+    typed, and a page that reformats a long value - or keeps only part of it -
+    makes that difference anywhere in it: past the 120th character the model
+    read "..." where the change was. No constraint asked for the cap (D87: a
+    cap only where one does)."""
     if secret:
         return "%d characters, not shown because the field holds a secret" % len(value)
-    return repr(value if len(value) <= 120 else value[:117] + "...")
+    return repr(value)
 
 
 def what_the_field_kept(selector: str, text: str, before: dict, after: dict) -> str:
@@ -2168,4 +2141,4 @@ async def evaluate(session, expression: str) -> str:
     only `el.value = 'x'` does not.
     """
     _refuse_script_interaction(expression)
-    return json_capped(await session.page().evaluate(expression))
+    return json.dumps(await session.page().evaluate(expression))

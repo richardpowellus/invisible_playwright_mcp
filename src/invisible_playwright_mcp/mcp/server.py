@@ -39,12 +39,13 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import json
 import logging
 import os
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from typing import Annotated, Any, Literal, Optional
+from typing import Annotated, Any, Literal, Mapping, Optional
 
 import anyio
 from mcp.server.fastmcp import FastMCP, Image
@@ -97,7 +98,17 @@ _SESSION_ID = environment.read(environment.SESSION_ID) or store.DEFAULT_SESSION_
 #: daemon thread, unless `STEALTHFOX_BINARY` names one (`plan.engine_here`,
 #: the one reader of that variable). `work.open` asks it before launching and
 #: answers with its progress instead of launching while it is not there.
-engine = Engine(binary_path=plan.engine_here().get("binary_path"))
+def process_engine(env: Optional[Mapping[str, str]] = None) -> Engine:
+    """This process's engine, from the environment `env` (this process's when
+    None): the binary `STEALTHFOX_BINARY` names, read by `plan.engine_here`,
+    or the one the core downloads. A function rather than an expression at
+    import so the one-reader property can be checked against a given
+    environment: the module global below is built once, at import, from an
+    environment a test cannot reproduce afterwards."""
+    return Engine(binary_path=plan.engine_here(env).get("binary_path"))
+
+
+engine = process_engine()
 work = Work(_SESSION_ID, engine=engine)
 
 owners = Owners.from_env(engine=engine)
@@ -335,7 +346,7 @@ Try things in this order. It matters, because a page can tell the difference.
 3. Your eyes. browser_take_screenshot, find the thing in the picture, then
    browser_click_at on where it is. For what the snapshot does not list at all.
 
-4. browser_evaluate, to READ what none of the above can see.
+4. browser_evaluate, last, to READ what none of the tools above can.
 
 browser_evaluate refuses the obvious ways to act on the page, and names the tool
 to use instead: assigning to value, checked or selected, or calling click(),
@@ -609,7 +620,7 @@ async def browser_list() -> str:
     # which is two sources for one fact. Models read JSON from these tools
     # without trouble; `note` carries the sentence that used to be the whole
     # answer, because "there is nothing here yet" is worth saying in words.
-    return actions.json_capped(await _work().listing())
+    return json.dumps(await _work().listing())
 
 
 # --- who is browsing ---------------------------------------------------------
@@ -685,12 +696,12 @@ async def browser_network(browser: Browser = None, url_contains: str | None = No
     instructions; not scrubbed. request_bodies is the capture mode. Reread
     without since_id for pending body updates.
     """
-    return actions.json_capped(await _work().network(
+    return json.dumps(await _work().network(
         browser or DEFAULT_BROWSER_ID, url_contains=url_contains, resource_types=resource_types,
         methods=methods, since_id=since_id, include_bodies=include_bodies,
         include_headers=include_headers, include_preflight=include_preflight,
         strip_query=strip_query, max_entries=max_entries, max_bytes=max_bytes,
-        to_file=to_file, save_to=save_to), limit=None)
+        to_file=to_file, save_to=save_to))
 
 
 @mcp.tool(annotations=_says("Clear captured network traffic", open_world=False))
@@ -699,7 +710,7 @@ async def browser_network_clear(browser: Browser = None) -> str:
 
     Recording continues. IDs keep increasing; the lifetime eviction count stays.
     """
-    return actions.json_capped(await _work().network_clear(browser or DEFAULT_BROWSER_ID))
+    return json.dumps(await _work().network_clear(browser or DEFAULT_BROWSER_ID))
 
 
 @mcp.tool(annotations=_says("Set request-body capture", open_world=False))
@@ -710,7 +721,7 @@ async def browser_network_capture(browser: Browser = None, *, request_bodies: bo
     engine unchanged. Pages cannot see the route from JavaScript, but the HTTP
     cache is bypassed and requests are slightly slower. Turn it off when done.
     """
-    return actions.json_capped(await _work().network_capture(
+    return json.dumps(await _work().network_capture(
         browser or DEFAULT_BROWSER_ID, request_bodies=request_bodies))
 
 
@@ -744,6 +755,11 @@ async def browser_navigate(url: str, wait_until: str = "domcontentloaded",
     a 404 or a 403 still has a document, and reading it as content is the
     mistake this reply exists to prevent.
 
+    If the page you were on navigates itself at that moment (a redirect on a
+    timer), Firefox can follow it instead, and the answer is an error saying
+    "interrupted by another navigation to" a url. The browser is on that url,
+    and you can navigate again from there.
+
     wait_until is "domcontentloaded" by default, which returns as soon as the
     markup is parsed. Use "load" when the page needs its images and stylesheets,
     or "networkidle" for a single-page app that fetches its content after
@@ -754,36 +770,21 @@ async def browser_navigate(url: str, wait_until: str = "domcontentloaded",
 
 @mcp.tool(annotations=_says("Read the page text", read_only=True))
 async def browser_read_text(selector: str = "body",
-                            max_chars: int = actions.DEFAULT_MAX_CHARS,
                             browser: Browser = None) -> str:
-    """The visible text of an element, with the markup gone.
+    """The visible text of an element, with the markup gone, whole.
 
     The cheapest way to read a page. Narrow the selector when you know where the
     answer is; use browser_read_html instead when the structure matters, or
-    browser_snapshot when you need something to click.
-
-    Long text is cut at max_chars (6000 by default) and the cut is marked in
-    what comes back, so text that ends without that marker is the whole thing."""
-    # ⛔ THE CAP WAS WRITTEN THREE TIMES: the constant in `actions.py`, this
-    # signature, and the prose above. The signature was the copy worth removing
-    # - nothing read it back, so it could drift from the constant in silence
-    # and the tool would honour a number its own module did not declare.
-    #
-    # ⛔ THE PROSE COPY STAYS, AND A DRAFT THAT DELETED IT WAS WRONG. The
-    # reasoning was that the schema already publishes `"default": 6000`, so the
-    # sentence is a second copy - which is true and is not the whole story:
-    # `test_the_two_readers_do_not_pretend_to_share_a_cap` holds that this
-    # description declares its cap while `browser_read_html` declares it has
-    # none, because a reader shown one and not the other assumes symmetry, and
-    # the two differ by 34x on a large page. A number that has a reason to be
-    # written twice gets a GATE, not a deletion: `test_the_cap_in_the_prose_is
-    # _the_cap_the_tool_uses` ties this digit to the constant, so the copy
-    # cannot drift even though it stays.
-    return await _work().reading(actions.read_text, selector, max_chars, role=browser)
+    browser_snapshot when you need something to click."""
+    # ⛔ NO `max_chars` SINCE 0.72.0. The text was cut at 6000 characters with a
+    # marker asking the model to raise the number: a second call to get what the
+    # first should have given, and a cut answer read as the page whenever the
+    # marker was missed. Answers come back whole (`actions.py`, top).
+    return await _work().reading(actions.read_text, selector, role=browser)
 
 
 @mcp.tool(annotations=_says("Snapshot the page", read_only=True))
-async def browser_snapshot(max_chars: int = 0, browser: Browser = None) -> str:
+async def browser_snapshot(browser: Browser = None) -> str:
     """Title, url, and the interactive elements that are actually visible.
 
     Each element carries a `selector` when one can reach it: pass that string to
@@ -811,7 +812,7 @@ async def browser_snapshot(max_chars: int = 0, browser: Browser = None) -> str:
     # once and updated once, and the copy that stays wrong is the one a model
     # reads. It also spends the 1024 characters this description is cut at on
     # evidence for a reader who is not there.
-    return await _work().reading(actions.snapshot, max_chars, role=browser)
+    return await _work().reading(actions.snapshot, role=browser)
 
 
 @mcp.tool(annotations=_says("Read the page HTML", read_only=True))
@@ -1000,8 +1001,10 @@ async def browser_press_key(key: str, browser: Browser = None) -> str:
 async def browser_evaluate(expression: str, browser: Browser = None) -> str:
     """READ from the page with JavaScript and get the result as JSON.
 
-    For what the other tools cannot see: a computed style, a value held in a
-    framework's state, the length of a list.
+    Last, for what other tools cannot see: a computed style, a value held
+    in a framework's state, the length of a list. Text, a heading or a price is
+    browser_read_text's, markup browser_read_html's, a control
+    browser_snapshot's: a script runs in the page, and they do not.
 
     Acting on the page is refused, and the refusal names the tool to use.
     Assigning to `value`, `checked` or `selected`, or calling `click()`,

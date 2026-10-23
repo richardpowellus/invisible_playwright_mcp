@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 import pytest
 from invisible_playwright.async_api import TargetClosedError
 
-from invisible_playwright_mcp.mcp import GONE, NOT_OPEN, actions, certificates, network, server, store
+from invisible_playwright_mcp.mcp import GONE, NOT_OPEN, OPENED, actions, certificates, network, server, store
 from invisible_playwright_mcp.mcp.work import REMEMBERED, Work, profile_holder
 from test_certificates import pin
 
@@ -158,7 +158,7 @@ async def test_before_browser_open_every_tool_says_so_and_names_the_call(work, n
 async def test_browser_open_then_the_tool_works(work):
     said = await server.browser_open(seed=4242)
 
-    assert said.startswith("the main browser is open. identity: seed 4242")
+    assert said.startswith(OPENED % "main" + " identity: seed 4242")
     assert work.roles() == ["main"]
     assert "navigated to https://example.com/" in await server.browser_navigate("https://example.com/")
     assert _session(work).urls == ["https://example.com/"]

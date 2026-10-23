@@ -39,7 +39,7 @@ from typing import Awaitable, Callable, Optional
 
 from invisible_playwright.async_api import TargetClosedError
 
-from . import DEFAULT_BROWSER_ID, GONE, NOT_OPEN, SUPPORT_BROWSER_ID, actions, certificates, identity, masked, network, plan, process, store
+from . import DEFAULT_BROWSER_ID, GONE, NOT_OPEN, OPENED, SUPPORT_BROWSER_ID, actions, certificates, identity, masked, network, plan, process, store
 from ..quiet import swallow
 from .actions import NAVIGATION_TIMEOUT_MS
 from .session import StealthSession
@@ -407,7 +407,7 @@ class Work:
             # so before the first of them arrives rather than after.
             self._acted = role
             self.remember(role)
-        return "the %s browser is open. %s" % (role, plan.describe(
+        return "%s %s" % (OPENED % role, plan.describe(
             settings, seed_from=seed_from, exit_note=exit_note, warnings=warnings))
 
     def _check_cert_profile(self, settings: dict) -> None:

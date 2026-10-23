@@ -34,6 +34,22 @@ WHAT_THE_TOOLS_NEED = {
         ("0.13.2", "browser_navigate reports the HTTP status and the landed url"),
         ("0.22.1", "a click is delivered once, whatever the click does to the page"),
         ("0.25.8", "a file chooser opened for a hidden file input takes the files"),
+        ("0.35.0", "browser_read_text right after browser_navigate reads the page "
+                   "that replaced itself instead of failing on its vanished world"),
+        ("0.35.2", "browser_snapshot and browser_read_html read through "
+                   "page.evaluate_read, and browser_evaluate runs the model's "
+                   "code once when its page navigates while it waits"),
+        ("0.35.4", "a page that replaces itself keeps its main world, so the "
+                   "snapshot and read_html read it instead of waiting 30 s for a "
+                   "world the engine never announced (B286, firefox-42)"),
+        ("0.37.0", "the snapshot runs in the caller's world, so a page that "
+                   "replaces getBoundingClientRect no longer hides its elements "
+                   "from it (B322, firefox-49)"),
+        ("0.41.0", "the canvas noise is edge-aware (B363, firefox-51): a flat "
+                   "region or a blend of two colours reads back exact, where on "
+                   "firefox-50 a flat clear did not read back as cleared, a "
+                   "readback signature a page that probes the canvas can tell "
+                   "from a real device"),
     ],
 }
 
