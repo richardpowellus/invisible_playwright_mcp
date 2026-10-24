@@ -22,7 +22,9 @@ import mimetypes
 import os
 import re
 import secrets
+import shlex
 import shutil
+import socket
 import stat
 import tempfile
 import time
@@ -1513,6 +1515,61 @@ async def _held(read):
 
 
 DOWNLOAD_DIRS_ENV = "INVISIBLE_MCP_DOWNLOAD_DIRS"
+#: The ssh name a caller reaches this machine by, when callers run elsewhere.
+#: An MCP served over HTTP is often on another machine than the agent using it,
+#: and a path in an answer reads as a path on the agent's own disk. Measured
+#: 2026-10-24: a session on a Mac opened a download's /home/... path locally,
+#: macOS treated /home as a network volume, and the whole agent process blocked
+#: in the kernel waiting on a privacy prompt nobody could see. With this set,
+#: every answer that names a file or directory says which machine it is on and
+#: gives the scp command that copies it.
+FILE_HOST_ENV = "INVISIBLE_MCP_FILE_HOST"
+
+
+def file_host() -> str:
+    """The ssh name callers reach this machine by, or "" when callers share
+    its disk. Read from the process, never from a caller's environment."""
+    return os.environ.get(FILE_HOST_ENV, "").strip()
+
+
+def _host_name(ssh_name: str) -> str:
+    name = socket.gethostname().split(".")[0]
+    return name if name and name != ssh_name else ""
+
+
+def _on(ssh_name: str) -> str:
+    name = _host_name(ssh_name)
+    return f"{name} (ssh {ssh_name})" if name else ssh_name
+
+
+def remote_file(path: str) -> dict:
+    """What an answer naming a saved file adds when callers run elsewhere:
+    the machine it is on, and how to copy it. Empty when they do not."""
+    ssh_name = file_host()
+    if not ssh_name:
+        return {}
+    fetch = f"scp {ssh_name}:{shlex.quote(path)} <local-dir>"
+    return {"host": _host_name(ssh_name) or ssh_name, "fetch": fetch,
+            "where": (f"this file is on {_on(ssh_name)}, the machine the browser runs "
+                      f"on, not necessarily yours. Unless you run there, do not open "
+                      f"the path locally; copy it with: {fetch}")}
+
+
+def remote_dir_lines(upload_dir=None, download_dir=None) -> str:
+    """The lines browser_open and browser_status add under `upload dir:` and
+    `download dir:` when callers run elsewhere. Kept on lines of their own so
+    the path after each label stays exactly the path."""
+    ssh_name = file_host()
+    if not ssh_name or (upload_dir is None and download_dir is None):
+        return ""
+    out = [f"files host: {_on(ssh_name)}. These directories are on the machine the "
+           "browser runs on, not necessarily yours; unless you run there, do not "
+           "open them locally"]
+    if upload_dir is not None:
+        out.append(f"upload with: scp <local-file> {ssh_name}:{shlex.quote(str(upload_dir) + '/')}")
+    if download_dir is not None:
+        out.append(f"fetch with: scp {ssh_name}:{shlex.quote(str(download_dir) + '/<file>')} <local-dir>")
+    return "\n" + "\n".join(out)
 DOWNLOAD_MAX_BYTES = 200 * 1024 * 1024
 DOWNLOAD_TIMEOUT_MAX_S = 300
 #: A PDF attachment is both shown in a tab and saved; once the shown copy has
@@ -1620,7 +1677,8 @@ def write_network_ndjson(rows, *, save_to, env, max_bytes: int) -> dict:
             with swallow("a partial network file that cannot be removed is reported by the raise"):
                 os.unlink(name if dir_fd is not None else path, dir_fd=dir_fd)
             raise
-    return {"path": path, "written": written, "bytes": size, "truncated": truncated}
+    return {"path": path, "written": written, "bytes": size, "truncated": truncated,
+            **remote_file(path)}
 
 
 def _named_dirs(var: str, what: str, env=None, *, error_type=RuntimeError) -> list[str]:
@@ -2056,7 +2114,7 @@ async def download(session, selector=None, x=None, y=None,
         "sha256": saved["sha256"],
         "from": {"download": "the browser's download", "page": "the document the page showed",
                  "viewer": "the PDF the browser's viewer showed"}[how],
-        "url": url, "notes": notes}, ensure_ascii=False)
+        "url": url, "notes": notes, **remote_file(saved["path"])}, ensure_ascii=False)
 
 
 async def press_key(session, key: str) -> str:

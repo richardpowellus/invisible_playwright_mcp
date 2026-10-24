@@ -189,6 +189,7 @@ class OwnerWork(Work):
             result += "\nupload dir: " + str(self.upload_dir)
         if self.download_dir is not None:
             result += "\ndownload dir: " + str(self.download_dir)
+        result += actions.remote_dir_lines(self.upload_dir, self.download_dir)
         if role == DEFAULT_BROWSER_ID and role in self._open:
             if self.fill_handle is None:
                 self.fill_handle = "bh_" + secrets.token_urlsafe(32)
@@ -256,7 +257,8 @@ class OwnerWork(Work):
             raise RuntimeError("uploads are off: your upload directory is unavailable.") from None
         except PermissionError:
             raise PermissionError(
-                "Upload refused. Copy the file into your upload dir: %s" % self.upload_dir) from None
+                "Upload refused. Copy the file into your upload dir: %s" % self.upload_dir
+                + actions.remote_dir_lines(self.upload_dir).replace("\n", ". ")) from None
 
     def _ensure_download_dir(self) -> None:
         try:
@@ -324,7 +326,8 @@ class OwnerWork(Work):
             raise RuntimeError("downloads are off: your download directory is unavailable.") from None
         except PermissionError:
             raise PermissionError(
-                "Download refused. Use only your download dir: %s" % self.download_dir) from None
+                "Download refused. Use only your download dir: %s" % self.download_dir
+                + actions.remote_dir_lines(download_dir=self.download_dir).replace("\n", ". ")) from None
 
     async def _act(self, at: str, fn, *args, **kwargs):
         if fn is actions.upload_files:
@@ -449,6 +452,8 @@ class OwnerWork(Work):
             result += "\nupload dir: " + str(self.upload_dir)
         if self.download_dir is not None and not _delegated_call.get():
             result += "\ndownload dir: " + str(self.download_dir)
+        if not _delegated_call.get():
+            result += actions.remote_dir_lines(self.upload_dir, self.download_dir)
         if role == DEFAULT_BROWSER_ID and self.fill_handle is not None:
             result += "\nfill handle: " + self.fill_handle
         return result
