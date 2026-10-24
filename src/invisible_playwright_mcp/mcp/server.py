@@ -426,7 +426,10 @@ pass it only to a trusted credential filler. Closing/reopening revokes it.
 The process-wide browser cap includes other sessions; a refusal evicts nobody.
 For uploads, copy files into your private `upload dir` shown by browser_open
 or browser_status. Shared staging roots and other owners' files are refused.
-Downloads use your private `download dir`; save_to must remain inside it."""
+Downloads use your private `download dir`; save_to must remain inside it.
+When an answer gives a `files host`, `host` or `fetch`, those paths are on the
+browser's machine, not necessarily yours: copy files with the scp it gives and
+never open such a path locally."""
 mcp = BrowserMCP("stealth", instructions=(
     "\n\n".join((OWNER_INSTRUCTIONS, PAGE_RULES, _TWO_BROWSERS))
     if owners is not None else INSTRUCTIONS),
@@ -985,7 +988,9 @@ async def browser_download(selector: str | None = None, x: float | None = None,
     INVISIBLE_MCP_DOWNLOAD_DIRS; omitted uses the first root. With no roots,
     downloads are off. Owner mode permits only your reported `download dir`.
     Never overwrites. Refuses empty or incomplete files. Answers JSON with
-    saved, filename, size, mime, sha256, url, from and notes."""
+    saved, filename, size, mime, sha256, url, from and notes, plus host,
+    fetch and where when the file is on another machine than yours: then
+    copy it with `fetch`, never open `saved` locally."""
     return await _work().acting(actions.download, selector, x, y, timeout_seconds,
                                 save_to, role=browser)
 

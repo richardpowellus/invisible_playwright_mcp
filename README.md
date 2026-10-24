@@ -158,6 +158,12 @@ ends. Both directory lines precede the final fill-handle line and are omitted
 from handle-delegated status. Download roots have the same startup restrictions
 and stale-directory cleanup as upload roots.
 
+When callers run on another machine (an HTTP server reached over a tunnel),
+set `INVISIBLE_MCP_FILE_HOST` to the ssh name they reach this one by. Every
+answer that names a file or directory then says which machine it is on and
+gives the `scp` command that copies it, so an agent does not open a path that
+is not on its own disk.
+
 Shutdown attempts graceful closes for three seconds. An independent watchdog
 observes stdin hangup and SIGTERM even if teardown blocks the event loop; after
 3.5 seconds it attempts cleanup for at most one more second and exits unsuccessfully.

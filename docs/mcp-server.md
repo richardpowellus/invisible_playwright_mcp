@@ -167,6 +167,7 @@ between what the browser says it is and where it appears to be.
 | `STEALTHFOX_MAX_BROWSERS` | Owner mode's process-wide browser capacity, including pending launches and closes; default 2. |
 | `STEALTHFOX_OWNER_IDLE_SECONDS` | Idle owner expiry; default 900 seconds. Active background typing is not idle. |
 | `INVISIBLE_MCP_DOWNLOAD_DIRS` | Absolute canonical download roots, separated by the platform path separator. Empty means downloads are off. |
+| `INVISIBLE_MCP_FILE_HOST` | The ssh name callers reach this machine by, for a server its callers reach over HTTP from other machines. Set, every answer naming a file or directory says which machine it is on and how to copy it: `browser_download` and `browser_network(to_file=true)` add `host`, `fetch` (an `scp` command) and `where`; `browser_open`/`browser_status` add `files host:`, `upload with:` and `fetch with:` lines after the directory lines. Unset (the default) means callers share this disk and nothing is added. |
 | `INVISIBLE_MCP_HOME` | Where saved sessions are kept. Defaults to `%APPDATA%/invisible-playwright-mcp` on Windows, `~/Library/Application Support/invisible-playwright-mcp` on macOS and `$XDG_DATA_HOME/invisible-playwright-mcp` on Linux. A directory left by the previous name is moved onto this one the first time the command runs, once, and the move is printed. Set it to put them on another disk. |
 
 Anything a tool call says wins over these. `browser_open` can pick another

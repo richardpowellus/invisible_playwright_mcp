@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import tempfile
 from pathlib import Path
 
@@ -54,7 +55,7 @@ class _Downloading(session_mod.StealthSession):
 @pytest.fixture
 async def owners(monkeypatch, tmp_path):
     for name in ("STEALTHFOX_PROFILE_DIR", "STEALTHFOX_PROXY", "STEALTHFOX_SEED",
-                 "STEALTHFOX_BINARY", actions.UPLOAD_DIRS_ENV):
+                 "STEALTHFOX_BINARY", actions.UPLOAD_DIRS_ENV, actions.FILE_HOST_ENV):
         monkeypatch.delenv(name, raising=False)
     roots = [tmp_path / "downloads", tmp_path / "second", tmp_path / "profiles"]
     for root in roots:
@@ -347,3 +348,31 @@ async def test_non_owner_mode_still_uses_shared_destinations(owners, monkeypatch
         assert all((Path(root) / "statement.pdf").exists() for root in owners.download_roots)
     finally:
         await work.close_all()
+
+
+async def test_a_caller_on_another_machine_is_told_where_the_file_is(owners, monkeypatch):
+    # 2026-10-24: a session on a Mac opened a download's /home/... path
+    # locally and its whole process blocked on a macOS privacy prompt.
+    monkeypatch.setenv(actions.FILE_HOST_ENV, "browser-host")
+    opened = success(await call("A", "browser_open"))
+    directory = download_dir(await call("A", "browser_status"))
+    lines = opened.splitlines()
+    assert any(line.startswith("files host: ") and "browser-host" in line for line in lines)
+    fetch_line = next(line for line in lines if line.startswith("fetch with: "))
+    assert shlex.split(fetch_line.removeprefix("fetch with: "))[1] == \
+        "browser-host:%s/<file>" % directory
+    assert lines[-1].startswith("fill handle: "), "the fill handle must stay last"
+    saved = json.loads(success(await download("A")))
+    assert Path(saved["saved"]).parent == directory
+    scp, source, target = shlex.split(saved["fetch"])
+    assert (scp, source, target) == ("scp", "browser-host:" + saved["saved"], "<local-dir>")
+    assert saved["fetch"] in saved["where"] and "do not open" in saved["where"]
+    refused = await download("A", save_to=str(owners.download_roots[1]))
+    assert refused.isError and "browser-host" in text(refused)
+
+
+async def test_a_caller_on_this_machine_is_told_nothing_extra(owners):
+    opened = success(await call("A", "browser_open"))
+    assert "files host:" not in opened and "scp" not in opened
+    saved = json.loads(success(await download("A")))
+    assert not {"host", "fetch", "where"} & saved.keys()
