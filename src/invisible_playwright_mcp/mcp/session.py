@@ -92,6 +92,7 @@ class StealthSession:
             self._ipw = InvisiblePlaywright(**kwargs)
             await self._attach(await self._ipw.__aenter__())
             self.network.attach(self._context)
+            self._arm_choosers()
         except BaseException:
             self._drop_downloads()
             raise
@@ -166,6 +167,25 @@ class StealthSession:
 
     async def new_page(self):
         return await self._context.new_page()
+
+    def _arm_choosers(self) -> None:
+        """Keep every page's file chooser intercepted for the life of the page.
+
+        ⛔ THE ENGINE INTERCEPTS ONLY WHILE SOMEBODY LISTENS, and until
+        2026-10-24 somebody listened only inside browser_upload_files. Any
+        other click that opened a chooser - browser_click_at on a drop zone,
+        browser_click on a "browse" link - opened FIREFOX'S OWN GTK dialog, on
+        a display nobody can see and no tool can answer. Firefox opens no
+        second picker for an input whose first is still up, so every upload
+        to that input afterwards failed with "opened no file chooser" until
+        the page built a new input (Helcim's product import, 2026-10-24; the
+        dialog was still listed by `xwininfo` on :90). An intercepted chooser
+        nobody answers holds nothing open, measured the same day: the next
+        click on that input opens a fresh one, which the upload answers.
+        """
+        self._context.on("page", _arm_page)
+        for page in self.pages():
+            _arm_page(page)
 
     def page(self):
         """The page a command drives: the newest live one.
@@ -370,6 +390,11 @@ class StealthSession:
         for path in self._kept:
             shutil.rmtree(path, ignore_errors=True)
         self._kept.clear()
+
+
+def _arm_page(page) -> None:
+    """A listener that answers nothing: being there is what arms the engine."""
+    page.on("filechooser", lambda _chooser: None)
 
 
 def download_prefs(directory: str) -> dict:

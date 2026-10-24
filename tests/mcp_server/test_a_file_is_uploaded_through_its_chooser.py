@@ -657,3 +657,26 @@ def test_a_file_unlinked_while_copied_keeps_its_name(allowed, private_tmp, monke
     copy, = actions.snapshot_files(real, env=_env(allowed))
     assert os.path.basename(copy) == "a.pdf"
     assert open(copy, "rb").read() == b"%PDF-1.4 a"
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("selector", ["#one", "input[aria-label='file uploader']"])
+def test_an_input_a_stray_click_opened_still_takes_the_files(url, env, selector):
+    """Helcim, 2026-10-24: a browser_click_at on the drop zone, with no upload
+    waiting, opened Firefox's own GTK file dialog on the display nobody can
+    see. Firefox will not open a second picker for an input whose first is
+    still up, so every browser_upload_files after it failed with "opened no
+    file chooser" until the page built a new input. The chooser a stray click
+    opens is intercepted, so the next click on the input opens another."""
+    async def body(session):
+        await actions.click(session, selector)
+        await asyncio.sleep(0.5)
+        out = await actions.upload_files(session, selector, [str(env / "a.pdf")])
+        return out, await session.page().evaluate("JSON.stringify(seen)")
+
+    import json
+    out, raw = asyncio.run(_with_browser(url, body))
+    seen = json.loads(raw)
+    assert out.startswith("attached 1 file to %s" % selector), out
+    assert [v["names"] for v in seen.values()] == [["a.pdf"]], seen
+    assert all(v["trusted"] for v in seen.values()), seen
