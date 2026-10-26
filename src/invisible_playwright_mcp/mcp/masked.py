@@ -29,6 +29,33 @@ def _windows(text: str) -> set[str]:
     return {text[i:i + 8] for i in range(len(text) - 7)}
 
 
+#: What a page inserts or removes when it formats a value for display: a card
+#: number shown in groups of four, a phone number, an IBAN. Separators only;
+#: a page that rewrites the characters themselves is not matched.
+SEPARATORS = frozenset("-.\u2010\u2011\u2012\u2013\u2014\u2015\u2212")
+
+#: Marks a window of a value with its separators removed, so it travels in the
+#: same set as the exact windows. Nine characters, and never a whole: no text
+#: slice is compared against it.
+_BARE = "\ue000"
+
+
+def _is_separator(char: str) -> bool:
+    return char.isspace() or char in SEPARATORS
+
+
+def _bare_windows(value: str) -> set[str]:
+    """⛔ A MASK THAT MATCHED ONLY THE TYPED FORM LEAKED A CARD NUMBER.
+
+    Helcim's card field (2026-10-26) took 16 digits typed with mask_value and
+    showed them as four groups of four. No 8-character window of the typed
+    digits occurs in "NNNN NNNN NNNN NNNN", so the next snapshot printed the
+    whole number and the screenshot guard saw nothing on the page. These
+    windows match the value with separators ignored on both sides."""
+    bare = "".join(char for char in value if not _is_separator(char))
+    return {_BARE + window for window in _windows(bare)}
+
+
 def _forms(value: str) -> tuple[str, ...]:
     return (value, html.escape(value, quote=True), html.escape(value, quote=False),
             json.dumps(value, ensure_ascii=True)[1:-1],
@@ -47,6 +74,9 @@ class MaskedValues:
         self.raw.update(_windows(value))
         for form in _forms(value):
             self.forms.update(_windows(form))
+        bare = _bare_windows(value)
+        self.raw.update(bare)
+        self.forms.update(bare)
 
     def register_exact(self, value: str) -> None:
         """Mask a value (16+ characters) only where it appears whole.
@@ -90,9 +120,39 @@ def result_windows(work) -> set[str]:
 def redact_text(text: str, windows: set[str]) -> str:
     if not windows:
         return text
+    return _redact_bare(_redact_exact(text, windows), windows)
+
+
+def _redact_bare(text: str, windows: set[str]) -> str:
+    """Mask any run whose characters, separators removed, are a registered
+    value's bare window; the separators inside the run are masked with it."""
+    index = [i for i, char in enumerate(text) if not _is_separator(char)]
+    bare = "".join(text[i] for i in index)
+    spans: list[list[int]] = []
+    for j in range(len(bare) - 7):
+        if _BARE + bare[j:j + 8] not in windows:
+            continue
+        start, end = index[j], index[j + 7] + 1
+        if spans and start <= spans[-1][1]:
+            spans[-1][1] = max(spans[-1][1], end)
+        else:
+            spans.append([start, end])
+    if not spans:
+        return text
+    out = []
+    copied = 0
+    for start, end in spans:
+        out.extend((text[copied:start], MASKED_PASSWORD))
+        copied = end
+    out.append(text[copied:])
+    return "".join(out)
+
+
+def _redact_exact(text: str, windows: set[str]) -> str:
     # Whole values (register_exact) first, longest first, so one containing
     # another is masked as a unit; then the 8-character windows.
-    for whole in sorted((w for w in windows if len(w) > 8), key=len, reverse=True):
+    wholes = (w for w in windows if len(w) > 8 and not w.startswith(_BARE))
+    for whole in sorted(wholes, key=len, reverse=True):
         text = text.replace(whole, MASKED_PASSWORD)
     out = []
     copied = 0
@@ -176,10 +236,9 @@ async def guard_pixels(session) -> None:
             session.page().eval_on_selector("html", PRESENCE_JS), 5)
         if not isinstance(fields, list) or not all(isinstance(v, str) for v in fields):
             raise MaskRefusal(SCREENSHOT_REFUSED)
-        wholes = [w for w in values.raw if len(w) > 8]
-        if any(field[i:i + 8] in values.raw
-               for field in fields for i in range(len(field) - 7)) or any(
-                   whole in field for field in fields for whole in wholes):
+        # The same matcher as the result boundary, so a value the page shows
+        # reformatted (spaced card digits) is present here too.
+        if any(redact_text(field, values.raw) != field for field in fields):
             raise MaskRefusal(SCREENSHOT_REFUSED)
     except Exception:
         # A failed presence read is never permission to capture, and its

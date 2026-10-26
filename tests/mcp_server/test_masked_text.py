@@ -474,3 +474,152 @@ async def test_real_masked_text_readers_pixels_and_utility_world(login_page, own
         result = await call("A", "browser_take_screenshot")
         assert not result.isError and result.content[0].type == "image"
         await owner.work.close_all()
+
+
+# A synthetic card number (the Visa test number), never a real one.
+CARD = "4111111111111111"
+SPACED = "4111 1111 1111 1111"
+
+
+def _bare(value: str) -> str:
+    return "".join(c for c in value if not (c.isspace() or c in "-."))
+
+
+class FormattingPage(Page):
+    """A card field: whatever is typed is shown in groups of four, as
+    `_GUARDED_STATE_JS` would read it back."""
+
+    def __init__(self, keeps=True):
+        super().__init__()
+        self.keeps = keeps
+
+    async def fill(self, selector, value, **kwargs):
+        digits = _bare(value)
+        self.value = " ".join(digits[i:i + 4] for i in range(0, len(digits), 4))
+
+    async def eval_on_selector(self, selector, expression, arg=None, **kwargs):
+        if arg is None:
+            return [self.value]
+        if not self.keeps:
+            return {"kept": False, "empty": False, "exact": False}
+        exact = self.value == arg["text"]
+        kept = exact or (_bare(self.value) != "" and _bare(self.value) == _bare(arg["text"]))
+        return {"kept": kept, "empty": not self.value, "exact": exact}
+
+
+@pytest.mark.parametrize("shown", [
+    SPACED, "4111-1111-1111-1111", "4111.1111.1111.1111", "4111 1111 1111 1111",
+    "4111  1111\t1111\n1111", '{"text": "4111 1111 1111 1111"}', "1111 1111",
+], ids=["spaces", "dashes", "dots", "nbsp", "mixed", "json", "fragment"])
+def test_a_reformatted_value_is_masked(shown):
+    from invisible_playwright_mcp.mcp import masked
+
+    registry = masked.MaskedValues()
+    registry.register(CARD)
+    redacted = registry.redact("card|" + shown + "|end")
+    assert _bare(CARD)[:8] not in _bare(redacted)
+    assert "1111 1111" not in redacted and "4111" not in redacted
+    assert redacted.startswith("card|") and redacted.endswith("|end")
+    assert clean.MASKED_PASSWORD in redacted
+
+
+def test_separator_matching_does_not_mask_ordinary_text():
+    from invisible_playwright_mcp.mcp import masked
+
+    registry = masked.MaskedValues()
+    registry.register(CARD)
+    for ordinary in ("4111 1112 and more", "order 41-11-11", "ordinary text", "1111111"):
+        assert registry.redact(ordinary) == ordinary
+    # A whole exported cookie is still matched only where it appears whole.
+    exact = masked.MaskedValues()
+    exact.register_exact("cookie-value-0123456789")
+    assert exact.redact("cookie value 0123456789") == "cookie value 0123456789"
+
+
+@pytest.mark.parametrize("keeps", [True, False], ids=["read-back-tolerates", "read-back-fails"])
+async def test_a_field_that_formats_the_value_never_shows_it(owners, monkeypatch, keeps):
+    monkeypatch.setattr(actions, "GUARD_SETTLE_S", 0)
+    monkeypatch.setattr(actions, "GUARD_SINCE_START_S", 0)
+    success(await call("A", "browser_open"))
+    page = FormattingPage(keeps)
+    monkeypatch.setattr(owners.entries["A"].work._open["main"], "page", lambda: page)
+    result = await call("A", "browser_type", {
+        "selector": "#n", "text": CARD, "expect_origin": ORIGIN,
+        "mask_value": True, "strict": True})
+    if keeps:
+        assert success(result) == ("typed into #n; the page reformatted it, adding or "
+                                   "removing only spaces, dashes or dots")
+    else:
+        assert result.isError and "the write outcome is unknown" in text(result)
+    assert page.value == SPACED
+
+    async def snapshot_echo() -> str:
+        return json.dumps({"selector": "#n", "text": page.value, "value": page.value})
+
+    server.mcp.add_tool(snapshot_echo)
+    try:
+        answer = success(await call("A", "snapshot_echo"))
+        assert SPACED not in answer and CARD not in answer and "1111" not in answer
+        assert json.loads(answer)["text"] == clean.MASKED_PASSWORD
+    finally:
+        server.mcp.remove_tool("snapshot_echo")
+    result = await call("A", "browser_take_screenshot")
+    assert result.isError and text(result) == REFUSAL
+    assert page.captures == 0
+
+
+def test_the_read_back_accepts_only_its_documented_shapes():
+    valid = actions._guarded_state_valid
+    assert valid({"kept": True, "empty": False, "exact": True}, "x")
+    assert valid({"kept": True, "empty": False, "exact": False}, "x")
+    assert valid({"kept": False, "empty": True}, "x")
+    assert valid({"kept": True, "empty": True}, "")
+    assert not valid({"kept": False, "empty": False, "exact": False}, "x")
+    assert not valid({"kept": True, "empty": True}, "x")
+    assert not valid({"kept": True, "empty": False, "other": 1}, "x")
+    assert not valid({"kept": 1, "empty": False}, "x")
+    assert not valid(None, "x")
+
+
+@pytest.mark.e2e
+async def test_real_card_field_that_groups_digits(login_page, owners, monkeypatch):
+    from invisible_playwright.async_api import InvisiblePlaywright
+    from invisible_playwright_mcp.mcp.session import StealthSession
+
+    async with InvisiblePlaywright(seed=1, headless=True) as browser:
+        ctx = await browser.new_context()
+        page = await ctx.new_page()
+        await page.goto(login_page)
+        # Fixture setup is page-owned code: a card input that shows four groups.
+        await page.evaluate("""() => {
+            const p = document.querySelector('#p');
+            p.type = 'text';
+            p.addEventListener('input', () => {
+                const digits = p.value.replace(/\\D/g, '');
+                p.value = digits.replace(/(.{4})(?=.)/g, '$1 ');
+            });
+        }""")
+        session = StealthSession()
+        session._context = ctx
+        owner = owners.caller("A")
+        owner.work._open["main"] = session
+        monkeypatch.setattr(actions, "GUARD_SETTLE_S", 0)
+        monkeypatch.setattr(actions, "GUARD_SINCE_START_S", 0)
+        result = await call("A", "browser_type", {
+            "selector": "#p", "text": CARD, "expect_origin": login_page,
+            "mask_value": True, "strict": True})
+        assert success(result).startswith("typed into #p; the page reformatted it")
+        assert await page.evaluate("() => document.querySelector('#p').value") == SPACED
+        for name, args in (("browser_snapshot", {}), ("browser_read_text", {}),
+                           ("browser_read_html", {"mode": "form"}),
+                           ("browser_evaluate",
+                            {"expression": "() => document.querySelector('#p').value"})):
+            answer = (await call("A", name, args)).model_dump_json()
+            assert SPACED not in answer and CARD not in answer, name
+            assert "4111 1111" not in answer and "1111 1111" not in answer, name
+        snapshot = json.loads(success(await call("A", "browser_snapshot")))
+        entry = next(e for e in snapshot["interactive_elements"] if e["selector"] == "#p")
+        assert entry["text"] == clean.MASKED_PASSWORD
+        result = await call("A", "browser_take_screenshot")
+        assert result.isError and text(result) == REFUSAL
+        await owner.work.close_all()

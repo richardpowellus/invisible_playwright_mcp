@@ -938,11 +938,33 @@ async def type_text(session, selector: str, text: str,
 GUARD_SETTLE_S = 0.75
 GUARD_SINCE_START_S = 2.0
 GUARD_ATTEMPTS = 3
-_GUARDED_STATE_JS = """(el, expected) => {
+#: ⛔ A FIELD THAT FORMATS ITS VALUE STILL KEPT IT. A card number typed as 16
+#: digits reads back as "NNNN NNNN NNNN NNNN"; an exact comparison called that
+#: "did not keep the value ... the write outcome is unknown" (Helcim,
+#: 2026-10-26), and a caller told the outcome is unknown types again. A value
+#: that differs only by the separators `masked.SEPARATORS` names is kept, and
+#: the answer says the page reformatted it.
+_GUARDED_STATE_JS = r"""(el, expected) => {
     if (el.ownerDocument.location.origin !== expected.origin ||
         !('value' in el)) return null;
-    return {kept: el.value === expected.text, empty: el.value === ''};
+    const bare = (s) => s.replace(/[\s.\-\u2010-\u2015\u2212]/g, '');
+    const exact = el.value === expected.text;
+    const kept = exact || (bare(el.value) !== '' && bare(el.value) === bare(expected.text));
+    return {kept: kept, empty: el.value === '', exact: exact};
 }"""
+
+
+def _guarded_state_valid(state, text: str) -> bool:
+    """Kept (and empty exactly when nothing was to be typed), or positively
+    empty; anything else - null, a wrong shape - is an unknown outcome."""
+    if not isinstance(state, dict) or set(state) - {"kept", "empty", "exact"}:
+        return False
+    kept, empty = state.get("kept"), state.get("empty")
+    if not isinstance(kept, bool) or not isinstance(empty, bool):
+        return False
+    if "exact" in state and not isinstance(state["exact"], bool):
+        return False
+    return empty == (not text) if kept else empty
 
 
 async def _type_on_origin(page, selector, text, expect_origin, expect_input_type,
@@ -991,8 +1013,7 @@ async def _type_on_origin(page, selector, text, expect_origin, expect_input_type
             except Exception:
                 raise RuntimeError(
                     "the origin-locked field could not be read back; the write outcome is unknown") from None
-            if state not in ({"kept": True, "empty": not bool(text)},
-                             {"kept": False, "empty": True}):
+            if not _guarded_state_valid(state, text):
                 raise RuntimeError(
                     "the origin-locked field did not keep the value or could not be read back; "
                     "the write outcome is unknown. Read the page before typing again")
@@ -1005,6 +1026,9 @@ async def _type_on_origin(page, selector, text, expect_origin, expect_input_type
                     "the page emptied the origin-locked field after each of three writes; "
                     "nothing is held there now; do not retry automatically")
             if time.monotonic() >= until:
+                if state.get("exact") is False:
+                    return (f"typed into {selector}; the page reformatted it, adding or "
+                            "removing only spaces, dashes or dots")
                 return f"typed into {selector}"
             await asyncio.sleep(0.1)
 
