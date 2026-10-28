@@ -703,7 +703,9 @@ async def snapshot(session) -> str:
     # Controls inside iframes, cross-origin ones included: the engine reads
     # each frame in its own document, which page script in the parent cannot.
     frames: list = []
-    await _snapshot_frames(page.main_frame, [], (0, 0), d.setdefault("interactive_elements", []), frames)
+    main = getattr(page, "main_frame", None)
+    if main is not None:
+        await _snapshot_frames(main, [], (0, 0), d.setdefault("interactive_elements", []), frames)
     if frames:
         d["frames"] = frames
     return json.dumps(d)

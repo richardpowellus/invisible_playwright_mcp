@@ -942,11 +942,9 @@ async def browser_type(selector: str, text: str, browser: Browser = None,
     are allowed. Page pixels are refused while masked text is present.
 
     strict, with expect_origin, refuses unless the selector matches exactly one
-    element, counting those in closed shadow roots, which page script cannot
-    see; nothing is written when it matches more.
+    element, counting closed shadow roots; nothing is written when it does not.
 
-    frame types inside an iframe (the snapshot's `frame`); expect_origin is
-    then the frame's origin, checked against the field's own document."""
+    frame: the snapshot's `frame`; expect_origin is then the frame's."""
     if mask_value:
         masked.validate(text, expect_origin)
     guard = {key: value for key, value in (
@@ -1043,9 +1041,7 @@ async def browser_evaluate(expression: str, browser: Browser = None,
 
     The refusal catches the obvious spellings, not every possible one. A script
     that slips past it is still the wrong way to do the thing: report it in your
-    answer rather than using it.
-
-    frame runs the script inside an iframe (the snapshot's `frame`)."""
+    answer rather than using it. frame: run in an iframe (the snapshot's)."""
     # ⛔ AN ARBITRARY SCRIPT IS NOT A READ, SO IT QUEUES LIKE AN ACTION. It went
     # through `work.reading`, which does not wait for the input lock: during a
     # background typing a script calling `focus()` on another field moved the
