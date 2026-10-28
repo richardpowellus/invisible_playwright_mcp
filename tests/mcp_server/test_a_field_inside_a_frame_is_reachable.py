@@ -228,9 +228,12 @@ def test_the_snapshot_lists_controls_inside_a_cross_origin_frame(run):
     assert [e.get("selector") for e in top] == ["#top-password"]
     # The hidden frame is not reported; the shown one is, by origin only.
     assert d["frames"] == [{"origin": run.frame_origin, "frame": ["#link"]}]
-    # `at` is in the top viewport (frame box at 40+3, 120+3), `frame_at` in the frame's.
+    # `at` is in the top viewport (frame box at 40+3, 120+3), `frame_at` in the
+    # frame's. Within a pixel: a fingerprint's display scale snaps the border,
+    # and both coordinates are rounded (measured: 567 for 525 + 43).
     go = framed["#go"]
-    assert go["at"] == [go["frame_at"][0] + 43, go["frame_at"][1] + 123]
+    for axis, offset in ((0, 43), (1, 123)):
+        assert abs(go["at"][axis] - (go["frame_at"][axis] + offset)) <= 1, go
 
 
 @pytest.mark.e2e
