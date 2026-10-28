@@ -232,9 +232,22 @@ async def guard_pixels(session) -> None:
     if not values.raw:
         return
     try:
-        fields = await asyncio.wait_for(
-            session.page().eval_on_selector("html", PRESENCE_JS), 5)
-        if not isinstance(fields, list) or not all(isinstance(v, str) for v in fields):
+        # ⛔ EVERY FRAME, READ IN ITS OWN DOCUMENT. PRESENCE_JS descends into a
+        # same-origin iframe from the parent, but a cross-origin one answers
+        # SecurityError and is skipped - so a value masked inside Plaid Link's
+        # iframe (cdn.plaid.com, inside app.squareup.com) was on the page and
+        # the guard read nothing. The engine reaches each frame directly;
+        # nested same-origin frames are then read twice, which only costs time.
+        page = session.page()
+        frames = list(getattr(page, "frames", None) or [page])
+        answers = await asyncio.wait_for(asyncio.gather(
+            *(frame.eval_on_selector("html", PRESENCE_JS) for frame in frames)), 5)
+        fields = []
+        for answer in answers:
+            if not isinstance(answer, list):
+                raise MaskRefusal(SCREENSHOT_REFUSED)
+            fields.extend(answer)
+        if not all(isinstance(v, str) for v in fields):
             raise MaskRefusal(SCREENSHOT_REFUSED)
         # The same matcher as the result boundary, so a value the page shows
         # reformatted (spaced card digits) is present here too.
