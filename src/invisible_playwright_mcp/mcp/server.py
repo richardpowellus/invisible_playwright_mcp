@@ -800,6 +800,9 @@ async def browser_snapshot(browser: Browser = None) -> str:
     Elements with no `selector` carry `at`, the centre coordinates, for
     browser_click_at.
 
+    Controls inside iframes, cross-origin too, carry `frame` (pass it with the
+    selector) and `frame_origin`; `frames` lists each frame found.
+
     It lists what a caller can act on, and it is not the accessibility tree:
     one country `<select>` would otherwise fill the answer with its options
     before the form you were looking for appears.
@@ -818,8 +821,15 @@ async def browser_snapshot(browser: Browser = None) -> str:
     return await _work().reading(actions.snapshot, role=browser)
 
 
+#: The iframe a selector tool acts in: the selectors of each nested iframe,
+#: outermost first, exactly as browser_snapshot reports an element's `frame`.
+#: Omitted, the top-level document, as before frames were reachable.
+FrameChain = list[str] | None
+
+
 @mcp.tool(annotations=_says("Read the page HTML", read_only=True))
-async def browser_read_html(mode: str = "form", browser: Browser = None) -> str:
+async def browser_read_html(mode: str = "form", browser: Browser = None,
+                            frame: FrameChain = None) -> str:
     """The page's HTML, cleaned down to what is worth reading.
 
     Use this when the STRUCTURE matters - a form and its labels, a table, what
@@ -834,8 +844,10 @@ async def browser_read_html(mode: str = "form", browser: Browser = None) -> str:
     page, tens of thousands of characters on a large one. Cutting markup in the
     middle leaves tags that mean nothing, so it is not cut - but the answer can
     be long. Reach for browser_snapshot when you only need something to click.
+
+    frame reads inside an iframe: pass an element's `frame` from the snapshot.
     """
-    return await _work().reading(actions.read_html, mode, role=browser)
+    return await _work().reading(actions.read_html, mode, frame=frame, role=browser)
 
 
 @mcp.tool(annotations=_says("Take a screenshot", read_only=True))
@@ -872,13 +884,15 @@ async def browser_watch(browser: Browser = None) -> Image:
 # --- acting ----------------------------------------------------------------
 
 @mcp.tool(annotations=_says("Click an element", destructive=True))
-async def browser_click(selector: str, browser: Browser = None) -> str:
+async def browser_click(selector: str, browser: Browser = None,
+                        frame: FrameChain = None) -> str:
     """Click the first element matching a CSS selector.
 
     Scrolls it into view and waits for it to be clickable. When no selector can
     describe the target, use browser_click_at with coordinates from
-    browser_snapshot."""
-    return await _work().acting(actions.click, selector, role=browser)
+    browser_snapshot. For an element inside an iframe pass its `frame` from
+    the snapshot as well."""
+    return await _work().acting(actions.click, selector, frame=frame, role=browser)
 
 
 @mcp.tool(annotations=_says("Click at a point", destructive=True))
@@ -910,7 +924,8 @@ async def browser_type(selector: str, text: str, browser: Browser = None,
                        expect_origin: str | None = None,
                        expect_input_type: str | None = None,
                        mask_value: Annotated[bool, Field(strict=True)] = False,
-                       strict: Annotated[bool, Field(strict=True)] = False) -> str:
+                       strict: Annotated[bool, Field(strict=True)] = False,
+                       frame: FrameChain = None) -> str:
     """Type into a field, replacing what it holds, key by key at a human pace.
 
     Reports what the field kept, including truncation or reformatting. Plain
@@ -928,7 +943,10 @@ async def browser_type(selector: str, text: str, browser: Browser = None,
 
     strict, with expect_origin, refuses unless the selector matches exactly one
     element, counting those in closed shadow roots, which page script cannot
-    see; nothing is written when it matches more."""
+    see; nothing is written when it matches more.
+
+    frame types inside an iframe (the snapshot's `frame`); expect_origin is
+    then the frame's origin, checked against the field's own document."""
     if mask_value:
         masked.validate(text, expect_origin)
     guard = {key: value for key, value in (
@@ -938,20 +956,23 @@ async def browser_type(selector: str, text: str, browser: Browser = None,
         guard["mask_value"] = True
     if strict:
         guard["strict"] = True
+    if frame is not None:
+        guard["frame"] = frame
     return await _work().typing(actions.type_text, selector, text, role=browser, **guard)
 
 
 @mcp.tool(annotations=_says("Choose a dropdown option", destructive=True))
 async def browser_select_option(selector: str, value: str,
-                                browser: Browser = None) -> str:
+                                browser: Browser = None,
+                                frame: FrameChain = None) -> str:
     """Choose an option in a dropdown (`<select>`), by its visible label or by
     its value.
 
     Use this rather than clicking the dropdown and pressing arrow keys: a click
     plus arrows cannot tell you which row it landed on, and setting the value
     through browser_evaluate changes it without the page seeing a real
-    interaction."""
-    return await _work().acting(actions.select_option, selector, value, role=browser)
+    interaction. Inside an iframe, pass the snapshot's `frame`."""
+    return await _work().acting(actions.select_option, selector, value, frame=frame, role=browser)
 
 
 @mcp.tool(annotations=_says("Upload files", destructive=True))
@@ -1003,7 +1024,8 @@ async def browser_press_key(key: str, browser: Browser = None) -> str:
 
 
 @mcp.tool(annotations=_says("Read the page with JavaScript", read_only=True))
-async def browser_evaluate(expression: str, browser: Browser = None) -> str:
+async def browser_evaluate(expression: str, browser: Browser = None,
+                           frame: FrameChain = None) -> str:
     """READ from the page with JavaScript and get the result as JSON.
 
     Last, for what other tools cannot see: a computed style, a value held
@@ -1021,7 +1043,9 @@ async def browser_evaluate(expression: str, browser: Browser = None) -> str:
 
     The refusal catches the obvious spellings, not every possible one. A script
     that slips past it is still the wrong way to do the thing: report it in your
-    answer rather than using it."""
+    answer rather than using it.
+
+    frame runs the script inside an iframe (the snapshot's `frame`)."""
     # ⛔ AN ARBITRARY SCRIPT IS NOT A READ, SO IT QUEUES LIKE AN ACTION. It went
     # through `work.reading`, which does not wait for the input lock: during a
     # background typing a script calling `focus()` on another field moved the
@@ -1030,7 +1054,7 @@ async def browser_evaluate(expression: str, browser: Browser = None) -> str:
     # call is refused with a sentence that says so, which is where the model
     # learns it: not in the description, resent on every turn (the published
     # tool-surface figures in docs/ count those characters).
-    return await _work().acting(actions.evaluate, expression, role=browser)
+    return await _work().acting(actions.evaluate, expression, frame=frame, role=browser)
 
 
 def main() -> None:
