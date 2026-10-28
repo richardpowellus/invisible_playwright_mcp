@@ -319,6 +319,16 @@ async def frame_target(session, frame=None):
     return current
 
 
+async def _read(target, expression):
+    """`evaluate_read` where the target has it, else `evaluate`.
+
+    The engine's public Frame has no `evaluate_read` (only Page does), so a
+    read inside a frame is sent once: a frame that navigates under it fails
+    the read rather than being read again on its successor."""
+    read = getattr(target, "evaluate_read", None)
+    return await (read or target.evaluate)(expression)
+
+
 async def _snapshot_frames(parent, chain, offset, out, frames) -> None:
     """Append the controls of every painted child frame of `parent`, each
     tagged with the `frame` chain that reaches it and its frame's origin.
@@ -342,7 +352,7 @@ async def _snapshot_frames(parent, chain, offset, out, frames) -> None:
         if not isinstance(info, dict) or not info.get("shown"):
             continue
         try:
-            origin = await child.evaluate_read("() => location.origin")
+            origin = await _read(child, "() => location.origin")
         except Exception:  # noqa: BLE001
             origin = None
         selector = info.get("selector")
@@ -358,7 +368,7 @@ async def _snapshot_frames(parent, chain, offset, out, frames) -> None:
         frames.append(entry)
         dx, dy = offset[0] + info["left"], offset[1] + info["top"]
         try:
-            sub = await child.evaluate_read(SNAPSHOT_JS)
+            sub = await _read(child, SNAPSHOT_JS)
             elements = sub.get("interactive_elements", [])
             await _resolve_nth(child, elements)
         except Exception:  # noqa: BLE001
@@ -722,7 +732,7 @@ async def read_html(session, mode: str = "form", frame=None) -> str:
     # `frame` reads the document inside an iframe instead (browser_snapshot
     # reports each one's chain); without it, the top-level document as before.
     target = await frame_target(session, frame)
-    html = await target.evaluate_read(clean.VISIBLE_HTML_JS)
+    html = await _read(target, clean.VISIBLE_HTML_JS)
     return clean.clean_page(html, mode)
 
 
