@@ -130,7 +130,6 @@ EVERY_TOOL = [
     ("browser_status", {}),
     ("browser_network", {}),
     ("browser_network_clear", {}),
-    ("browser_network_capture", {"request_bodies": True}),
 ]
 
 

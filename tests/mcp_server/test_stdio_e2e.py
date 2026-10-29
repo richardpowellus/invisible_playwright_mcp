@@ -124,7 +124,7 @@ async def test_every_tool_reaches_the_wire_with_its_hints():
                  "browser_read_text", "browser_snapshot", "browser_read_html",
                  "browser_take_screenshot", "browser_evaluate", "browser_network",
                  "browser_cookies_export"}
-    additive = {"browser_network_clear", "browser_network_capture"}
+    additive = {"browser_network_clear"}
     acts = {"browser_open", "browser_close", "browser_navigate", "browser_click",
             "browser_click_at", "browser_type", "browser_select_option",
             "browser_press_key", "browser_upload_files", "browser_download"}
