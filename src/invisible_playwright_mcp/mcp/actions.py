@@ -239,6 +239,15 @@ FRAME_DEPTH = 4
 #: a shadow root gets none: `_frame_target` resolves through the engine, which
 #: pierces shadow roots, and a selector unique in one place and not the other
 #: would name a different frame. One that cannot be checked is not handed out.
+#:
+#: When no id or naming attribute is unique, the bare tag is tried, then a
+#: child-combinator path of `tag:nth-of-type(n)` steps up to the nearest
+#: ancestor with a unique id (or to `html`). Facebook's settings dialogs
+#: (2026-10-29) are an iframe with none of those attributes, so the frame was
+#: listed `unaddressable` and a password field inside it could be typed into
+#: by `frame: ["iframe"]` but never seen by the snapshot, which is what a
+#: credential filler confirms masking against. `src` is never used: an
+#: embedded widget's URL commonly carries its session token.
 FRAME_INFO_JS = """(el) => {
     const doc = el.ownerDocument;
     const r = el.getBoundingClientRect(), s = getComputedStyle(el);
@@ -256,6 +265,20 @@ FRAME_INFO_JS = """(el) => {
     if (el.id) tries.push('#' + cssq(el.id));
     for (const name of ['name', 'title', 'data-testid', 'aria-label'])
         if (el.getAttribute(name)) tries.push(tag + '[' + name + "='" + attr(el.getAttribute(name)) + "']");
+    tries.push(tag);
+    const count = sel => { try { return doc.querySelectorAll(sel).length; } catch (err) { return -1; } };
+    const steps = [];
+    for (let node = el; node; node = node.parentElement) {
+        const id = node !== el && node.id ? '#' + cssq(node.id) : '';
+        if (id && count(id) === 1) { steps.unshift(id); break; }
+        const name = node.tagName.toLowerCase();
+        if (node === doc.documentElement) { steps.unshift(name); break; }
+        let n = 1;
+        for (let sib = node.previousElementSibling; sib; sib = sib.previousElementSibling)
+            if (sib.tagName === node.tagName) n++;
+        steps.unshift(name + ':nth-of-type(' + n + ')');
+    }
+    tries.push(steps.join(' > '));
     for (const sel of tries) {
         try {
             const found = doc.querySelectorAll(sel);
