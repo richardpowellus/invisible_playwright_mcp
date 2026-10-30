@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import gc
 import json
-import logging
 import os
 import re
 import weakref
@@ -22,11 +21,6 @@ from invisible_playwright_mcp.mcp.work import Work
 class Context:
     def __init__(self):
         self.listeners = {}
-        self.routes = []
-        self.route_calls = []
-        self.unroute_calls = []
-        self.route_error = None
-        self.unroute_error = None
 
     def on(self, event, callback):
         self.listeners[event] = callback
@@ -38,18 +32,10 @@ class Context:
         self.listeners[event](value)
 
     async def route(self, pattern, handler):
-        self.route_calls.append((pattern, handler))
-        self.routes.append((pattern, handler))
-        await asyncio.sleep(0)
-        if self.route_error:
-            raise RuntimeError(self.route_error)
+        raise AssertionError("network history is passive and must never route")
 
     async def unroute(self, pattern, handler):
-        self.unroute_calls.append((pattern, handler))
-        self.routes = [(p, h) for p, h in self.routes if p != pattern or h is not handler]
-        await asyncio.sleep(0)
-        if self.unroute_error:
-            raise RuntimeError(self.unroute_error)
+        raise AssertionError("network history is passive and must never unroute")
 
 
 class Request:
@@ -403,159 +389,47 @@ def test_bad_event_cannot_escape_the_listener():
     assert rows(capture) == []
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-async def test_engine_missing_post_data_is_not_reported_as_an_empty_body(enabled):
+async def test_engine_missing_post_data_is_not_reported_as_an_empty_body():
     capture, context = recorder()
-    await capture.capture(request_bodies=enabled)
     request = Request(body=None, headers={"Content-Length": "123"})
     context.emit("request", request)
     row = rows(capture)[0]
     assert row["post_data_bytes"] == 123
-    assert row["post_data_state"] == (
-        "unavailable: engine did not expose request body" if enabled else network.REQUEST_BODIES_HINT)
+    assert row["post_data_state"] == "unavailable: engine did not expose request body"
     assert "post_data" not in row
     unknown = Request(body=None, headers={})
     context.emit("request", unknown)
     row = rows(capture)[1]
     assert row["post_data_bytes"] is None
-    assert row["post_data_state"] == (
-        "absent or unavailable from engine" if enabled else network.REQUEST_BODIES_HINT)
+    assert row["post_data_state"] == "absent or unavailable from engine"
     await capture.close()
 
 
 @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
-def test_body_capable_methods_without_data_while_off_name_the_opt_in(method):
+def test_body_capable_methods_without_data_say_absent_or_unavailable(method):
     capture, context = recorder()
     request = Request(method=method, body=None)
     context.emit("request", request)
-    assert rows(capture, include_preflight=True)[0]["post_data_state"] == network.REQUEST_BODIES_HINT
-    assert capture.entries()["request_bodies"] is False
+    row = rows(capture, include_preflight=True)[0]
+    assert row["post_data_state"] == "absent or unavailable from engine"
+    assert "request_bodies" not in capture.entries()
 
 
-async def test_capture_is_idempotent_concurrent_and_removes_exactly_its_route():
+async def test_request_bodies_are_recorded_with_no_route():
+    """invisible-playwright 0.37.0 gives request.post_data with no route, and
+    the floor is past it, so nothing here intercepts to read a body."""
     capture, context = recorder()
-    assert not context.routes and capture.entries()["request_bodies"] is False
-    assert await capture.capture(request_bodies=False) == {"request_bodies": False}
-    assert not context.unroute_calls
-
-    async def unrelated(route):
-        await route.fallback()
-
-    await context.route("**/*", unrelated)
-    replies = await asyncio.gather(*(capture.capture(request_bodies=True) for _ in range(5)))
-    assert all(reply == {"request_bodies": True} for reply in replies)
-    assert len(context.route_calls) == 2
-    pattern, handler = context.route_calls[-1]
-    assert pattern == "**/*" and handler is not unrelated
-    assert context.routes == [("**/*", unrelated), (pattern, handler)]
-    capture.clear()
-    assert capture.entries()["request_bodies"] is True
-    assert len(context.routes) == 2
-    await asyncio.gather(*(capture.capture(request_bodies=False) for _ in range(5)))
-    assert context.unroute_calls == [(pattern, handler)]
-    assert context.routes == [("**/*", unrelated)]
-    assert capture.entries()["request_bodies"] is False
+    context.emit("request", Request(body=b'{"a":1}'))
+    row = rows(capture)[0]
+    assert row["post_data"] == '{"a":1}' and row["post_data_state"] == "captured"
     await capture.close()
 
 
-@pytest.mark.parametrize("rollback_fails", [False, True])
-async def test_route_failure_rolls_back_partial_registration_and_preserves_error(rollback_fails):
+async def test_close_removes_the_listeners_and_leaves_the_context_unrouted():
     capture, context = recorder()
-    context.route_error = "BrowserContext.route: service_workers='block'\nengine detail"
-    if rollback_fails:
-        context.unroute_error = "rollback failed"
-    with pytest.raises(RuntimeError) as caught:
-        await capture.capture(request_bodies=True)
-    assert str(caught.value) == context.route_error
-    assert capture.entries()["request_bodies"] is False
-    assert not context.routes
-    assert context.unroute_calls == context.route_calls
-    context.route_error = context.unroute_error = None
-    assert await capture.capture(request_bodies=True) == {"request_bodies": True}
-    assert len(context.routes) == 1
     await capture.close()
-
-
-async def test_failed_disable_restores_the_registered_handler_and_state():
-    capture, context = recorder()
-    await capture.capture(request_bodies=True)
-    registered = list(context.routes)
-    context.unroute_error = "engine refused unroute"
-    with pytest.raises(RuntimeError, match="engine refused unroute"):
-        await capture.capture(request_bodies=False)
-    assert context.routes == registered
-    assert capture.entries()["request_bodies"] is True
-    context.unroute_error = None
-    await capture.capture(request_bodies=False)
-    assert not context.routes
+    assert not context.listeners
     await capture.close()
-
-
-async def test_cancelled_enable_cleans_up_partial_registration():
-    capture, context = recorder()
-    entered = asyncio.Event()
-
-    async def wait(pattern, handler):
-        context.routes.append((pattern, handler))
-        entered.set()
-        await asyncio.Event().wait()
-
-    context.route = wait
-    task = asyncio.create_task(capture.capture(request_bodies=True))
-    await entered.wait()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert not context.routes and not capture.entries()["request_bodies"]
-    await capture.close()
-
-
-@pytest.mark.parametrize("fallback_available", [False, True])
-@pytest.mark.parametrize("raises", [False, True])
-async def test_pass_through_only_falls_back_or_continues_once_and_never_raises(
-        fallback_available, raises, caplog):
-    capture, context = recorder()
-    await capture.capture(request_bodies=True)
-    handler = context.routes[0][1]
-    called = []
-
-    async def fallback():
-        called.append("fallback")
-        if raises:
-            raise RuntimeError("request already gone")
-
-    async def continue_():
-        called.append("continue")
-        if raises:
-            raise RuntimeError("request already gone")
-
-    route = SimpleNamespace(continue_=continue_)
-    if fallback_available:
-        route.fallback = fallback
-    with caplog.at_level(logging.DEBUG, logger="invisible_playwright_mcp"):
-        await asyncio.wait_for(handler(route), 1)
-    assert called == ["fallback" if fallback_available else "continue"]
-    assert ("request already gone" in caplog.text) is raises
-    await capture.close()
-
-
-@pytest.mark.parametrize("unroute_fails", [False, True])
-async def test_close_releases_capture_and_new_browsers_default_to_off(unroute_fails, caplog):
-    capture, context = recorder()
-    await capture.capture(request_bodies=True)
-    registered = context.routes[0]
-    if unroute_fails:
-        context.unroute_error = "context gone"
-    with caplog.at_level(logging.DEBUG, logger="invisible_playwright_mcp"):
-        await capture.close()
-    assert context.unroute_calls == [registered]
-    assert not context.routes and not context.listeners
-    assert capture.entries()["request_bodies"] is False
-    assert ("context gone" in caplog.text) is unroute_fails
-    fresh, _ = recorder()
-    assert fresh.entries()["request_bodies"] is False
-    with pytest.raises(RuntimeError, match="not attached"):
-        await capture.capture(request_bodies=True)
 
 
 async def test_duplicate_finish_does_not_double_count_body_bytes():
@@ -667,6 +541,7 @@ async def test_tools_preserve_large_json_shape_and_browser_isolation(monkeypatch
     assert len(out["entries"][0]["post_data"]) == 7000
     assert out["next_since_id"] == 1 and "preview" not in out
     assert "support.test" not in json.dumps(out)
+    assert "request_bodies" not in out
     assert json.loads(await server.browser_network_clear())["cleared"] == 1
     assert json.loads(await server.browser_network())["entries"] == []
     assert len(json.loads(await server.browser_network(browser="support"))["entries"]) == 1
@@ -680,8 +555,8 @@ async def test_tools_preserve_large_json_shape_and_browser_isolation(monkeypatch
     assert {choice["type"] for choice in properties["include_headers"]["anyOf"]} == {
         "boolean", "array"}
     assert tools["browser_network"].annotations.readOnlyHint is True
-    assert tools["browser_network_capture"].inputSchema["required"] == ["request_bodies"]
-    for name in ("browser_network", "browser_network_clear", "browser_network_capture"):
+    assert "browser_network_capture" not in tools
+    for name in ("browser_network", "browser_network_clear"):
         assert tools[name].annotations.openWorldHint is False
     for session in work._open.values():
         await session.network.close()
@@ -751,7 +626,7 @@ async def test_file_mode_streams_all_matches_with_metadata_only(
     out = json.loads(await server.browser_network(
         to_file=True, max_entries=1, max_bytes=1, **filters))
     assert set(out) == {"path", "written", "bytes", "truncated", "dropped", "capacity",
-                        "stored_body_bytes", "note", "request_bodies"}
+                        "stored_body_bytes", "note"}
     for key, value in capture.metadata().items():
         assert out[key] == value
     path = Path(out["path"])
