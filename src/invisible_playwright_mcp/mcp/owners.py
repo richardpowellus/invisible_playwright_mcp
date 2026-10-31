@@ -36,6 +36,9 @@ HANDLE_TOOLS = frozenset({
     "browser_status", "browser_evaluate", "browser_snapshot", "browser_read_html",
     "browser_read_text", "browser_type", "browser_press_key",
     "browser_select_option", "browser_take_screenshot",
+    # A card tokenizer (Fiserv) encrypts the number only on blur, so the filler
+    # clicks the field it filled and presses Tab, as a person leaves it.
+    "browser_click",
 })
 _HANDLE = re.compile(r"bh_[A-Za-z0-9_-]{43}")
 IDENTITY_ERROR = "Owner mode requires a valid mcpd/identity sessionId."
