@@ -643,7 +643,8 @@ async def test_allowed_handle_tools_reach_only_main(owners, monkeypatch, name, a
         touched.append(session)
         return "read or typed"
 
-    for action in ("evaluate", "snapshot", "read_html", "read_text", "type_text", "press_key"):
+    for action in ("evaluate", "snapshot", "read_html", "read_text", "type_text", "press_key",
+                   "select_option"):
         monkeypatch.setattr(actions, action, record)
     async def screenshot(session):
         touched.append(session)
@@ -848,3 +849,22 @@ async def test_owner_mode_refuses_direct_http(owners, monkeypatch):
     monkeypatch.setenv("STEALTHFOX_MCP_TRANSPORT", "http")
     with pytest.raises(ValueError, match="trusted stdio"):
         server.main()
+
+
+async def test_a_fill_handle_can_choose_an_option_on_main(owners, monkeypatch):
+    # 1Password fill_card_expiry chooses a card expiry month and year through the
+    # handle; the parametrized cases above follow HANDLE_TOOLS and cannot pin it.
+    old = handle(await call("A", "browser_open"))
+    a = owners.entries["A"].work._open["main"]
+    touched = []
+
+    async def record(session, *args, **kwargs):
+        touched.append(session)
+        return "selected"
+
+    monkeypatch.setattr(actions, "select_option", record)
+    result = await call("filler", "browser_select_option", {"selector": "#expMonth", "value": "07"},
+                        meta={**identity("filler"), HANDLE_KEY: old})
+    assert not result.isError, text(result)
+    assert touched == [a]
+    assert "filler" not in owners.entries
