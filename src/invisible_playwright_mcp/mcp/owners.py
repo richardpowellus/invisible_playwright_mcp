@@ -35,7 +35,7 @@ HANDLE_KEY = "stealthfox/browser_handle"
 HANDLE_TOOLS = frozenset({
     "browser_status", "browser_evaluate", "browser_snapshot", "browser_read_html",
     "browser_read_text", "browser_type", "browser_press_key",
-    "browser_take_screenshot",
+    "browser_select_option", "browser_take_screenshot",
 })
 _HANDLE = re.compile(r"bh_[A-Za-z0-9_-]{43}")
 IDENTITY_ERROR = "Owner mode requires a valid mcpd/identity sessionId."
