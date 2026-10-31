@@ -644,7 +644,7 @@ async def test_allowed_handle_tools_reach_only_main(owners, monkeypatch, name, a
         return "read or typed"
 
     for action in ("evaluate", "snapshot", "read_html", "read_text", "type_text", "press_key",
-                   "select_option"):
+                   "select_option", "click"):
         monkeypatch.setattr(actions, action, record)
     async def screenshot(session):
         touched.append(session)
@@ -864,6 +864,26 @@ async def test_a_fill_handle_can_choose_an_option_on_main(owners, monkeypatch):
 
     monkeypatch.setattr(actions, "select_option", record)
     result = await call("filler", "browser_select_option", {"selector": "#expMonth", "value": "07"},
+                        meta={**identity("filler"), HANDLE_KEY: old})
+    assert not result.isError, text(result)
+    assert touched == [a]
+    assert "filler" not in owners.entries
+
+
+async def test_a_fill_handle_can_click_on_main(owners, monkeypatch):
+    # 1Password clicks a card field it filled, then presses Tab, because the
+    # Fiserv tokenizer encrypts only on blur. Pinned by name, like select_option.
+    old = handle(await call("A", "browser_open"))
+    a = owners.entries["A"].work._open["main"]
+    touched = []
+
+    async def record(session, *args, **kwargs):
+        touched.append(session)
+        return "clicked"
+
+    monkeypatch.setattr(actions, "click", record)
+    result = await call("filler", "browser_click", {"selector": "#cardinfo-card-number",
+                                                    "frame": ["#tokenFrame", "#tokenframe"]},
                         meta={**identity("filler"), HANDLE_KEY: old})
     assert not result.isError, text(result)
     assert touched == [a]
