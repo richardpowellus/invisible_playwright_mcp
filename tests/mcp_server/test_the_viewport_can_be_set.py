@@ -45,11 +45,23 @@ class _Page:
 
 
 class _Session:
-    def __init__(self, page):
+    def __init__(self, page, *, opened=True):
         self._page = page
+        self._open = opened
         self.own_viewport = None
+        self.new_pages = 0
+
+    def pages(self):
+        return [self._page] if self._open else []
+
+    async def new_page(self):
+        self.new_pages += 1
+        self._open = True
+        return self._page
 
     def page(self):
+        if not self._open:
+            raise RuntimeError("this browser has no page open")
         return self._page
 
 
@@ -62,6 +74,23 @@ async def test_a_size_is_set_and_read_back_from_the_page():
     assert answer["screen"] == {"width": 1920, "height": 1080}
     assert answer["own"] == {"width": 1920, "height": 947}
     assert "warning" not in answer
+
+
+async def test_a_browser_with_no_page_yet_gets_one_and_is_sized():
+    """Known-bad, live on 2026-11-01: browser_open, then browser_set_viewport,
+    then browser_navigate answered "this browser has no page open", because a
+    fresh browser has none until the first navigation."""
+    page = _Page()
+    session = _Session(page, opened=False)
+    answer = json.loads(await actions.set_viewport(session, 390, 844))
+    assert session.new_pages == 1
+    assert answer["viewport"] == {"width": 390, "height": 844}
+
+
+async def test_a_page_already_open_is_not_replaced():
+    session = _Session(_Page())
+    await actions.set_viewport(session, 390, 844)
+    assert session.new_pages == 0
 
 
 async def test_neither_size_restores_the_one_the_browser_opened_with():
@@ -141,7 +170,13 @@ async def test_a_real_page_reads_the_size_and_keeps_its_screen(monkeypatch, tmp_
 
     try:
         success(await call("A", "browser_open"))
+        # Sized before anything is loaded, as a responsive check does it.
+        first = json.loads(success(await call("A", "browser_set_viewport",
+                                              {"width": 390, "height": 844})))
+        assert first["viewport"] == {"width": 390, "height": 844}, first
         success(await call("A", "browser_navigate", {"url": page}))
+        assert (await read())["inner"] == [390, 844]
+        success(await call("A", "browser_set_viewport"))
         before = await read()
         for width, height in ((1440, 900), (1024, 768), (390, 844)):
             if width > before["screen"][0] or height > before["screen"][1]:
