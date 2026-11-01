@@ -59,6 +59,10 @@ class StealthSession:
         self.downloads: str | None = None
         self._download_root = download_root
         self.network = network.Network(network_limits)
+        # The identity's own content-area size, remembered by
+        # `actions.set_viewport` the first time it changes it, so a call with
+        # no size can put it back.
+        self.own_viewport: dict | None = None
 
     @property
     def seed(self):

@@ -130,6 +130,7 @@ EVERY_TOOL = [
     ("browser_status", {}),
     ("browser_network", {}),
     ("browser_network_clear", {}),
+    ("browser_set_viewport", {"width": 390, "height": 844}),
 ]
 
 
