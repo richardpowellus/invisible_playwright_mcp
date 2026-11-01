@@ -48,6 +48,9 @@ async def test_server_registers_expected_tools():
         "browser_status",
         "browser_network", "browser_network_clear",
         "browser_cookies_export",
+        # Added 2026-11-01: responsive checks need a 390-wide page, and no
+        # keystroke or frame reaches the window size.
+        "browser_set_viewport",
         # Added 2026-10-01: a file input took nothing any tool could give it,
         # so an upload was the end of the road - or a DataTransfer built in
         # script, which is the untrusted change this package exists to avoid.
