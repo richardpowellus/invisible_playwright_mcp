@@ -291,7 +291,9 @@ def test_the_gate_is_looking_at_the_whole_package():
     # browser_network compact/file export adds Network.stream, Network.metadata
     # and Work._download_env. Always-on file-chooser interception adds
     # StealthSession._arm_choosers.
-    assert methods <= 129, "%d methods judged; the exclusions have stopped applying" % methods
+    # Native dialogs add eight session methods and Work._dialog_result:
+    # 136 methods now meet the same exclusions.
+    assert methods <= 136, "%d methods judged; the exclusions have stopped applying" % methods
     reached = set()
     for text in sources.values():
         reached.update(_on_an_object(ast.parse(text), known))

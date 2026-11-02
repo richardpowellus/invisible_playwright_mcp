@@ -126,6 +126,7 @@ async def test_every_tool_reaches_the_wire_with_its_hints():
                  "browser_cookies_export"}
     additive = {"browser_network_clear", "browser_set_viewport"}
     acts = {"browser_open", "browser_close", "browser_navigate", "browser_click",
+            "browser_handle_dialog",
             "browser_click_at", "browser_type", "browser_select_option",
             "browser_press_key", "browser_upload_files", "browser_download"}
     async with stdio_client(server_params()) as (read, write):
