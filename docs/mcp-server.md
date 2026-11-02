@@ -182,6 +182,7 @@ a browser gets when nobody says anything.
 `browser_type`, `browser_select_option`, `browser_press_key`,
 `browser_upload_files`, `browser_download`, `browser_evaluate`,
 `browser_network`, `browser_network_clear`, `browser_set_viewport`,
+`browser_handle_dialog`,
 `browser_cookies_export` (fork-only, credential-bearing).
 
 Tool names mirror the Microsoft Playwright MCP, so prompts written for it work
@@ -495,6 +496,29 @@ watch reads discard cached frames before checking. The same plain-form
 limitation as masked fills applies: this is not a sandbox against page code
 computing other encodings of a value.
 
+### Native dialogs
+
+`browser_handle_dialog(accept, prompt_text=null, timeout_seconds=60)` arms the
+**next** native alert, confirm, prompt or beforeunload in the selected browser,
+including dialogs from pages the site opens. It starts no browser. Call it
+before the action that opens the dialog; another call replaces the arm.
+Timeout must be greater than zero and at most 600 seconds. `prompt_text`
+requires `accept=true` and is passed only to prompts. `accept=false` dismisses.
+An expired or consumed arm leaves the default: dismiss, except beforeunload
+is accepted so navigation behavior stays unchanged.
+
+Dialogs are answered through the engine, not by replacing page JavaScript.
+Text results report the type, message, page, chosen action, armed/default
+decision and any failure. A default dismissal says to arm acceptance and
+repeat the action. **Image tools (`browser_click_at`, `browser_take_screenshot`,
+`browser_watch`) keep their single-image result** and retain news for the next
+text-returning tool or `browser_status`; they never discard it. Status also
+shows the current arm's action and seconds left, plus recent dialogs. History
+and unreported news each retain at most 20 events, with dropped news counted.
+A pending answer is reported as pending and its completion is reported later.
+Closing the browser clears its arm and history. This is an ordinary
+owner-scoped tool, not a delegated fill-handle capability.
+
 ### Acting on the page
 
 The fork adds optional `expect_origin` and `expect_input_type` to `browser_type`.
@@ -503,8 +527,8 @@ requires an origin. It writes without keystrokes and reports kept only after a
 read-only equality check remains true. A field emptied by a first-focus model
 render is rewritten at most twice, with both guards checked again on each
 write. A changed nonempty or unreadable value fails without a retry. Success
-is exactly `typed into <selector>`; guarded calls wait for their terminal
-answer and leave ordinary background-typing news for status or the next plain
+is `typed into <selector>`, with dialog news prepended when present; guarded
+calls wait for their terminal answer and leave ordinary background-typing news for status or the next plain
 action. Plain typing never automatically retries. Credential diagnostics
 contain no field value; a refusal after a previous write never claims that
 the whole call wrote nothing.
