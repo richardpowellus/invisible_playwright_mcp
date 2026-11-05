@@ -113,7 +113,8 @@ work = Work(_SESSION_ID, engine=engine)
 
 owners = Owners.from_env(engine=engine)
 _selected_work: ContextVar[Work] = ContextVar("browser_owner_work")
-_result_windows: ContextVar[tuple[set[str], ...]] = ContextVar("browser_result_windows", default=())
+_result_windows: ContextVar[tuple[set[masked.MaskPattern], ...]] = ContextVar(
+    "browser_result_windows", default=())
 
 
 def _work() -> Work:
@@ -134,7 +135,7 @@ class BrowserMCP(FastMCP):
         self._mcp_server.request_handlers[types.CallToolRequest] = self._owner_tool_result
 
     async def _owner_tool_result(self, request: types.CallToolRequest) -> types.ServerResult:
-        windows: list[set[str]] = []
+        windows: list[set[masked.MaskPattern]] = []
         log_token = _result_windows.set(())
         exporting = request.params.name == cookies.TOOL
         export_token = cookies.active.set(exporting)
@@ -948,11 +949,11 @@ async def browser_type(selector: str, text: str, browser: Browser = None,
     expect_origin locks delivery to the field's origin. expect_input_type,
     with expect_origin, also locks its type. Uses native autofill; retries only
     an observed empty field, at most three guarded writes. Changed or unreadable
-    values fail. Success is exactly 'typed into <selector>', never progress.
+    values fail. Success: 'typed into <selector>' (notes reformatting).
 
-    mask_value hides text of at least eight characters from this owner's tool
-    results until this browser closes. Requires expect_origin; empty clears
-    are allowed. Page pixels are refused while masked text is present.
+    mask_value hides text (8+ chars, or 3+ digits with separators, matched
+    whole) from this owner's results until close. Needs expect_origin; empty
+    clears allowed; screenshots refused while present.
 
     strict, with expect_origin, refuses unless the selector matches exactly one
     element, counting closed shadow roots; nothing is written when it does not.
