@@ -554,7 +554,7 @@ class Owners:
             self.entries[identity] = Owner(work, self.clock())
         return self.entries[identity]
 
-    def redaction_windows(self, meta: dict) -> set[str]:
+    def redaction_windows(self, meta: dict) -> set[masked.MaskPattern]:
         """Include policy refusals that happen before target() can yield."""
         identity = owner_id(meta)
         if HANDLE_KEY in meta:

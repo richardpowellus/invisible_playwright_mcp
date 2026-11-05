@@ -7,6 +7,8 @@ import html
 import inspect
 import json
 import logging
+import shutil
+import subprocess
 from pathlib import Path
 from urllib.parse import quote, quote_plus
 
@@ -78,7 +80,7 @@ async def test_mask_value_is_a_json_boolean_not_a_coerced_flag(owners, value):
 @pytest.mark.parametrize("value,origin,reason", [
     (VALUE, None, "requires expect_origin"),
     ("short", ORIGIN, "text must be at least 8 characters"),
-    ("1234567", ORIGIN, "text must be at least 8 characters"),
+    ("123456x", ORIGIN, "text must be at least 8 characters"),
     ("", None, "requires expect_origin"),
 ])
 async def test_mask_refusals_write_nothing(owners, monkeypatch, value, origin, reason):
@@ -92,6 +94,174 @@ async def test_mask_refusals_write_nothing(owners, monkeypatch, value, origin, r
     assert result.isError
     assert text(result) == "mask_value refused: " + reason + "; nothing was written"
     assert page.value == ""
+
+
+@pytest.mark.parametrize("value", ["123", "0729", "12345", "123456", "1234567", "1/2 3"])
+async def test_short_numeric_values_are_accepted(owners, monkeypatch, value):
+    monkeypatch.setattr(actions, "GUARD_SETTLE_S", 0)
+    monkeypatch.setattr(actions, "GUARD_SINCE_START_S", 0)
+    success(await call("A", "browser_open"))
+    page = Page()
+    monkeypatch.setattr(owners.entries["A"].work._open["main"], "page", lambda: page)
+    result = await call("A", "browser_type", {
+        "selector": "#p", "text": value, "expect_origin": ORIGIN, "mask_value": True})
+    assert success(result) == "typed into #p"
+    assert page.value == value
+
+
+@pytest.mark.parametrize("value", ["abc", "ab123", "12a456", "123456x", "1/2", "12/"])
+async def test_short_non_numeric_values_keep_the_original_refusal(owners, monkeypatch, value):
+    success(await call("A", "browser_open"))
+    page = Page()
+    monkeypatch.setattr(owners.entries["A"].work._open["main"], "page", lambda: page)
+    result = await call("A", "browser_type", {
+        "selector": "#p", "text": value, "expect_origin": ORIGIN, "mask_value": True})
+    assert result.isError
+    assert text(result) == "mask_value refused: text must be at least 8 characters; nothing was written"
+    assert page.value == ""
+
+
+def test_short_value_matches_whole_with_digit_boundaries():
+    from invisible_playwright_mcp.mcp import masked
+
+    registry = masked.MaskedValues()
+    registry.register("123")
+    for shown in ("123", "1 2 3", "1/2-3"):
+        assert registry.redact(shown) == clean.MASKED_PASSWORD
+    assert registry.redact("x123y") == "x" + clean.MASKED_PASSWORD + "y"
+    for shown in ("41234", "1234", "4123", "٥123", "123١", "12", "124"):
+        assert registry.redact(shown) == shown
+
+
+def test_short_unicode_digits_and_their_json_form_are_masked():
+    from invisible_playwright_mcp.mcp import masked
+
+    registry = masked.MaskedValues()
+    registry.register("١٢٣")
+    assert registry.redact("١ ٢/٣") == clean.MASKED_PASSWORD
+    assert registry.redact(json.dumps("١ ٢/٣")) == '"' + clean.MASKED_PASSWORD + '"'
+
+
+@pytest.mark.parametrize("shown", ["07 / 29", "07/29", "0729", "0 7.2-9"])
+def test_short_expiry_redacts_all_separator_shapes(shown):
+    from invisible_playwright_mcp.mcp import masked
+
+    registry = masked.MaskedValues()
+    registry.register("0729")
+    assert registry.redact(shown) == clean.MASKED_PASSWORD
+
+
+@pytest.mark.parametrize("shown", ["07\t/29", "07\n/29", "07\u00a0/29", "07\u2010/29"])
+def test_short_expiry_redacts_json_escaped_separators(shown):
+    from invisible_playwright_mcp.mcp import masked
+
+    registry = masked.MaskedValues()
+    registry.register("0729")
+    assert registry.redact(json.dumps(shown)) == json.dumps(clean.MASKED_PASSWORD, ensure_ascii=False)
+
+
+def test_short_values_redact_url_escaped_original_form():
+    from invisible_playwright_mcp.mcp import masked
+
+    registry = masked.MaskedValues()
+    registry.register("1/2 3")
+    for form in (quote("1/2 3", safe=""), quote_plus("1/2 3")):
+        assert registry.redact(form) == clean.MASKED_PASSWORD
+
+
+def test_short_patterns_do_not_collide_with_long_values():
+    from invisible_playwright_mcp.mcp import masked
+
+    registry = masked.MaskedValues()
+    value = "\ue001123456789012345"
+    registry.register_exact(value)
+    registry.register("123")
+    assert registry.redact(value) == clean.MASKED_PASSWORD
+
+
+def test_long_value_matches_across_slashes():
+    from invisible_playwright_mcp.mcp import masked
+
+    registry = masked.MaskedValues()
+    registry.register("123456789012")
+    assert registry.redact("1234/5678/9012") == clean.MASKED_PASSWORD
+
+
+async def test_short_expiry_refuses_screenshot_when_input_is_reformatted(owners, monkeypatch):
+    from invisible_playwright_mcp.mcp import masked
+
+    success(await call("A", "browser_open"))
+    session = owners.entries["A"].work._open["main"]
+    page = Page()
+    page.value = "07 / 29"
+    monkeypatch.setattr(session, "page", lambda: page)
+    masked.registry(session).register("0729")
+    result = await call("A", "browser_take_screenshot")
+    assert result.isError and text(result) == REFUSAL
+    assert page.captures == 0
+
+
+@pytest.mark.parametrize("shown", ["407 / 29", "07 / 294"])
+async def test_short_screenshot_guard_respects_digit_boundaries(owners, monkeypatch, shown):
+    from invisible_playwright_mcp.mcp import masked
+
+    success(await call("A", "browser_open"))
+    session = owners.entries["A"].work._open["main"]
+    page = Page()
+    page.value = shown
+    monkeypatch.setattr(session, "page", lambda: page)
+    masked.registry(session).register("0729")
+    await masked.guard_pixels(session)
+
+
+@pytest.mark.parametrize("value,shown", [("123", "123"), ("0729", "07 / 29")])
+async def test_short_value_in_snapshot_is_exactly_eight_bullets(
+        owners, monkeypatch, value, shown):
+    from invisible_playwright_mcp.mcp import masked
+
+    class SnapshotPage(Page):
+        async def evaluate_read(self, expression):
+            assert expression == actions.SNAPSHOT_JS
+            return {"interactive_elements": [{"selector": "#p", "text": shown}]}
+
+    success(await call("A", "browser_open"))
+    session = owners.entries["A"].work._open["main"]
+    monkeypatch.setattr(session, "page", lambda: SnapshotPage())
+    masked.registry(session).register(value)
+    snapshot = json.loads(success(await call("A", "browser_snapshot")))
+    assert snapshot["interactive_elements"][0]["text"] == clean.MASKED_PASSWORD
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="needs node to execute the guarded readback")
+@pytest.mark.parametrize("value,shown", [("0729", "07 / 29"), ("123456789012", "1234/5678/9012")])
+async def test_slash_readback_reports_reformatting(owners, monkeypatch, value, shown):
+    class ExpiryPage(Page):
+        async def fill(self, selector, value, **kwargs):
+            self.value = shown
+
+        async def eval_on_selector(self, selector, expression, arg=None, **kwargs):
+            if arg is None:
+                return [self.value]
+            script = (
+                "const read = " + expression + ";\n"
+                "const el = {value: " + json.dumps(self.value)
+                + ", ownerDocument: {location: {origin: " + json.dumps(ORIGIN) + "}}};\n"
+                "process.stdout.write(JSON.stringify(read(el, " + json.dumps(arg) + ")));"
+            )
+            result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True,
+                                    text=True, timeout=30, check=True)
+            return json.loads(result.stdout)
+
+    monkeypatch.setattr(actions, "GUARD_SETTLE_S", 0)
+    monkeypatch.setattr(actions, "GUARD_SINCE_START_S", 0)
+    success(await call("A", "browser_open"))
+    page = ExpiryPage()
+    monkeypatch.setattr(owners.entries["A"].work._open["main"], "page", lambda: page)
+    result = await call("A", "browser_type", {
+        "selector": "#p", "text": value, "expect_origin": ORIGIN, "mask_value": True})
+    assert success(result) == ("typed into #p; the page reformatted it, adding or "
+                               "removing only spaces, dashes, dots or slashes")
+    assert page.value == shown
 
 
 async def test_registration_precedes_the_write_and_an_empty_clear_registers_nothing(
@@ -144,11 +314,15 @@ async def test_overlapping_and_adjacent_windows_merge_without_cascading(filled):
 
 
 @pytest.mark.parametrize("fails", [False, True])
+@pytest.mark.parametrize("short", [False, True], ids=["long", "short"])
 async def test_every_registered_tool_and_a_new_tool_pass_the_result_boundary(
-        filled, monkeypatch, fails):
+        filled, monkeypatch, fails, short):
     """Walk the actual registry, not a hand-maintained list of tool names."""
     from invisible_playwright_mcp.mcp import masked
 
+    value = "07 / 29" if short else VALUE
+    if short:
+        masked.registry(filled[0]).register("0729")
     seen = []
     redact = masked.redact_result
 
@@ -160,11 +334,11 @@ async def test_every_registered_tool_and_a_new_tool_pass_the_result_boundary(
 
     async def answer() -> str:
         if fails:
-            raise ValueError(VALUE)
-        return VALUE
+            raise ValueError(value)
+        return value
 
     async def future_tool() -> str:
-        return VALUE
+        return value
 
     server.mcp.add_tool(future_tool)
     try:
@@ -183,7 +357,7 @@ async def test_every_registered_tool_and_a_new_tool_pass_the_result_boundary(
             result = await call("A", tool.name, arguments)
             assert len(seen) == before + 1, tool.name
             assert result.isError == fails
-            assert VALUE not in result.model_dump_json()
+            assert value not in result.model_dump_json()
             assert clean.MASKED_PASSWORD in text(result)
     finally:
         server.mcp.remove_tool("future_tool")
@@ -548,7 +722,7 @@ async def test_a_field_that_formats_the_value_never_shows_it(owners, monkeypatch
         "mask_value": True, "strict": True})
     if keeps:
         assert success(result) == ("typed into #n; the page reformatted it, adding or "
-                                   "removing only spaces, dashes or dots")
+                                   "removing only spaces, dashes, dots or slashes")
     else:
         assert result.isError and "the write outcome is unknown" in text(result)
     assert page.value == SPACED
@@ -620,6 +794,47 @@ async def test_real_card_field_that_groups_digits(login_page, owners, monkeypatc
         snapshot = json.loads(success(await call("A", "browser_snapshot")))
         entry = next(e for e in snapshot["interactive_elements"] if e["selector"] == "#p")
         assert entry["text"] == clean.MASKED_PASSWORD
+        result = await call("A", "browser_take_screenshot")
+        assert result.isError and text(result) == REFUSAL
+        await owner.work.close_all()
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("value,shown", [("123", "123"), ("0729", "07 / 29")])
+async def test_real_short_masked_field(login_page, owners, monkeypatch, value, shown):
+    from invisible_playwright.async_api import InvisiblePlaywright
+    from invisible_playwright_mcp.mcp.session import StealthSession
+
+    async with InvisiblePlaywright(seed=1, headless=True) as browser:
+        ctx = await browser.new_context()
+        page = await ctx.new_page()
+        await page.goto(login_page)
+        await page.evaluate("""() => {
+            const p = document.querySelector('#p');
+            p.type = 'text';
+            p.addEventListener('input', () => {
+                const digits = p.value.replace(/\\D/g, '');
+                p.value = digits.length === 4 ? digits.slice(0, 2) + ' / ' + digits.slice(2) : digits;
+            });
+        }""")
+        session = StealthSession()
+        session._context = ctx
+        owner = owners.caller("A")
+        owner.work._open["main"] = session
+        monkeypatch.setattr(actions, "GUARD_SETTLE_S", 0)
+        monkeypatch.setattr(actions, "GUARD_SINCE_START_S", 0)
+        result = await call("A", "browser_type", {
+            "selector": "#p", "text": value, "expect_origin": login_page, "mask_value": True})
+        assert success(result).startswith("typed into #p")
+        assert await page.evaluate("() => document.querySelector('#p').value") == shown
+        snapshot = json.loads(success(await call("A", "browser_snapshot")))
+        entry = next(e for e in snapshot["interactive_elements"] if e["selector"] == "#p")
+        assert entry["text"] == clean.MASKED_PASSWORD
+        for name, args in (("browser_read_text", {}), ("browser_read_html", {"mode": "form"}),
+                           ("browser_evaluate", {
+                               "expression": "() => document.querySelector('#p').value"})):
+            answer = (await call("A", name, args)).model_dump_json()
+            assert shown not in answer and value not in answer, name
         result = await call("A", "browser_take_screenshot")
         assert result.isError and text(result) == REFUSAL
         await owner.work.close_all()

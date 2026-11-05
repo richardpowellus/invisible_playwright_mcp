@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import re
+from dataclasses import dataclass
 from urllib.parse import quote, quote_plus
 
 from pydantic import BaseModel
@@ -20,7 +22,7 @@ class MaskRefusal(ValueError):
 def validate(text: str, expect_origin: str | None) -> None:
     if not expect_origin:
         raise MaskRefusal("mask_value refused: requires expect_origin; nothing was written")
-    if text and len(text) < 8:
+    if text and len(text) < 8 and not _short_digits(text):
         raise MaskRefusal(
             "mask_value refused: text must be at least 8 characters; nothing was written")
 
@@ -32,7 +34,7 @@ def _windows(text: str) -> set[str]:
 #: What a page inserts or removes when it formats a value for display: a card
 #: number shown in groups of four, a phone number, an IBAN. Separators only;
 #: a page that rewrites the characters themselves is not matched.
-SEPARATORS = frozenset("-.\u2010\u2011\u2012\u2013\u2014\u2015\u2212")
+SEPARATORS = frozenset("-./\u2010\u2011\u2012\u2013\u2014\u2015\u2212")
 
 #: Marks a window of a value with its separators removed, so it travels in the
 #: same set as the exact windows. Nine characters, and never a whole: no text
@@ -40,8 +42,29 @@ SEPARATORS = frozenset("-.\u2010\u2011\u2012\u2013\u2014\u2015\u2212")
 _BARE = "\ue000"
 
 
+@dataclass(frozen=True)
+class _ShortPattern:
+    value: str
+    separated: bool
+
+
+MaskPattern = str | _ShortPattern
+
+_JSON_SEPARATORS = "|".join(
+    f"{code:04x}" for code in range(0x10000)
+    if chr(code).isspace() or chr(code) in SEPARATORS)
+_SHORT_SEPARATORS = (
+    r"(?:[\s" + re.escape("".join(sorted(SEPARATORS))) +
+    r"]|\\[tnrf]|\\u(?i:" + _JSON_SEPARATORS + r"))*")
+
+
 def _is_separator(char: str) -> bool:
     return char.isspace() or char in SEPARATORS
+
+
+def _short_digits(value: str) -> str:
+    digits = "".join(char for char in value if not _is_separator(char))
+    return digits if len(digits) >= 3 and digits.isdigit() else ""
 
 
 def _bare_windows(value: str) -> set[str]:
@@ -65,11 +88,22 @@ def _forms(value: str) -> tuple[str, ...]:
 
 class MaskedValues:
     def __init__(self) -> None:
-        self.raw: set[str] = set()
-        self.forms: set[str] = set()
+        self.raw: set[MaskPattern] = set()
+        self.forms: set[MaskPattern] = set()
 
     def register(self, value: str) -> None:
         if not value:
+            return
+        if len(value) < 8:
+            digits = _short_digits(value)
+            if not digits:
+                return
+            pattern = _ShortPattern(digits, separated=True)
+            self.raw.add(pattern)
+            self.forms.add(pattern)
+            for form in _forms(value):
+                if _short_digits(form) != digits:
+                    self.forms.add(_ShortPattern(form, separated=False))
             return
         self.raw.update(_windows(value))
         for form in _forms(value):
@@ -113,17 +147,53 @@ def forget(session) -> None:
         current.clear()
 
 
-def result_windows(work) -> set[str]:
+def result_windows(work) -> set[MaskPattern]:
     return set().union(*(registry(s).forms for s in work._open.values()))
 
 
-def redact_text(text: str, windows: set[str]) -> str:
+def redact_text(text: str, windows: set[MaskPattern]) -> str:
     if not windows:
         return text
-    return _redact_bare(_redact_exact(text, windows), windows)
+    return _redact_short(_redact_bare(_redact_exact(text, windows), windows), windows)
 
 
-def _redact_bare(text: str, windows: set[str]) -> str:
+def _redact_short(text: str, windows: set[MaskPattern]) -> str:
+    """Mask whole short digit values, not substrings of adjacent digits."""
+    spans = []
+    for window in windows:
+        if not isinstance(window, _ShortPattern):
+            continue
+        if window.separated:
+            pattern = _SHORT_SEPARATORS.join(
+                "(?:" + "|".join(re.escape(form) for form in {
+                    char, json.dumps(char, ensure_ascii=True)[1:-1]}) + ")"
+                for char in window.value)
+        else:
+            pattern = re.escape(window.value)
+        for match in re.finditer("(?=(" + pattern + "))", text):
+            start, end = match.start(1), match.end(1)
+            if ((start and text[start - 1].isdigit())
+                    or (end < len(text) and text[end].isdigit())):
+                continue
+            spans.append((start, end))
+    if not spans:
+        return text
+    merged = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    out = []
+    copied = 0
+    for start, end in merged:
+        out.extend((text[copied:start], MASKED_PASSWORD))
+        copied = end
+    out.append(text[copied:])
+    return "".join(out)
+
+
+def _redact_bare(text: str, windows: set[MaskPattern]) -> str:
     """Mask any run whose characters, separators removed, are a registered
     value's bare window; the separators inside the run are masked with it."""
     index = [i for i, char in enumerate(text) if not _is_separator(char)]
@@ -148,10 +218,11 @@ def _redact_bare(text: str, windows: set[str]) -> str:
     return "".join(out)
 
 
-def _redact_exact(text: str, windows: set[str]) -> str:
+def _redact_exact(text: str, windows: set[MaskPattern]) -> str:
     # Whole values (register_exact) first, longest first, so one containing
     # another is masked as a unit; then the 8-character windows.
-    wholes = (w for w in windows if len(w) > 8 and not w.startswith(_BARE))
+    wholes = (w for w in windows if isinstance(w, str)
+              and len(w) > 8 and not w.startswith(_BARE))
     for whole in sorted(wholes, key=len, reverse=True):
         text = text.replace(whole, MASKED_PASSWORD)
     out = []
@@ -173,7 +244,7 @@ def _redact_exact(text: str, windows: set[str]) -> str:
     return "".join(out)
 
 
-def redact_result(result, registries: list[set[str]]):
+def redact_result(result, registries: list[set[MaskPattern]]):
     """The only result scrubber, after SDK normalization of successes/errors."""
     windows = set().union(*registries)
 

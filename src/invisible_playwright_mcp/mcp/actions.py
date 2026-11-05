@@ -1149,7 +1149,7 @@ GUARD_ATTEMPTS = 3
 _GUARDED_STATE_JS = r"""(el, expected) => {
     if (el.ownerDocument.location.origin !== expected.origin ||
         !('value' in el)) return null;
-    const bare = (s) => s.replace(/[\s.\-\u2010-\u2015\u2212]/g, '');
+    const bare = (s) => s.replace(/[\s.\/\-\u2010-\u2015\u2212]/g, '');
     const exact = el.value === expected.text;
     const kept = exact || (bare(el.value) !== '' && bare(el.value) === bare(expected.text));
     return {kept: kept, empty: el.value === '', exact: exact};
@@ -1230,7 +1230,7 @@ async def _type_on_origin(page, selector, text, expect_origin, expect_input_type
             if time.monotonic() >= until:
                 if state.get("exact") is False:
                     return (f"typed into {selector}; the page reformatted it, adding or "
-                            "removing only spaces, dashes or dots")
+                            "removing only spaces, dashes, dots or slashes")
                 return f"typed into {selector}"
             await asyncio.sleep(0.1)
 
