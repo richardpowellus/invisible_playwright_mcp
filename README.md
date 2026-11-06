@@ -174,6 +174,19 @@ The owner's `browser_open` and `browser_status` disclose a generation-bound
 Treat it as a secret; closing/reopening revokes it. See
 [owner-mode configuration and the transport trust boundary](docs/mcp-server.md#shared-mcpd-owner-mode).
 
+### CAPTCHA solving
+
+`browser_solve_captcha` uses the paid CapSolver service when the server has
+`CAPSOLVER_API_KEY` provisioned. Image mode sends the guarded image capture
+to CapSolver, types the recognised text with real keys, and optionally clicks
+submit. reCAPTCHA mode delivers a token to the widget and invokes its callback;
+this is a script-action exception, not a pointer or keyboard action. Neither
+mode confirms acceptance: snapshot the page afterwards. The companion engine
+fork must include its image solver and an async-compatible `solve_recaptcha`.
+The current synchronous engine API cannot use this server's async page and
+reCAPTCHA mode refuses until that API is available. This tool is not available
+to delegated credential-fill handles.
+
 ### Fork-only credential guard and downloads
 
 `browser_type` accepts `expect_origin` and, with it, `expect_input_type`.
