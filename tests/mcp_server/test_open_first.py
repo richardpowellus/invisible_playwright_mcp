@@ -118,6 +118,7 @@ EVERY_TOOL = [
     ("browser_snapshot", {}),
     ("browser_read_html", {}),
     ("browser_take_screenshot", {}),
+    ("browser_solve_captcha", {"input_selector": "#captcha"}),
     ("browser_watch", {}),
     ("browser_click", {"selector": "#go"}),
     ("browser_handle_dialog", {"accept": True}),

@@ -762,7 +762,7 @@ async def read_html(session, mode: str = "form", frame=None) -> str:
     return clean.clean_page(html, mode)
 
 
-async def screenshot_png(session) -> bytes:
+async def screenshot_png(session, clip=None) -> bytes:
     """Raw PNG bytes of the active tab.
 
     Bytes rather than an MCP Image, because this is also what a live view in a
@@ -771,7 +771,127 @@ async def screenshot_png(session) -> bytes:
     from .masked import guard_pixels
 
     await guard_pixels(session)
-    return await session.page().screenshot()
+    if clip is None:
+        return await session.page().screenshot()
+    return await session.page().screenshot(clip=clip)
+
+
+_CAPTCHA_CANDIDATES_JS = r"""input => {
+    const path = el => {
+        const parts = [];
+        for (; el && el.nodeType === 1; el = el.parentElement) {
+            let n = 1;
+            for (let sibling = el.previousElementSibling; sibling; sibling = sibling.previousElementSibling)
+                if (sibling.tagName === el.tagName) n++;
+            parts.unshift(el.tagName.toLowerCase() + ':nth-of-type(' + n + ')');
+        }
+        return parts.join(' > ');
+    };
+    const hint = /captcha|challenge|verification|verify|security.?code/i;
+    const matches = new Set();
+    for (let container = input.parentElement, depth = 0;
+         container && depth < 5; container = container.parentElement, depth++) {
+        if (container === input.ownerDocument.body && depth > 0) break;
+        const images = [...container.querySelectorAll('img')].filter(img => {
+            const rect = img.getBoundingClientRect();
+            const style = getComputedStyle(img);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' &&
+                style.display !== 'none' && (typeof img.checkVisibility !== 'function' ||
+                img.checkVisibility({opacityProperty: true, visibilityProperty: true})) && hint.test([
+                    img.id, img.className, img.getAttribute('src'),
+                    img.getAttribute('alt'), img.getAttribute('title'),
+                    container.id, container.className
+                ].join(' '));
+        });
+        for (const image of images) matches.add(image);
+        if (container.tagName === 'FORM' || container === input.ownerDocument.body) break;
+    }
+    return [...matches].map(path);
+}"""
+
+_CAPTCHA_IMAGE_JS = """el => ({
+    tag: el.tagName, connected: el.isConnected, src: el.currentSrc,
+    origin: el.ownerDocument.defaultView.performance.timeOrigin,
+    url: el.ownerDocument.location.href
+})"""
+
+
+async def solve_captcha(session, kind="image", image_selector=None, input_selector=None,
+                        submit_selector=None, module=None, case_sensitive=False, frame=None):
+    """Solve a CAPTCHA on the selected page without claiming site acceptance."""
+    if not os.environ.get("CAPSOLVER_API_KEY", "").strip():
+        raise ValueError("CAPSOLVER_API_KEY is not provisioned to the server")
+    if kind == "recaptcha":
+        if frame or image_selector is not None or input_selector is not None or submit_selector is not None:
+            raise ValueError("reCAPTCHA detects its own frames; image selectors and frame are not supported")
+        if module is not None or case_sensitive:
+            raise ValueError("module and case_sensitive apply only to image CAPTCHAs")
+        from invisible_playwright.recaptcha import solve_recaptcha_async
+
+        result = await solve_recaptcha_async(session.page())
+        return ("reCAPTCHA token delivered: %s response field(s), callback %s. "
+                "The challenge was not confirmed; snapshot to check the page."
+                % (result.fields_filled,
+                   "%s called" % result.callback_called if result.callback_called else "not called"))
+    if kind != "image":
+        raise ValueError("kind must be 'image' or 'recaptcha'")
+    if not input_selector or not input_selector.strip():
+        raise ValueError("input_selector is required for an image CAPTCHA")
+    if image_selector is not None and not image_selector.strip():
+        raise ValueError("image_selector must not be empty")
+    if submit_selector is not None and not submit_selector.strip():
+        raise ValueError("submit_selector must not be empty")
+
+    target = await frame_target(session, frame)
+    field = target.locator(input_selector)
+    if await field.count() != 1:
+        raise ValueError("input_selector must match exactly one element")
+    if image_selector is None:
+        candidates = await field.evaluate(_CAPTCHA_CANDIDATES_JS)
+        if len(candidates) != 1:
+            raise ValueError("Cannot unambiguously detect a CAPTCHA image near %s; candidates: %s. "
+                             "Pass image_selector." % (input_selector, json.dumps(candidates)))
+        image_selector = candidates[0]
+    image = target.locator(image_selector)
+    if await image.count() != 1:
+        raise ValueError("image_selector must match exactly one image")
+    identity = await image.evaluate(_CAPTCHA_IMAGE_JS)
+    if identity["tag"] != "IMG" or not identity["connected"]:
+        raise ValueError("image_selector must match a connected <img>")
+    if submit_selector is not None and await target.locator(submit_selector).count() != 1:
+        raise ValueError("submit_selector must match exactly one element")
+
+    await image.scroll_into_view_if_needed()
+    box = await image.bounding_box()
+    if not box or box["width"] <= 0 or box["height"] <= 0:
+        raise ValueError("CAPTCHA image is not visible")
+    scroll = await _read(session.page(), "() => ({x: window.scrollX, y: window.scrollY})")
+    clip = {**box, "x": box["x"] + scroll["x"], "y": box["y"] + scroll["y"]}
+    png = await screenshot_png(session, clip=clip)
+    if await image.count() != 1 or await image.evaluate(_CAPTCHA_IMAGE_JS) != identity:
+        raise RuntimeError("CAPTCHA image or document changed during capture; nothing was sent")
+    from invisible_playwright.recaptcha import solve_image_text
+
+    text = await asyncio.to_thread(solve_image_text, png, module=module, case_sensitive=case_sensitive)
+    if not isinstance(text, str) or not text.strip():
+        raise RuntimeError("CAPTCHA solver returned no recognised text; nothing was typed")
+    target = await frame_target(session, frame)
+    image = target.locator(image_selector)
+    if await image.count() != 1 or await image.evaluate(_CAPTCHA_IMAGE_JS) != identity:
+        raise RuntimeError("CAPTCHA image or document changed during solving; nothing was typed")
+    if await target.locator(input_selector).count() != 1:
+        raise RuntimeError("CAPTCHA input changed during solving; nothing was typed")
+    typed = await type_text(session, input_selector, text, frame=frame)
+    state = await _field_state(target, input_selector)
+    if state.get("value") != text:
+        return ("Recognised %s; %s. Submit was not clicked because the input did not retain the answer. "
+                "Snapshot to check the page." % (json.dumps(text), typed))
+    if submit_selector is not None:
+        if await target.locator(submit_selector).count() != 1:
+            raise RuntimeError("CAPTCHA answer was typed, but submit_selector no longer matches exactly one element")
+        await click(session, submit_selector, frame=frame)
+    return ("Recognised %s; %s; submit %s. The challenge was not confirmed; snapshot to check the page."
+            % (json.dumps(text), typed, "clicked" if submit_selector is not None else "not clicked"))
 
 
 # --- acting ----------------------------------------------------------------

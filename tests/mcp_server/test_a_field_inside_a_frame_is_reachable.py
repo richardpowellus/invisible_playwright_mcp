@@ -39,7 +39,8 @@ def test_a_malformed_frame_is_refused_before_the_page_is_asked(bad):
 
 
 def test_every_selector_tool_declares_it():
-    for tool in (server.browser_type, server.browser_click, server.browser_select_option,
+    for tool in (server.browser_type, server.browser_click, server.browser_solve_captcha,
+                 server.browser_select_option,
                  server.browser_evaluate, server.browser_read_html):
         params = inspect.signature(tool).parameters
         assert "frame" in params and params["frame"].default is None, tool.__name__

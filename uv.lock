@@ -1,11 +1,11 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
     "python_full_version >= '3.14' and sys_platform != 'win32'",
-    "python_full_version < '3.14' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
+    "python_full_version < '3.14' and sys_platform == 'win32'",
     "(python_full_version < '3.12' and sys_platform == 'emscripten') or (python_full_version < '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32')",
 ]
 
@@ -563,7 +563,7 @@ wheels = [
 
 [[package]]
 name = "invisible-core"
-version = "49.44.0"
+version = "55.50.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "maxminddb" },
@@ -572,14 +572,14 @@ dependencies = [
     { name = "requests", extra = ["socks"] },
     { name = "tzdata" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/54/20/335e727c3e8dbb4cd0347e160f37d28d180be51e7ec285bc6725e269801f/invisible_core-49.44.0.tar.gz", hash = "sha256:4cb8011aa98dd1d22a9c19f941c061359aad4fde29e5377431b398f571d6910d", size = 1411691, upload-time = "2026-10-17T07:28:08.657Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e8/c6/e168853492fabd92cf9dc619712ea1f17c5bbe266464f3a048fdaf276434/invisible_core-55.50.0.tar.gz", hash = "sha256:11d0e208ad563f70bafcf8bee3f1d00fd0ebfe8de83d5f96f8890c18f31b01d3", size = 1528935, upload-time = "2026-11-04T03:42:13.586Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5b/68/642280a0bcabe51ce5179194b583e334b1e1596a53da0389c500127cae34/invisible_core-49.44.0-py3-none-any.whl", hash = "sha256:ab0c7b9009ab2a868ac7b43ffc24d1fa0dbb53cb5942fa8b803b38aa7640c1ec", size = 1028264, upload-time = "2026-10-17T07:28:07.091Z" },
+    { url = "https://files.pythonhosted.org/packages/77/12/a7b080ba35753691db595fb37387aa0baa5fba5cf4c91c23252235f6881f/invisible_core-55.50.0-py3-none-any.whl", hash = "sha256:0209514bc407154c106f4ac34c72da5c7ac1a2e364df409d26ce3505e26184e8", size = 1088304, upload-time = "2026-11-04T03:42:12.119Z" },
 ]
 
 [[package]]
 name = "invisible-playwright"
-version = "0.37.0"
+version = "0.45.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "greenlet" },
@@ -587,14 +587,14 @@ dependencies = [
     { name = "psutil" },
     { name = "pyee" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6b/a2/e3591aeee2cbc6f78e2e4194a87b168741ba3ebcc9f2bca5d2fbb1fb995d/invisible_playwright-0.37.0.tar.gz", hash = "sha256:4ea8ed5f5c65f64b98f4ae4a1991d0871500ac2b2d777f81a537e98cf10ee2dc", size = 1103508, upload-time = "2026-10-17T11:42:20.092Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/88/06/611597466992c2149ade202362d1ff4c143214413ca0ee24b6a56a0d65d4/invisible_playwright-0.45.0.tar.gz", hash = "sha256:20828da0b2ae20fc54b279917b0805509a8f00b98e5c0f30e056341f3ba36243", size = 1137105, upload-time = "2026-11-04T04:34:17.092Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b1/b7/86eddae354be1ca0cb2a6ad9e45c07dd2f64341097ebee0bc2daf5a64764/invisible_playwright-0.37.0-py3-none-any.whl", hash = "sha256:7b29b1ca2cc66791aed98a357f70f609f8c603e568bdf0071e527ab147847279", size = 603115, upload-time = "2026-10-17T11:42:18.313Z" },
+    { url = "https://files.pythonhosted.org/packages/99/40/631885aab6efb09afcdd40cc85bd33dfa7c67c40105a961bdb6381dbf33d/invisible_playwright-0.45.0-py3-none-any.whl", hash = "sha256:4f5c622891208ef2119e5d9c6e54044e4b1ffd430ed278be84d664bbdd86bb68", size = 609374, upload-time = "2026-11-04T04:34:15.34Z" },
 ]
 
 [[package]]
 name = "invisible-playwright-mcp"
-version = "0.71.0+fork.1"
+version = "0.73.0+fork.1"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
@@ -623,7 +623,7 @@ requires-dist = [
     { name = "click", specifier = ">=8.1" },
     { name = "httpx", marker = "extra == 'test'", specifier = ">=0.27" },
     { name = "invisible-core", marker = "extra == 'test'", specifier = ">=34.31.0" },
-    { name = "invisible-playwright", specifier = ">=0.32.0" },
+    { name = "invisible-playwright", specifier = ">=0.41.0" },
     { name = "mcp", specifier = ">=1.30,<2" },
     { name = "openai", specifier = ">=1.30" },
     { name = "pydantic", specifier = ">=2" },

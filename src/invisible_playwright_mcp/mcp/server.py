@@ -329,8 +329,9 @@ says the browser is gone, call browser_open again and carry on."""
 # answered it. And going back or loading a page again has no tool here: a key
 # pressed on the page never reaches the browser's own shortcuts, so a
 # navigation is the way, and one to the page's own address loads it again.
-PAGE_RULES = """Drive the page the way a person would. Everything here goes
-through the real pointer and the real keyboard.
+PAGE_RULES = """Drive the page the way a person would. Interactions go through
+the real pointer and the real keyboard, except browser_solve_captcha's reCAPTCHA
+mode, which delivers a service token to the widget's response and callback.
 
 Dialogs are never dismissed silently: to accept one, arm browser_handle_dialog
 then do the action. Image results leave dialog news for the next text result
@@ -971,6 +972,31 @@ async def browser_type(selector: str, text: str, browser: Browser = None,
     if frame is not None:
         guard["frame"] = frame
     return await _work().typing(actions.type_text, selector, text, role=browser, **guard)
+
+
+@mcp.tool(annotations=_says("Solve a CAPTCHA", destructive=True))
+async def browser_solve_captcha(kind: Literal["image", "recaptcha"] = "image",
+                                image_selector: str | None = None,
+                                input_selector: str | None = None,
+                                submit_selector: str | None = None,
+                                module: str | None = None,
+                                case_sensitive: Annotated[bool, Field(strict=True)] = False,
+                                frame: FrameChain = None,
+                                browser: Browser = None) -> str:
+    """Solve a CAPTCHA using CapSolver, which must be provisioned on the server.
+
+    Image mode requires input_selector. Give image_selector or let it detect
+    an unambiguous nearby CAPTCHA image. It sends a guarded image capture to
+    CapSolver, types the answer with real keys, and clicks submit_selector
+    with the real pointer if given. module and case_sensitive are CapSolver
+    image options. frame is the snapshot's frame chain.
+
+    reCAPTCHA mode detects the widget and injects its service token and invokes
+    its callback; it does not explicitly submit. It does not use selectors or frame.
+    Neither mode confirms acceptance: snapshot the page afterwards."""
+    return await _work().acting(
+        actions.solve_captcha, kind, image_selector, input_selector, submit_selector,
+        module, case_sensitive, frame, role=browser)
 
 
 @mcp.tool(annotations=_says("Choose a dropdown option", destructive=True))
