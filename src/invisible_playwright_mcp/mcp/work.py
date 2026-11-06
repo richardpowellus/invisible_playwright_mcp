@@ -602,10 +602,15 @@ class Work:
         # live-pane clients consume a single frame. Keep bytes/Image intact;
         # retain news for the next string result or browser_status instead.
         if isinstance(answer, str):
-            news = session.dialog_news()
+            news = "\n".join(line for line in (
+                session.dialog_news(), await self.print_news(session)) if line)
             if news:
                 return news + "\n" + answer
         return answer
+
+    async def print_news(self, session) -> str:
+        """A print the page started, kept as a PDF and said; see print_prefs."""
+        return await actions.collect_print(session, self._download_env)
 
     async def typing(self, fn: Callable[..., Awaitable], selector: str, text: str,
                      role: Optional[str] = None, **kwargs) -> str:
@@ -826,7 +831,8 @@ class Work:
         async def dialogs():
             if isinstance(session, StealthSession):
                 await session.settle_dialogs()
-                return session.dialog_status()
+                printed = await self.print_news(session)
+                return session.dialog_status() + ("\n" + printed if printed else "")
             return ""
 
         try:

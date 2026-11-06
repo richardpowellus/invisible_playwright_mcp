@@ -180,7 +180,7 @@ a browser gets when nobody says anything.
 `browser_navigate`, `browser_read_text`, `browser_snapshot`, `browser_read_html`,
 `browser_take_screenshot`, `browser_watch`, `browser_click`, `browser_click_at`,
 `browser_type`, `browser_select_option`, `browser_press_key`,
-`browser_upload_files`, `browser_download`, `browser_evaluate`,
+`browser_upload_files`, `browser_download`, `browser_print_pdf`, `browser_evaluate`,
 `browser_network`, `browser_network_clear`, `browser_set_viewport`,
 `browser_handle_dialog`,
 `browser_cookies_export` (fork-only, credential-bearing).
@@ -496,6 +496,24 @@ watch reads discard cached frames before checking. The same plain-form
 limitation as masked fills applies: this is not a sandbox against page code
 computing other encodings of a value.
 
+### Printing
+
+`window.print()` never opens a dialog. Firefox's print preview would hold the
+page's script inside `print()` until somebody answered it, wedging every later
+click, navigation and resize until `browser_close` (seen 2026-11-06 on a Print
+button). Every browser is launched with silent print-to-PDF preferences
+instead, so a page's own Print button saves the PDF into the caller's download
+directory. The file lands just after `print()` returns, so the click itself
+answers only `clicked`; the next text result (or `browser_status`) reports it:
+
+```text
+print: the page called window.print(); no dialog opened. Saved the page as a PDF: /.../Account Status.pdf (27003 bytes).
+```
+
+`browser_print_pdf` does the same on demand and answers like `browser_download`.
+The file is named after the page title unless `filename` is given. With
+downloads off, a page's print is discarded and the news says so.
+
 ### Native dialogs
 
 `browser_handle_dialog(accept, prompt_text=null, timeout_seconds=60)` arms the
@@ -567,9 +585,9 @@ in Python. An incomplete or failed check refuses. Clearing the field and removin
 mirrored text allows capture again. Existing live watches stop before a masked
 write; subsequent allowed watches capture fresh frames and stop rather than
 retaining a continuous stream. Fill handles may call `browser_take_screenshot`
-so credential fillers can positively verify this refusal. This server has no
-page-to-PDF or other screenshot-option tool; `browser_download` saves downloaded
-documents, not rendered page pixels.
+so credential fillers can positively verify this refusal. `browser_print_pdf`
+prints the page through the browser's own print path, not a screenshot option;
+`browser_download` saves downloaded documents, not rendered page pixels.
 
 Known limit: page scripts and `browser_evaluate` can still compute over `.value`,
 such as `btoa`, or expose fragments shorter than eight characters. Redaction
@@ -596,6 +614,7 @@ only for the file is closed. The result is JSON with `saved`, `filename`,
 | `browser_type` | `selector`, `text`, `expect_origin`, `expect_input_type`, `mask_value` (default false) | Plain typing uses human-paced keys and reports what the field kept; long typing continues in the background. Origin-locked fills use guarded native autofill with terminal readback. `mask_value` protects concealed text in owner results and guards page captures; see the contract above. |
 | `browser_select_option` | `selector`, `value` | Chooses an option in a `<select>`, by its visible label or by its value. |
 | `browser_upload_files` | `selector`, `paths` | Attaches local files to a file input the way a person picks them: the input, or the button or label that opens its chooser, is clicked with the real pointer and the chooser is answered with `paths`. A hidden input is opened by clicking its label, and one with no label is refused with a request for the button that opens it: a hidden input is never fed files no click opened. The chooser is answered after the time a person takes to pick a file. Off unless `INVISIBLE_MCP_UPLOAD_DIRS` names the directories files may come from (absolute, separated by `:`, `;` on Windows); a path must be a regular file inside one of them, under no hidden directory, at most 50 MB, and on Windows never an alternate data stream (`a.pdf:Zone.Identifier`). The private copies sent to the browser are removed when it closes. |
+| `browser_print_pdf` | `filename`, `save_to`, `timeout_seconds` (default 30, at most 120) | Prints the page to a PDF the way the browser's own Print does (print styles, page breaks, header and footer) and keeps it like `browser_download`: same `save_to` rules, never overwrites, JSON with `saved`, `filename`, `size`, `mime`, `sha256`, `url`, `from`. See [printing](#printing). |
 | `browser_press_key` | `key` | Presses a key on whatever has focus: `Enter`, `Tab`, `Escape`, `ArrowDown`, `Control+a`, or a single character. |
 | `browser_set_viewport` | `width`, `height` (both or neither) | Resizes the page's content area to that many CSS pixels, for responsive checks; neither restores the browser's own size. Answers JSON with the size the page now reads, the window and the screen. Larger than the browser's own screen is refused. See [resizing the page](#resizing-the-page). |
 | `browser_evaluate` | `expression` | Runs JavaScript to **read** from the page and returns the result as JSON: a computed style, a value held in a framework's state, the length of a list. |

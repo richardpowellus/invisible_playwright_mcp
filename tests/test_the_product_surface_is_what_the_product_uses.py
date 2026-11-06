@@ -292,8 +292,8 @@ def test_the_gate_is_looking_at_the_whole_package():
     # and Work._download_env. Always-on file-chooser interception adds
     # StealthSession._arm_choosers.
     # Native dialogs add eight session methods and Work._dialog_result:
-    # 136 methods now meet the same exclusions.
-    assert methods <= 136, "%d methods judged; the exclusions have stopped applying" % methods
+    # 136 methods now meet the same exclusions. Printing adds Work.print_news: 137.
+    assert methods <= 137, "%d methods judged; the exclusions have stopped applying" % methods
     reached = set()
     for text in sources.values():
         reached.update(_on_an_object(ast.parse(text), known))

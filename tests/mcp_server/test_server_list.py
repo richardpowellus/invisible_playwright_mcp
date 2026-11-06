@@ -56,6 +56,9 @@ async def test_server_registers_expected_tools():
         # so an upload was the end of the road - or a DataTransfer built in
         # script, which is the untrusted change this package exists to avoid.
         "browser_upload_files", "browser_download",
+        # Added 2026-11-06: window.print() wedged the browser, and a PDF of
+        # the page is what a Print button was for.
+        "browser_print_pdf",
     }
     # EXACT, not a subset. `expected <= names` passed while a tool nobody
     # meant to publish sat in the list, and the surface of an MCP server is

@@ -1028,6 +1028,24 @@ async def browser_download(selector: str | None = None, x: float | None = None,
                                 save_to, role=browser)
 
 
+@mcp.tool(annotations=_says("Save the page as a PDF", open_world=False))
+async def browser_print_pdf(filename: str | None = None, save_to: str | None = None,
+                            timeout_seconds: float = 30,
+                            browser: Browser = None) -> str:
+    """Print this page to a PDF file, as the browser's own Print does (print
+    styles, page breaks, headers and footers), and keep it.
+
+    window.print() never opens a dialog here: a page's own Print button saves
+    the same PDF into your download dir and the next text result says where.
+
+    `filename` defaults to the page title. `save_to` and the answer follow
+    browser_download: JSON with saved, filename, size, mime, sha256, url and
+    from, plus host and fetch when the file is on another machine than yours.
+    Never overwrites."""
+    return await _work().acting(actions.print_pdf, filename, save_to, timeout_seconds,
+                                role=browser)
+
+
 @mcp.tool(annotations=_says("Press a key", destructive=True))
 async def browser_press_key(key: str, browser: Browser = None) -> str:
     """Press a key on whatever has focus: "Enter", "Tab", "Escape",

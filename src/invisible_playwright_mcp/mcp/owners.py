@@ -332,11 +332,24 @@ class OwnerWork(Work):
                 "Download refused. Use only your download dir: %s" % self.download_dir
                 + actions.remote_dir_lines(download_dir=self.download_dir).replace("\n", ". ")) from None
 
+    async def _print_pdf(self, session, *args, **kwargs) -> str:
+        env = self._download_env()
+        try:
+            return await actions.print_pdf(session, *args, **kwargs, env=env)
+        except actions.DownloadDirectoryError:
+            raise RuntimeError("downloads are off: your download directory is unavailable.") from None
+        except PermissionError:
+            raise PermissionError(
+                "Print refused. Use only your download dir: %s" % self.download_dir
+                + actions.remote_dir_lines(download_dir=self.download_dir).replace("\n", ". ")) from None
+
     async def _act(self, at: str, fn, *args, **kwargs):
         if fn is actions.upload_files:
             fn = self._upload_files
         elif fn is actions.download:
             fn = self._download
+        elif fn is actions.print_pdf:
+            fn = self._print_pdf
         return await super()._act(at, fn, *args, **kwargs)
 
     async def _start(self, role: str, settings: dict) -> StealthSession:

@@ -169,6 +169,7 @@ const VERB = {
   browser_select_option:['Choosing','Chose'],
   browser_upload_files:['Uploading','Uploaded'],
   browser_download:['Downloading','Downloaded'],
+  browser_print_pdf:['Printing to PDF','Printed to PDF'],
   browser_handle_dialog:['Arming dialog response','Armed dialog response'],
   browser_open:['Opening browser','Opened browser'],
   browser_close:['Closing browser','Closed browser'],

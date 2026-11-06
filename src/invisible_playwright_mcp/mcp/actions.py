@@ -35,6 +35,7 @@ from pathlib import Path
 from invisible_playwright.async_api import Error
 
 from . import certificates, clean, lan, process
+from .session import PRINT_FILE
 from ..quiet import swallow
 
 # ⛔ NO CAP ON ANY ANSWER, since 0.72.0. `DEFAULT_MAX_CHARS` (6000) cut the
@@ -2341,6 +2342,111 @@ async def download(session, selector=None, x=None, y=None,
         "from": {"download": "the browser's download", "page": "the document the page showed",
                  "viewer": "the PDF the browser's viewer showed"}[how],
         "url": url, "notes": notes, **remote_file(saved["path"])}, ensure_ascii=False)
+
+
+PRINT_TIMEOUT_MAX_S = 120
+
+
+def _whole_pdf(path: str) -> int:
+    """The size of a finished PDF at `path`, or 0 while it is absent, empty or
+    still being written (no `%%EOF` in its tail yet)."""
+    try:
+        with open(path, "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            if size < 8 or f.read(5) != b"%PDF-":
+                return 0
+            f.seek(max(0, size - 1024))
+            return size if b"%%EOF" in f.read() else 0
+    except OSError:
+        return 0
+
+
+async def _printed(session, deadline: float):
+    """The path of the PDF the browser's silent print finished, once its size
+    holds still, or None by `deadline`."""
+    prints = getattr(session, "prints", None)
+    if not prints:
+        return None
+    path, last = os.path.join(prints, PRINT_FILE), 0
+    while True:
+        size = _whole_pdf(path)
+        if size and size == last:
+            return path
+        last = size
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(0.2)
+
+
+def _keep_print(path: str, name: str, save_to=None, *, env=None) -> dict:
+    directory = download_target(save_to, env=env)
+    name = safe_filename(name, "page")
+    if not name.lower().endswith(".pdf"):
+        name += ".pdf"
+    # Read as a download is: refused unless the file really is inside this
+    # caller's own download root, so a replaced print directory cannot hand
+    # over another owner's PDF.
+    with closing(_read_chunks(path, env=env)) as chunks:
+        saved = save_download(directory, name, chunks, env=env)
+    os.unlink(path)
+    return saved
+
+
+async def _print_name(session) -> str:
+    title = ""
+    with swallow("a page that will not give its title is saved as page.pdf"):
+        title = await asyncio.wait_for(session.page().title(), 5)
+    return title or "page"
+
+
+async def collect_print(session, download_env=lambda: None) -> str:
+    """The news line for a print the PAGE started (its own Print button), with
+    the PDF moved where downloads are kept; "" when nothing was printed.
+    `download_env` is the caller's download roots, asked for only when a print
+    is there, so an owner with downloads off refuses rather than falling back."""
+    prints = getattr(session, "prints", None)
+    if not prints or not os.path.exists(os.path.join(prints, PRINT_FILE)):
+        return ""
+    path = await _printed(session, time.monotonic() + 10)
+    if path is None:
+        return "print: the page called window.print(); its PDF is still being written."
+    try:
+        saved = _keep_print(path, await _print_name(session), env=download_env())
+    except Exception as exc:  # downloads off, or the root unavailable
+        with swallow("a print that cannot be kept must not be kept half"):
+            os.unlink(path)
+        return f"print: the page called window.print(); its PDF was not kept: {exc}"
+    where = remote_file(saved["path"])
+    return ("print: the page called window.print(); no dialog opened. Saved the page "
+            f"as a PDF: {saved['path']} ({saved['size']} bytes)"
+            + (f". {where['where']}" if where else "") + ".")
+
+
+async def print_pdf(session, filename=None, save_to=None,
+                    timeout_seconds: float = 30, *, env=None) -> str:
+    """Print this page to a PDF, as the browser's own Print would, and keep it."""
+    if not 0 < float(timeout_seconds) <= PRINT_TIMEOUT_MAX_S:
+        raise ValueError(f"timeout_seconds is above 0 and at most {PRINT_TIMEOUT_MAX_S}")
+    download_target(save_to, env=env)  # refuse before printing, not after
+    prints = getattr(session, "prints", None)
+    if not prints or not os.path.isdir(prints):
+        raise RuntimeError("this browser was opened without print-to-PDF; "
+                           "browser_close it and browser_open it again")
+    page = session.page()
+    with swallow("a stale print is replaced by this one"):
+        os.unlink(os.path.join(prints, PRINT_FILE))
+    # Silent print: print() returns once the job is spooled, with no dialog.
+    await page.evaluate("() => window.print()")
+    path = await _printed(session, time.monotonic() + float(timeout_seconds))
+    if path is None:
+        raise RuntimeError(f"the browser did not finish printing {page.url} within "
+                           f"{float(timeout_seconds):g} s; nothing was saved")
+    saved = _keep_print(path, filename or await _print_name(session), save_to, env=env)
+    return json.dumps({
+        "saved": saved["path"], "filename": saved["filename"], "size": saved["size"],
+        "mime": "application/pdf", "sha256": saved["sha256"],
+        "from": "the browser's print of the page", "url": page.url,
+        **remote_file(saved["path"])}, ensure_ascii=False)
 
 
 async def press_key(session, key: str) -> str:
