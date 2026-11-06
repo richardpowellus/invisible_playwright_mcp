@@ -60,6 +60,8 @@ class StealthSession:
         # sends it, so they must last exactly as long as the browser does.
         self._kept: list[str] = []
         self.downloads: str | None = None
+        # Where Firefox's silent print writes `PRINT_FILE` (see print_prefs).
+        self.prints: str | None = None
         self._download_root = download_root
         self.network = network.Network(network_limits)
         # The identity's own content-area size, remembered by
@@ -94,9 +96,13 @@ class StealthSession:
 
     async def start(self) -> None:
         self.downloads = tempfile.mkdtemp(prefix="invisible-downloads-", dir=self._download_root)
+        # A directory of its own, beside the landing area, so a print is never
+        # mistaken for a download nor a download for a print.
+        self.prints = tempfile.mkdtemp(prefix="invisible-prints-", dir=self._download_root)
         kwargs = dict(self._kwargs)
         kwargs["extra_prefs"] = {**(kwargs.get("extra_prefs") or {}),
-                                 **download_prefs(self.downloads)}
+                                 **download_prefs(self.downloads),
+                                 **print_prefs(self.prints)}
         try:
             if self.cert_pins:
                 await asyncio.to_thread(
@@ -111,6 +117,12 @@ class StealthSession:
             raise
 
     def _drop_downloads(self) -> None:
+        if self.prints:
+            if os.path.islink(self.prints):
+                os.unlink(self.prints)
+            elif os.path.exists(self.prints):
+                shutil.rmtree(self.prints)
+            self.prints = None
         if self.downloads:
             if os.path.islink(self.downloads):
                 os.unlink(self.downloads)
@@ -549,4 +561,28 @@ def download_prefs(directory: str) -> dict:
         "browser.download.useDownloadDir": True,
         "browser.download.always_ask_before_handling_new_types": False,
         "browser.download.alwaysOpenPanel": False,
+    }
+
+
+#: The one name Firefox's silent print writes; collected and renamed after.
+PRINT_FILE = "page.pdf"
+
+
+def print_prefs(directory: str) -> dict:
+    """Make window.print() save a PDF silently instead of opening a dialog.
+
+    ⛔ WITHOUT THESE, window.print() WEDGES THE BROWSER. Firefox opens its
+    print preview and the page's script waits inside print() until somebody
+    answers it, which nobody here can: the click that called it fails with
+    "the page did not handle mouse event", and every later click, navigation
+    and resize hangs until browser_close (Texas Comptroller account-status
+    page, 2026-11-06; reproduced headless and headed). Saving to a file is
+    what a person printing a page for a record wants anyway."""
+    return {
+        "print.always_print_silent": True,
+        "print.show_print_progress": False,
+        "print_printer": "Mozilla Save to PDF",
+        "print.printer_Mozilla_Save_to_PDF.print_to_file": True,
+        "print.printer_Mozilla_Save_to_PDF.print_to_filename":
+            os.path.join(os.path.abspath(directory), PRINT_FILE),
     }
