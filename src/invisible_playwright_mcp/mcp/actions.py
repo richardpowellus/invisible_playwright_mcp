@@ -1140,7 +1140,10 @@ async def drag_path(session, strokes: list) -> bytes:
         await page.mouse.down()
         try:
             for point in stroke[1:]:
-                await page.mouse.move(point[0], point[1])
+                await page.mouse._channel.send(
+                    "mouseMove", None,
+                    {"x": float(point[0]), "y": float(point[1]),
+                     "buttons": 1})
         finally:
             await page.mouse.up()
         await page.wait_for_timeout(80)
