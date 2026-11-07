@@ -1140,7 +1140,7 @@ async def drag_path(session, strokes: list) -> bytes:
         await page.mouse.down()
         try:
             for point in stroke[1:]:
-                await page.mouse._channel.send(
+                await page.mouse._impl_obj._channel.send(
                     "mouseMove", None,
                     {"x": float(point[0]), "y": float(point[1]),
                      "buttons": 1})
