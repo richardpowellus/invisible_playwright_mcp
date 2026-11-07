@@ -59,6 +59,7 @@ async def test_server_registers_expected_tools():
         # Added 2026-11-06: window.print() wedged the browser, and a PDF of
         # the page is what a Print button was for.
         "browser_print_pdf", "browser_solve_captcha",
+        "browser_drag",
     }
     # EXACT, not a subset. `expected <= names` passed while a tool nobody
     # meant to publish sat in the list, and the surface of an MCP server is
