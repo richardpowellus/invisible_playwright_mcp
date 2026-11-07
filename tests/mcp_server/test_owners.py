@@ -888,3 +888,70 @@ async def test_a_fill_handle_can_click_on_main(owners, monkeypatch):
     assert not result.isError, text(result)
     assert touched == [a]
     assert "filler" not in owners.entries
+
+
+async def test_idle_reap_reason_surfaces_in_next_tool_call(owners):
+    """After idle reap removes a browser, the next tool call tells the caller
+    WHY it is gone, not just that it is.
+
+    Regression: 2026-11-07, Table Top Meat Co. Accounting — browser_type on
+    an MFA field succeeded, then browser_press_key immediately after got
+    'the main browser is not open' with no reason. The whole Ramp + Intuit
+    login (two SMS MFAs) was lost to one unhelpful sentence.
+    """
+    now = [0.0]
+    owners.clock = lambda: now[0]
+    success(await call("A", "browser_open"))
+
+    now[0] = owners.idle_seconds + 1
+    await owners.reap_idle()
+
+    # The entry was removed; caller() creates a fresh one with stale reasons.
+    result = await call("A", "browser_press_key", {"key": "Enter"})
+    assert result.isError
+    msg = text(result)
+    assert "idle timeout" in msg, (
+        "expected 'idle timeout' in %r — the caller must be told WHY" % msg)
+    assert "browser_open" in msg
+
+
+async def test_session_ended_blocks_with_descriptive_error(owners):
+    """session_ended puts the identity in the ended set; caller() blocks with
+    a message that already says WHY (no stale-reason carry needed)."""
+    success(await call("A", "browser_open"))
+    await owners.session_ended("A")
+
+    result = await call("A", "browser_press_key", {"key": "Enter"})
+    assert result.isError
+    msg = text(result)
+    assert "session has ended" in msg
+
+
+async def test_idle_reap_reason_surfaces_in_browser_list(owners):
+    """browser_list notes the reason when no browsers are open after idle reap."""
+    now = [0.0]
+    owners.clock = lambda: now[0]
+    success(await call("A", "browser_open"))
+
+    now[0] = owners.idle_seconds + 1
+    await owners.reap_idle()
+
+    result = await call("A", "browser_list")
+    note = json.loads(success(result))["note"]
+    assert "idle timeout" in note
+
+
+async def test_removal_reason_cleared_on_reopen(owners):
+    """Opening a browser clears any stale removal reason for that role."""
+    now = [0.0]
+    owners.clock = lambda: now[0]
+    success(await call("A", "browser_open"))
+
+    now[0] = owners.idle_seconds + 1
+    await owners.reap_idle()
+
+    # Reopen — the stale reason should be consumed and cleared.
+    success(await call("A", "browser_open"))
+    result = await call("A", "browser_list")
+    browsers = json.loads(success(result))["browsers"]
+    assert len(browsers) == 1

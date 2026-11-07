@@ -155,6 +155,9 @@ class OwnerWork(Work):
         #: Browsers the sweep dropped because their Firefox exited: the
         #: owner's next call is told GONE once, not "not open".
         self.lost: set[str] = set()
+        #: Why a browser was last removed, by role. Persists until the role
+        #: is reopened or the reason is consumed by session()/listing().
+        self._removal_reasons: dict[str, str] = {}
         self.fill_handle: str | None = None
         self.upload_dir: Path | None = None
         self.download_dir: Path | None = None
@@ -186,6 +189,7 @@ class OwnerWork(Work):
             raise ValueError("Persistent profile arguments are refused in owner mode; "
                              "leave profile out for an ephemeral browser.")
         self.lost.discard(role)
+        self._removal_reasons.pop(role, None)
         result = await super().open(role, seed=seed, proxy=proxy, profile=profile,
                                     accept_lan_certs=accept_lan_certs)
         if self.upload_dir is not None:
@@ -386,7 +390,9 @@ class OwnerWork(Work):
             self.registry.handles.pop(self.registry.handle_hash(self.fill_handle), None)
             self.fill_handle = None
 
-    async def _drop(self, role: str) -> None:
+    async def _drop(self, role: str, *, reason: str = "") -> None:
+        if reason and (role in self._open or role in self.profiles):
+            self._removal_reasons[role] = reason
         rec = self._typing.pop(role, None)
         if rec is not None:
             rec.task.cancel()
@@ -417,6 +423,8 @@ class OwnerWork(Work):
     def gone(self, role: str, cause: BaseException | None = None) -> RuntimeError:
         self.report_gone(role, cause)
         self.dead.add(role)
+        if cause is not None:
+            self._removal_reasons[role] = str(cause)[:200]
         if role == DEFAULT_BROWSER_ID:
             self.revoke()
         return RuntimeError(GONE % role)
@@ -426,7 +434,17 @@ class OwnerWork(Work):
             raise RuntimeError(GONE % role)
         if role in self.lost and role not in self._open:
             self.lost.discard(role)
+            reason = self._removal_reasons.pop(role, None)
+            if reason:
+                raise RuntimeError(
+                    "the %s browser is gone: %s. Call browser_open to open it "
+                    "again; it comes back as the same person." % (role, reason))
             raise RuntimeError(GONE % role)
+        if role not in self._open and role in self._removal_reasons:
+            reason = self._removal_reasons.pop(role)
+            raise RuntimeError(
+                "the %s browser was closed: %s. Call browser_open to open it "
+                "again." % (role, reason))
         return super().session(role)
 
     async def exited(self, role: str) -> BaseException | None:
@@ -459,8 +477,9 @@ class OwnerWork(Work):
         for role in list(self.dead):
             await self._drop(role)
 
-    async def close_all(self) -> None:
-        await _close_all(*(self._drop(role) for role in set(self._open) | set(self.profiles)))
+    async def close_all(self, *, reason: str = "") -> None:
+        await _close_all(*(self._drop(role, reason=reason)
+                           for role in set(self._open) | set(self.profiles)))
 
     async def status(self, role: str) -> str:
         result = await super().status(role)
@@ -472,6 +491,16 @@ class OwnerWork(Work):
             result += actions.remote_dir_lines(self.upload_dir, self.download_dir)
         if role == DEFAULT_BROWSER_ID and self.fill_handle is not None:
             result += "\nfill handle: " + self.fill_handle
+        return result
+
+    async def listing(self) -> dict:
+        result = await super().listing()
+        if not result["browsers"] and self._removal_reasons:
+            parts = "; ".join(
+                "%s: %s" % (role, reason) for role, reason in self._removal_reasons.items())
+            result["note"] = (
+                "no browsers open (last closed: %s). Call browser_open to open one."
+                % parts)
         return result
 
 
@@ -514,6 +543,9 @@ class Owners:
         self.entries: dict[str, Owner] = {}
         self.handles: dict[bytes, OwnerWork] = {}
         self.ended: OrderedDict[str, None] = OrderedDict()
+        #: Removal reasons from recently reaped entries, carried forward to the
+        #: next incarnation of that identity so the caller hears WHY it is gone.
+        self._stale_reasons: OrderedDict[str, dict[str, str]] = OrderedDict()
         self.stopping = asyncio.Event()
         self.instances = Instances()
 
@@ -564,6 +596,9 @@ class Owners:
         if identity not in self.entries:
             work = OwnerWork(self, factory=self.factory, engine=self.engine)
             work.owner = identity
+            stale = self._stale_reasons.pop(identity, None)
+            if stale:
+                work._removal_reasons.update(stale)
             self.entries[identity] = Owner(work, self.clock())
         return self.entries[identity]
 
@@ -629,7 +664,7 @@ class Owners:
         entry.work.revoke()
         async with entry.lock:
             try:
-                await entry.work.close_all()
+                await entry.work.close_all(reason="session ended")
             except Exception as exc:
                 raise RuntimeError(masked.redact_text(
                     str(exc), masked.result_windows(entry.work))) from None
@@ -637,6 +672,10 @@ class Owners:
                 for session in entry.work._open.values():
                     masked.forget(session)
             entry.work.remove_file_dirs()
+            if entry.work._removal_reasons:
+                self._stale_reasons[identity] = dict(entry.work._removal_reasons)
+                if len(self._stale_reasons) > MAX_ENDED_SESSIONS:
+                    self._stale_reasons.popitem(last=False)
             self.entries.pop(identity, None)
 
     async def reap_idle(self) -> None:
@@ -646,10 +685,12 @@ class Owners:
                                           for rec in entry.work._typing.values()):
                 continue
             async with entry.lock:
-                if not entry.ended and self.clock() - entry.last_used < self.idle_seconds:
+                idle_for = self.clock() - entry.last_used
+                if not entry.ended and idle_for < self.idle_seconds:
                     continue
                 try:
-                    await entry.work.close_all()
+                    await entry.work.close_all(
+                        reason="idle timeout (%ds)" % int(idle_for))
                 except Exception as exc:
                     errors.append(exc)
                     continue
@@ -662,6 +703,10 @@ class Owners:
                         ExceptionGroup) as exc:
                     errors.append(exc)
                     continue
+                if entry.work._removal_reasons:
+                    self._stale_reasons[identity] = dict(entry.work._removal_reasons)
+                    if len(self._stale_reasons) > MAX_ENDED_SESSIONS:
+                        self._stale_reasons.popitem(last=False)
                 self.entries.pop(identity)
         if errors:
             raise ExceptionGroup("Could not close all idle browser owners", errors)
