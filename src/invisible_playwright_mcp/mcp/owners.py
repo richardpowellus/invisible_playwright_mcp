@@ -423,8 +423,7 @@ class OwnerWork(Work):
     def gone(self, role: str, cause: BaseException | None = None) -> RuntimeError:
         self.report_gone(role, cause)
         self.dead.add(role)
-        if cause is not None:
-            self._removal_reasons[role] = str(cause)[:200]
+        self._removal_reasons[role] = "it closed or crashed"
         if role == DEFAULT_BROWSER_ID:
             self.revoke()
         return RuntimeError(GONE % role)
