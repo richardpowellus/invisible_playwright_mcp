@@ -23,6 +23,7 @@ import pytest
 
 from invisible_playwright_mcp.mcp import actions, clean, masked
 from invisible_playwright_mcp.mcp.secret_shapes import REDACTED, redact_secret_shapes
+from test_owners import owners as owners  # noqa: F401 - the owner-mode fixture
 
 #: Synthetic: the RFC 6238 example key's alphabet, never enrolled anywhere.
 SEED = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
@@ -87,16 +88,35 @@ def test_the_boundary_redacts_unless_a_fill_handle_called():
     assert SEED in json.dumps(masked.redact_result(result, [], shapes=False))
 
 
-def test_the_server_turns_shapes_off_only_for_a_resolved_handle():
-    """The flag comes from owners.target, which sets it only after the handle
-    resolved; a refused handle's error is still redacted."""
-    import inspect
+async def test_the_server_turns_shapes_off_only_for_a_resolved_handle(owners, monkeypatch):
+    """Through the real result boundary in owner mode: the owner's own read is
+    redacted; the same read made with its fill handle (the credential filler)
+    is not; a forged handle is refused AND redacted."""
+    from mcp.server.fastmcp.tools.base import Tool
 
     from invisible_playwright_mcp.mcp import server
+    from invisible_playwright_mcp.mcp.owners import HANDLE_KEY
+    from test_owners import call, handle, identity, success, text
 
-    src = inspect.getsource(server)
-    assert "delegated.append(_delegated_call.get())" in src
-    assert "shapes=not any(delegated)" in src
+    success(await call("A", "browser_open"))
+    capability = handle(await call("A", "browser_status"))
+
+    async def answer() -> str:
+        return 'button "Copy %s"' % SEED
+
+    tool = server.mcp._tool_manager.get_tool("browser_read_text")
+    stub = Tool.from_function(answer, name=tool.name)
+    for name in ("fn_metadata", "fn", "parameters"):
+        monkeypatch.setattr(tool, name, getattr(stub, name))
+
+    own = success(await call("A", "browser_read_text"))
+    assert SEED not in own and REDACTED in own
+    filler = success(await call("F", "browser_read_text",
+                                meta={**identity("F"), HANDLE_KEY: capability}))
+    assert SEED in filler
+    forged = await call("F", "browser_read_text",
+                        meta={**identity("F"), HANDLE_KEY: "bh_" + SEED + "A" * 11})
+    assert forged.isError and SEED not in text(forged)
 
 
 PAGE = ("""<!doctype html>
