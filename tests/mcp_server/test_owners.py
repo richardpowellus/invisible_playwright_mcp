@@ -955,3 +955,42 @@ async def test_removal_reason_cleared_on_reopen(owners):
     result = await call("A", "browser_list")
     browsers = json.loads(success(result))["browsers"]
     assert len(browsers) == 1
+
+
+async def test_child_replaced_reports_gone_not_not_open(owners):
+    """After a shared-child reload, the first call with childReplaced=true
+    reports the browser as GONE (lost in the reload) rather than NOT_OPEN.
+
+    Regression: 2026-11-07 — mcpd hot-reloaded the Python child, destroying
+    all in-memory OwnerWork objects.  The new child created fresh ones and
+    reported 'the main browser is not open', which tells the caller nothing
+    was ever there.  The correct answer is 'gone: the server process was
+    replaced', so the caller knows to reopen with browser_open and gets the
+    same identity back.
+    """
+    meta = {"mcpd/identity": {"sessionId": "A", "childReplaced": True}}
+    result = await call("A", "browser_status", meta=meta)
+    assert result.isError
+    msg = text(result)
+    assert "gone" in msg.lower() or "replaced" in msg.lower(), (
+        "expected 'gone' or 'replaced' in %r — childReplaced must surface as "
+        "GONE, not NOT_OPEN" % msg)
+    assert "browser_open" in msg
+
+    # Second call (without childReplaced) sees NOT_OPEN, not GONE again.
+    result2 = await call("A", "browser_status")
+    assert result2.isError
+    msg2 = text(result2)
+    assert "not open" in msg2.lower(), (
+        "expected 'not open' on the second call: %r" % msg2)
+
+
+async def test_child_replaced_does_not_clobber_live_browsers(owners):
+    """If the owner already has browsers open (e.g. childReplaced arrives on
+    a second concurrent call after the entry was created), do not mark them
+    as lost."""
+    success(await call("A", "browser_open"))
+    meta = {"mcpd/identity": {"sessionId": "A", "childReplaced": True}}
+    result = await call("A", "browser_status", meta=meta)
+    assert not result.isError, (
+        "childReplaced must not clobber a live browser: %s" % text(result))

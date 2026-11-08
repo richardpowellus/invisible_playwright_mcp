@@ -24,7 +24,7 @@ import anyio
 
 from invisible_playwright.async_api import TargetClosedError
 
-from . import DEFAULT_BROWSER_ID, GONE, actions, masked, plan
+from . import DEFAULT_BROWSER_ID, GONE, SUPPORT_BROWSER_ID, actions, masked, plan
 from .session import StealthSession
 from .owner_instances import Instances
 from .work import Work
@@ -613,6 +613,11 @@ class Owners:
         entry = self.entries.get(identity)
         return masked.result_windows(entry.work) if entry is not None else set()
 
+    @staticmethod
+    def _child_replaced(meta: dict) -> bool:
+        identity = meta.get("mcpd/identity")
+        return isinstance(identity, dict) and identity.get("childReplaced") is True
+
     @asynccontextmanager
     async def target(self, meta: dict, tool: str, arguments: dict) -> AsyncIterator[OwnerWork]:
         identity = owner_id(meta)
@@ -624,6 +629,12 @@ class Owners:
             target = next(entry for entry in self.entries.values() if entry.work is work)
         else:
             target = self.caller(identity)
+            if self._child_replaced(meta) and not target.work.roles():
+                target.work.lost.update({DEFAULT_BROWSER_ID, SUPPORT_BROWSER_ID})
+                target.work._removal_reasons.setdefault(
+                    DEFAULT_BROWSER_ID, "the server process was replaced")
+                target.work._removal_reasons.setdefault(
+                    SUPPORT_BROWSER_ID, "the server process was replaced")
         target.last_used = self.clock()
         # A released lock can still have queued callers holding this entry.
         target.pending_calls += 1
