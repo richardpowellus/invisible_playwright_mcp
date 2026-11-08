@@ -2788,4 +2788,55 @@ async def evaluate(session, expression: str, frame=None) -> str:
     """
     _refuse_script_interaction(expression)
     target = await frame_target(session, frame)
-    return json.dumps(await target.evaluate(expression))
+    answer = json.dumps(await target.evaluate(expression))
+    from .owners import _delegated_call
+    if _delegated_call.get():
+        # The credential filler reads a field's value to move it into a vault;
+        # its own guard keeps it out of every transcript.
+        return answer
+    return await _without_secret_values(target, answer)
+
+
+#: The values of the secret fields in a document and its open shadow roots,
+#: read in the engine's utility world. Never returned to a caller: only used
+#: to take those values back out of an evaluate answer.
+SECRET_VALUES_JS = """(element) => {
+""" + clean.SECRET_FIELD_JS + """
+    const out = [];
+    function read(root) {
+        for (const el of root.querySelectorAll('*')) {
+            if (secretField(el) && el.value) out.push(String(el.value));
+            if (el.shadowRoot) read(el.shadowRoot);
+        }
+    }
+    read(element.ownerDocument);
+    return out;
+}"""
+
+EVALUATE_WITHHELD = ("browser_evaluate answer withheld: the page's password fields "
+                     "could not be checked against it")
+
+
+async def _without_secret_values(target, answer: str) -> str:
+    """⛔ `browser_evaluate` CAN READ A PASSWORD BOX'S `.value`.
+
+    The snapshot and read_html report a secret field only as filled. An
+    expression such as `document.querySelector('[type=password]').value`
+    returned the value itself. Every secret field's current value is taken
+    back out of the answer, in its plain and JSON-escaped spellings. A check
+    that cannot run withholds the answer rather than returning it unchecked."""
+    try:
+        values = await target.eval_on_selector("html", SECRET_VALUES_JS)
+    except Exception:
+        raise ValueError(EVALUATE_WITHHELD) from None
+    if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+        raise ValueError(EVALUATE_WITHHELD)
+    forms = set()
+    for value in values:
+        if len(value) < 4:
+            continue
+        forms.update({value, json.dumps(value, ensure_ascii=True)[1:-1],
+                      json.dumps(value, ensure_ascii=False)[1:-1]})
+    for form in sorted(forms, key=len, reverse=True):
+        answer = answer.replace(form, clean.MASKED_PASSWORD)
+    return answer

@@ -11,6 +11,7 @@ from urllib.parse import quote, quote_plus
 from pydantic import BaseModel
 
 from .clean import MASKED_PASSWORD
+from .secret_shapes import redact_secret_shapes
 
 SCREENSHOT_REFUSED = "screenshot refused: a masked value is on the page; nothing was captured"
 
@@ -244,13 +245,18 @@ def _redact_exact(text: str, windows: set[MaskPattern]) -> str:
     return "".join(out)
 
 
-def redact_result(result, registries: list[set[MaskPattern]]):
-    """The only result scrubber, after SDK normalization of successes/errors."""
+def redact_result(result, registries: list[set[MaskPattern]], shapes: bool = True):
+    """The only result scrubber, after SDK normalization of successes/errors.
+
+    ``shapes`` also redacts text shaped like an authenticator secret
+    (``secret_shapes``); only a call made with a valid fill handle, the
+    credential filler's own, turns it off."""
     windows = set().union(*registries)
 
     def walk(value):
         if isinstance(value, str):
-            return redact_text(value, windows)
+            text = redact_text(value, windows)
+            return redact_secret_shapes(text) if shapes else text
         if isinstance(value, BaseModel):
             return value.model_copy(update={
                 key: item if key in ("data", "blob") else walk(item)

@@ -49,6 +49,10 @@ class _Page:
         self.doors.append("evaluate_read")
         return self._value
 
+    async def eval_on_selector(self, _selector, _expression):
+        # evaluate's secret-field read: this page has none.
+        return []
+
 
 class _Session:
     def __init__(self, page):
