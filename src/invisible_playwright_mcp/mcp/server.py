@@ -61,7 +61,7 @@ from ..engine import Engine
 from ..link import answer_of
 from ..quiet import swallow
 from .work import DEFAULT_BROWSER_ID, Work
-from .owners import CapacityExhausted, HANDLE_ERROR, IDENTITY_ERROR, Owners
+from .owners import CapacityExhausted, HANDLE_ERROR, IDENTITY_ERROR, Owners, _delegated_call
 from .owner_transport import (
     ExitWatchdog, SessionEnded, notifications, owner_stdio, redact_sdk_logs, shutdown_on_sigterm,
 )
@@ -143,7 +143,11 @@ class BrowserMCP(FastMCP):
         if exporting:
             redact_sdk_logs(_redact_log)
 
+        delegated = []
+
         async def dispatch(selected: Work):
+            # Set by owners.target only once a fill handle has resolved.
+            delegated.append(_delegated_call.get())
             token = _selected_work.set(selected)
             windows.append(masked.result_windows(selected))
             _result_windows.set(tuple(windows))
@@ -176,7 +180,7 @@ class BrowserMCP(FastMCP):
                         and result.root.structuredContent is None):
                     # Only the exact, authorized export bypasses ordinary result masking.
                     return result
-            return masked.redact_result(result, windows)
+            return masked.redact_result(result, windows, shapes=not any(delegated))
         finally:
             cookies.result.reset(payload_token)
             cookies.active.reset(export_token)

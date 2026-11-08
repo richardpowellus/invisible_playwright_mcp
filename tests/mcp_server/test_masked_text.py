@@ -326,9 +326,9 @@ async def test_every_registered_tool_and_a_new_tool_pass_the_result_boundary(
     seen = []
     redact = masked.redact_result
 
-    def record(result, registries):
+    def record(result, registries, shapes=True):
         seen.append(result)
-        return redact(result, registries)
+        return redact(result, registries, shapes)
 
     monkeypatch.setattr(masked, "redact_result", record)
 
