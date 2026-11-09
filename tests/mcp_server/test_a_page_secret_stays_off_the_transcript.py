@@ -29,6 +29,7 @@ from test_owners import owners as owners  # noqa: F401 - the owner-mode fixture
 SEED = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 GROUPED = "jbsw y3dp ehpk 3pxp jbsw y3dp ehpk 3pxp"
 PASSWORD = "correct-horse-battery-9"
+FRAME_PASSWORD = "framed-horse-battery-8"
 
 
 @pytest.mark.parametrize("text", [
@@ -127,6 +128,7 @@ PAGE = ("""<!doctype html>
   <button aria-label="Copy %s" title="Copy %s">Copy</button>
   <a href="otpauth://totp/Ramp:bot?secret=%s&amp;issuer=Ramp">Open in app</a>
   <label>Password <input id="pw" type="password"></label>
+  <iframe id="inner" srcdoc="<input id='ipw' type='password'>"></iframe>
   <input id="code" placeholder="6-digit code">
   <button>Complete setup</button>
 </body></html>""" % (SEED, SEED, SEED, SEED)).encode()
@@ -170,6 +172,7 @@ def reads():
             await session.start()
             await actions.navigate(session, url)
             await actions.type_text(session, "#pw", PASSWORD)
+            await actions.type_text(session, "#ipw", FRAME_PASSWORD, frame=["#inner"])
             out = {
                 "snapshot": await actions.snapshot(session),
                 "read_text": await actions.read_text(session, "body"),
@@ -177,6 +180,10 @@ def reads():
                 "evaluate": await actions.evaluate(
                     session, "() => [document.querySelector('#setup-key').textContent,"
                     " document.querySelector('#pw').value]"),
+                # Script in the TOP page reading a same-origin iframe's field.
+                "evaluate_frame": await actions.evaluate(
+                    session, "() => document.querySelector('#inner')"
+                    ".contentDocument.querySelector('#ipw').value"),
             }
             return out
         finally:
@@ -209,3 +216,10 @@ def test_a_digitless_key_is_caught_by_its_length_or_its_label():
     digitless = "ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEF"
     assert digitless not in redact_secret_shapes("code " + digitless)
     assert "ABCDEFGHIJKLMNOP" not in redact_secret_shapes("Setup key: ABCDEFGHIJKLMNOP")
+
+
+@pytest.mark.e2e
+def test_evaluate_does_not_return_a_password_from_a_same_origin_frame(reads):
+    """Known-bad: only the evaluated document's fields were read (MCP #858)."""
+    assert FRAME_PASSWORD not in reads["evaluate_frame"]
+    assert clean.MASKED_PASSWORD in reads["evaluate_frame"]
