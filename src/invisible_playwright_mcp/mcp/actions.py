@@ -2794,11 +2794,11 @@ async def evaluate(session, expression: str, frame=None) -> str:
         # The credential filler reads a field's value to move it into a vault;
         # its own guard keeps it out of every transcript.
         return answer
-    return await _without_secret_values(target, answer)
+    return await _without_secret_values(session, answer)
 
 
-#: The values of the secret fields in a document and its open shadow roots,
-#: read in the engine's utility world. Never returned to a caller: only used
+#: The values of the secret fields in one document and its open shadow roots,
+#: read in the engine's utility world, once per frame. Never returned to a caller: only used
 #: to take those values back out of an evaluate answer.
 SECRET_VALUES_JS = """(element) => {
 """ + clean.SECRET_FIELD_JS + """
@@ -2817,20 +2817,31 @@ EVALUATE_WITHHELD = ("browser_evaluate answer withheld: the page's password fiel
                      "could not be checked against it")
 
 
-async def _without_secret_values(target, answer: str) -> str:
+async def _without_secret_values(session, answer: str) -> str:
     """⛔ `browser_evaluate` CAN READ A PASSWORD BOX'S `.value`.
 
     The snapshot and read_html report a secret field only as filled. An
     expression such as `document.querySelector('[type=password]').value`
     returned the value itself. Every secret field's current value is taken
     back out of the answer, in its plain and JSON-escaped spellings. A check
-    that cannot run withholds the answer rather than returning it unchecked."""
+    that cannot run withholds the answer rather than returning it unchecked.
+
+    EVERY frame, each read in its own document, whichever one the expression
+    ran in: script in the top page reaches a same-origin iframe's fields
+    (`frames[0].document...`), and reading only the evaluated document let
+    such a password through (Copilot, MCP #858). As guard_pixels does."""
+    page = session.page()
+    frames = list(getattr(page, "frames", None) or [page])
     try:
-        values = await target.eval_on_selector("html", SECRET_VALUES_JS)
+        answers = await asyncio.wait_for(asyncio.gather(
+            *(frame.eval_on_selector("html", SECRET_VALUES_JS) for frame in frames)), 5)
     except Exception:
         raise ValueError(EVALUATE_WITHHELD) from None
-    if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
-        raise ValueError(EVALUATE_WITHHELD)
+    values = []
+    for found in answers:
+        if not isinstance(found, list) or not all(isinstance(v, str) for v in found):
+            raise ValueError(EVALUATE_WITHHELD)
+        values.extend(found)
     forms = set()
     for value in values:
         if len(value) < 4:
