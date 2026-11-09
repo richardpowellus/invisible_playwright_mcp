@@ -2816,6 +2816,71 @@ SECRET_VALUES_JS = """(element) => {
 EVALUATE_WITHHELD = ("browser_evaluate answer withheld: the page's password fields "
                      "could not be checked against it")
 
+#: The whole check's budget, shared by every frame.
+SECRET_CHECK_SECONDS = 5.0
+
+
+def _frame_origin(frame) -> str:
+    """Scheme and host of a frame, for a diagnosis: never its path or query."""
+    try:
+        parts = urllib.parse.urlsplit(frame.url or "")
+    except Exception:
+        return "an unreadable address"
+    if parts.scheme in ("http", "https") and parts.hostname:
+        return "%s://%s" % (parts.scheme, parts.hostname)
+    return parts.scheme + ":" if parts.scheme else "an unnamed frame"
+
+
+def _detached(frame) -> bool:
+    check = getattr(frame, "is_detached", None)
+    return bool(check()) if callable(check) else False
+
+
+async def _frame_secret_values(frame, deadline: float):
+    """One frame's secret-field values, or None when the frame is GONE.
+
+    ⛔ 2026-11-09 (billpay, three times on the first call after a fresh QBO
+    sign-in): a frame removed between `page.frames` and its read does not
+    always fail. Measured against the 2026-11-08 build on a page that adds and
+    removes iframes: of 32 such reads, 18 raised TargetClosedError at once and
+    14 HUNG until the 5 s budget ran out, and one hung read withheld the whole
+    answer. So the read is raced against the frame detaching.
+
+    A detached frame is skipped, not treated as a failed check. That is no
+    weaker than before: a frame detached a moment earlier is not in
+    `page.frames` at all, and was never read either. Anything else - the
+    page not answering in time, a read that fails while the frame is still
+    attached - still withholds, now naming the frame and what happened."""
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(frame.eval_on_selector("html", SECRET_VALUES_JS))
+    try:
+        while not task.done():
+            if _detached(frame):
+                return None
+            left = deadline - loop.time()
+            if left <= 0:
+                raise ValueError("%s: %s did not answer within %g s" % (
+                    EVALUATE_WITHHELD, _frame_origin(frame), SECRET_CHECK_SECONDS))
+            await asyncio.wait({task}, timeout=min(0.1, left))
+        try:
+            found = task.result()
+        except Exception as error:
+            if _detached(frame):
+                return None
+            # The type only: an engine message can quote the page.
+            raise ValueError("%s: reading %s failed (%s)" % (
+                EVALUATE_WITHHELD, _frame_origin(frame), type(error).__name__)) from None
+        if not isinstance(found, list) or not all(isinstance(v, str) for v in found):
+            raise ValueError("%s: %s answered an unexpected shape" % (
+                EVALUATE_WITHHELD, _frame_origin(frame)))
+        return found
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+
 
 async def _without_secret_values(session, answer: str) -> str:
     """⛔ `browser_evaluate` CAN READ A PASSWORD BOX'S `.value`.
@@ -2832,16 +2897,22 @@ async def _without_secret_values(session, answer: str) -> str:
     such a password through (Copilot, MCP #858). As guard_pixels does."""
     page = session.page()
     frames = list(getattr(page, "frames", None) or [page])
+    deadline = asyncio.get_running_loop().time() + SECRET_CHECK_SECONDS
+    reads = [asyncio.ensure_future(_frame_secret_values(frame, deadline)) for frame in frames]
     try:
-        answers = await asyncio.wait_for(asyncio.gather(
-            *(frame.eval_on_selector("html", SECRET_VALUES_JS) for frame in frames)), 5)
+        answers = await asyncio.gather(*reads)
+    except ValueError:
+        raise
     except Exception:
         raise ValueError(EVALUATE_WITHHELD) from None
+    finally:
+        for read in reads:
+            read.cancel()
+        await asyncio.gather(*reads, return_exceptions=True)
     values = []
     for found in answers:
-        if not isinstance(found, list) or not all(isinstance(v, str) for v in found):
-            raise ValueError(EVALUATE_WITHHELD)
-        values.extend(found)
+        if found is not None:
+            values.extend(found)
     forms = set()
     for value in values:
         if len(value) < 4:
