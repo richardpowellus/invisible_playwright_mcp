@@ -244,9 +244,13 @@ bodies. See [network limits and output fields](docs/mcp-server.md#reading-the-pa
 credential-bearing; not proposed upstream**. It exports httpOnly and other
 applicable cookies from the engine, never page JavaScript. It requires owner
 mode, the caller's own current main-browser fill handle, and 1..8 exact
-`https://<host>` origins. It refuses support browsers and delegated handles.
+`https://<host>` origins. It refuses support browsers.
 `STEALTHFOX_COOKIE_EXPORT_DOMAINS` must enable comma-separated DNS suffixes
-(for example `intuit.com`); unset/empty refuses. Both the requested hosts and
+(for example `intuit.com`); unset/empty refuses. A delegated call (the same
+handle also in `_meta`, from a trusted credential filler that stores the value
+without returning it) reads only `STEALTHFOX_COOKIE_EXPORT_DELEGATED_DOMAINS`,
+and a direct call never does, so a domain on that list is exportable only by the
+filler, never by the agent driving the browser; unset/empty refuses delegation. Both the requested hosts and
 cookie domains must match on a DNS label boundary. Only cookies applicable to
 the origins' root paths are returned. Exceeding **200 cookies or 256 KiB of
 JSON** refuses the entire export, never truncates it. The single JSON text

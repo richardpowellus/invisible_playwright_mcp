@@ -17,9 +17,15 @@ from . import masked
 
 TOOL = "browser_cookies_export"
 DOMAINS_ENV = "STEALTHFOX_COOKIE_EXPORT_DOMAINS"
+#: Domains exportable ONLY through a delegated call: one carrying the owner's
+#: fill handle in ``_meta`` (the trusted credential filler, which stores the
+#: value without returning it). The owner itself cannot export these, so a
+#: cookie on this list never reaches the agent driving the browser.
+DELEGATED_DOMAINS_ENV = "STEALTHFOX_COOKIE_EXPORT_DELEGATED_DOMAINS"
 MAX_COOKIES = 200
 MAX_BYTES = 256 * 1024
 DISABLED = "cookie export is not enabled on this server"
+DELEGATED_DISABLED = "delegated cookie export is not enabled on this server"
 FAILED = "cookie export failed; no cookies were exported"
 active: ContextVar[bool] = ContextVar("cookie_export_active", default=False)
 result: ContextVar[str | None] = ContextVar("cookie_export_result", default=None)
@@ -64,10 +70,12 @@ def matches_suffix(host: str, suffix: str) -> bool:
     return host == suffix or host.endswith("." + suffix)
 
 
-def allowed_origins(origins: list[str]) -> tuple[list[str], list[str]]:
-    configured = os.environ.get(DOMAINS_ENV, "")
+def allowed_origins(origins: list[str], delegated: bool = False) -> tuple[list[str], list[str]]:
+    # The two lists never mix: a direct call reads only DOMAINS_ENV and a
+    # delegated one only DELEGATED_DOMAINS_ENV.
+    configured = os.environ.get(DELEGATED_DOMAINS_ENV if delegated else DOMAINS_ENV, "")
     if not any(item.strip() for item in configured.split(",")):
-        raise ExportError(DISABLED)
+        raise ExportError(DELEGATED_DISABLED if delegated else DISABLED)
     try:
         suffixes = [_host(item.strip()) for item in configured.split(",")]
     except ExportError:
