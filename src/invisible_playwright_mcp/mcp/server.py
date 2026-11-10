@@ -669,12 +669,14 @@ async def browser_cookies_export(browser_handle: str, origins: list[str]) -> str
 
     Requires its current fill handle and 1..8 https://<host> origins allowed by
     STEALTHFOX_COOKIE_EXPORT_DOMAINS. Disabled when that allowlist is unset.
-    No support browser or delegated fill-handle access. Returns one JSON text
+    No support browser. A delegated call (the fill handle in _meta, from a
+    trusted credential filler) reads only STEALTHFOX_COOKIE_EXPORT_DELEGATED_DOMAINS,
+    and a direct call never does. Returns one JSON text
     item with cookies, count, origins and exported_at; refuses above 200 cookies
     or 256 KiB. Treat the result as credentials: never log or persist it.
     """
     args = _cookie_export_arguments({"browser_handle": browser_handle, "origins": origins})
-    hosts, suffixes = cookies.allowed_origins(args.origins)
+    hosts, suffixes = cookies.allowed_origins(args.origins, delegated=_delegated_call.get())
     payload = await _work().reading(cookies.export, args.origins, hosts, suffixes,
                                     role=DEFAULT_BROWSER_ID)
     _cookie_export_arguments({"browser_handle": browser_handle, "origins": origins})

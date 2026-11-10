@@ -39,6 +39,9 @@ HANDLE_TOOLS = frozenset({
     # A card tokenizer (Fiserv) encrypts the number only on blur, so the filler
     # clicks the field it filled and presses Tab, as a person leaves it.
     "browser_click",
+    # Delegated cookie export reads only STEALTHFOX_COOKIE_EXPORT_DELEGATED_DOMAINS
+    # (cookies.allowed_origins), and is refused while that list is unset.
+    "browser_cookies_export",
 })
 _HANDLE = re.compile(r"bh_[A-Za-z0-9_-]{43}")
 IDENTITY_ERROR = "Owner mode requires a valid mcpd/identity sessionId."

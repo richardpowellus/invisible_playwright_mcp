@@ -99,9 +99,7 @@ async def test_invalid_handle_uses_existing_error(opened, value):
 async def test_handle_is_required_in_arguments_not_metadata(opened):
     for meta in (identity("A"), {**identity("A"), HANDLE_KEY: opened[0]}):
         result = await call("A", cookies.TOOL, {"origins": [ORIGIN]}, meta=meta)
-        assert result.isError
-        assert text(result) == (HANDLE_ERROR if HANDLE_KEY not in meta else
-                                "This tool or browser is not permitted with a fill handle.")
+        assert result.isError and text(result) == HANDLE_ERROR
     opened[2].cookies.assert_not_awaited()
 
 
@@ -130,6 +128,72 @@ async def test_other_owner_and_delegated_handles_are_refused(opened):
         result = await call("B", cookies.TOOL, {
             "browser_handle": opened[0], "origins": [ORIGIN]}, meta=meta)
         assert result.isError
+    opened[2].cookies.assert_not_awaited()
+
+
+DELEGATED_ORIGIN = "https://platform.claude.com"
+
+
+async def delegated(opened, caller="B", **changes):
+    """A trusted filler's call: its own mcpd identity, the owner's handle in _meta."""
+    arguments = dict({"browser_handle": opened[0], "origins": [DELEGATED_ORIGIN]}, **changes)
+    return await call(caller, cookies.TOOL, arguments,
+                      meta={**identity(caller), HANDLE_KEY: opened[0]})
+
+
+async def test_delegated_export_is_refused_while_its_allowlist_is_unset(opened):
+    # The direct list alone never enables a delegated export, even of its own domain.
+    for origin in (ORIGIN, DELEGATED_ORIGIN):
+        result = await delegated(opened, origins=[origin])
+        assert result.isError and text(result) == cookies.DELEGATED_DISABLED
+    opened[2].cookies.assert_not_awaited()
+
+
+async def test_delegated_export_reads_only_the_delegated_list(opened, monkeypatch):
+    monkeypatch.setenv(cookies.DELEGATED_DOMAINS_ENV, "claude.com")
+    opened[2].cookies.return_value = [cookie(domain=".claude.com")]
+    payload = json.loads(success(await delegated(opened)))
+    assert payload["count"] == 1 and payload["cookies"][0]["value"] == CANARY
+    assert payload["origins"] == [DELEGATED_ORIGIN]
+    opened[2].cookies.assert_awaited_once_with([DELEGATED_ORIGIN])
+    # A direct-list domain is not exportable by delegation.
+    result = await delegated(opened, origins=[ORIGIN])
+    assert result.isError and "outside the server allowlist" in text(result)
+    # The value is masked from the owner's own later results.
+    assert masked.registry(opened[1]).redact(CANARY) == masked.MASKED_PASSWORD
+
+
+async def test_owner_cannot_export_a_delegated_only_domain_directly(opened, monkeypatch):
+    monkeypatch.setenv(cookies.DELEGATED_DOMAINS_ENV, "claude.com")
+    result = await export(opened, origins=[DELEGATED_ORIGIN])
+    assert result.isError and "outside the server allowlist" in text(result)
+    assert CANARY not in text(result)
+    opened[2].cookies.assert_not_awaited()
+
+
+async def test_delegated_export_needs_the_same_handle_in_arguments_and_meta(opened, monkeypatch):
+    monkeypatch.setenv(cookies.DELEGATED_DOMAINS_ENV, "claude.com")
+    other = handle(await call("B", "browser_open"))
+    for args_handle, meta_handle in ((other, opened[0]), (opened[0], other)):
+        result = await call("C", cookies.TOOL, {
+            "browser_handle": args_handle, "origins": [DELEGATED_ORIGIN]},
+            meta={**identity("C"), HANDLE_KEY: meta_handle})
+        assert result.isError and text(result) == HANDLE_ERROR
+    opened[2].cookies.assert_not_awaited()
+
+
+async def test_delegated_export_refuses_the_support_browser(opened, monkeypatch):
+    monkeypatch.setenv(cookies.DELEGATED_DOMAINS_ENV, "claude.com")
+    result = await delegated(opened, browser="support")
+    assert result.isError
+    opened[2].cookies.assert_not_awaited()
+
+
+async def test_revoked_handle_never_exports_by_delegation(opened, monkeypatch):
+    monkeypatch.setenv(cookies.DELEGATED_DOMAINS_ENV, "claude.com")
+    success(await call("A", "browser_close"))
+    result = await delegated(opened)
+    assert result.isError and text(result) == HANDLE_ERROR
     opened[2].cookies.assert_not_awaited()
 
 

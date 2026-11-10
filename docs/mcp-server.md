@@ -164,6 +164,7 @@ between what the browser says it is and where it appears to be.
 | `STEALTHFOX_OWNER_MODE` | `mcpd` enables trusted stdio per-caller isolation; unset preserves single-owner behavior. Requires POSIX filesystem locks. |
 | `CAPSOLVER_API_KEY` | Server-side CapSolver API key for the paid `browser_solve_captcha` tool. Unset disables solving; never supplied as a tool argument. |
 | `STEALTHFOX_COOKIE_EXPORT_DOMAINS` | Fork-only credential export allowlist of comma-separated DNS suffixes, e.g. `intuit.com`. Unset/empty disables export. Requires owner mode and the caller's own main-browser fill handle. No wildcard, URL, port, IP or leading dot. |
+| `STEALTHFOX_COOKIE_EXPORT_DELEGATED_DOMAINS` | Fork-only, same syntax: the only domains a **delegated** export (fill handle in `_meta`, from a trusted credential filler) may read. Never read by a direct call, and the direct list is never read by a delegated one. Unset/empty disables delegated export. |
 | `INVISIBLE_MCP_HOST_MANAGED` | `1` for a host that opens/closes its own browser and gives its model only page tools. Instructions contain only page rules, `browser` is hidden from tool schemas, and `support` is refused. Cannot be combined with `STEALTHFOX_OWNER_MODE=mcpd`. |
 | `STEALTHFOX_MAX_BROWSERS` | Owner mode's process-wide browser capacity, including pending launches and closes; default 2. |
 | `STEALTHFOX_OWNER_IDLE_SECONDS` | Idle owner expiry; default 900 seconds. Active background typing is not idle. |
@@ -457,8 +458,12 @@ handle from your own main browser's `browser_open`/`browser_status`) and
 `origins` (required array of 1..8 strings, each exactly `https://<host>`).
 Unknown arguments, coercible strings in place of arrays, paths, trailing
 slashes, credentials, ports, queries, fragments and non-HTTPS URLs are refused.
-There is no `browser` argument. Support browsers, another owner's handle,
-delegated `_meta` handles and non-owner mode cannot export.
+There is no `browser` argument. Support browsers, another owner's handle and
+non-owner mode cannot export. A delegated call carries the same handle in
+`_meta` and in `browser_handle`; it is checked against
+`STEALTHFOX_COOKIE_EXPORT_DELEGATED_DOMAINS` only (unset/empty returns
+`delegated cookie export is not enabled on this server`), and the owner cannot
+export a domain that appears only on that list.
 Invalid or revoked handles return `Invalid or revoked browser fill handle.`
 
 The server operator must set `STEALTHFOX_COOKIE_EXPORT_DOMAINS`, for example
