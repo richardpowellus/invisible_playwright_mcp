@@ -17,7 +17,6 @@ import http.server
 import json
 import os
 import threading
-from types import SimpleNamespace
 
 import pytest
 
@@ -25,7 +24,24 @@ from invisible_playwright_mcp.mcp import actions
 from invisible_playwright.async_api import Error
 
 from test_a_downloaded_file_is_kept import (PDF, _Response, _Session, _download,
-                                            _with_browser, env, root)  # noqa: F401
+                                            _with_browser)
+
+
+@pytest.fixture
+def root(tmp_path):
+    out = tmp_path / "down"
+    out.mkdir()
+    return out
+
+
+@pytest.fixture
+def env(root, monkeypatch, tmp_path):
+    monkeypatch.setenv(actions.DOWNLOAD_DIRS_ENV, str(root))
+    monkeypatch.setattr(actions, "SAVED_COPY_GRACE_S", 0.3)
+    monkeypatch.setattr(actions, "_POLL_S", 0.05)
+    landing = tmp_path / "landing"
+    landing.mkdir()
+    return root, landing
 
 
 class _EngineDownload:
