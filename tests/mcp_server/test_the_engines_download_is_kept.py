@@ -245,6 +245,20 @@ document.getElementById('dl').addEventListener('click', async () => {
 </script></body></html>"""
 
 
+# Indeed's candidate view, 2026-11-11 15:58Z: two anchors with blob hrefs and
+# one filename, the first of them zero-size, and a layout that keeps moving.
+MOVING_PAGE = b"""<!doctype html><html><body>
+<div id="top"></div>
+<a data-testid="dl-more" download="Resume.pdf" style="position:absolute;width:0;height:0;overflow:hidden">x</a>
+<a data-testid="dl-inline" download="Resume.pdf" style="display:inline-block;padding:20px">Download resume</a>
+<script>
+fetch('/api/download?id=1').then(r => r.blob()).then(b => {
+  for (const a of document.querySelectorAll('a')) a.href = URL.createObjectURL(b);
+  document.title = 'ready';
+});
+</script></body></html>"""
+
+
 @pytest.fixture(scope="module")
 def site():
     class H(http.server.BaseHTTPRequestHandler):
@@ -256,7 +270,7 @@ def site():
                 body = PDF
             else:
                 self.send_header("Content-Type", "text/html; charset=utf-8")
-                body = LATE_BLOB_PAGE
+                body = MOVING_PAGE if self.path.startswith("/moving") else LATE_BLOB_PAGE
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -299,3 +313,85 @@ def test_navigating_to_an_attachment_keeps_it(site, root, monkeypatch):
     out = json.loads(out)
     assert out["filename"] == "resume.pdf"
     assert open(out["saved"], "rb").read() == PDF
+
+
+@pytest.mark.e2e
+def test_two_blob_downloads_on_two_pages_are_both_kept(site, root, monkeypatch):
+    """Every download in a session, not only the first. Reported from Indeed
+    (2026-11-11 05:38Z) as a second download failing; the 15:58Z repro showed
+    the real cause was a moved page (the tests below), but the guarantee is
+    worth holding."""
+    monkeypatch.setenv(actions.DOWNLOAD_DIRS_ENV, str(root))
+
+    async def body(session):
+        first = json.loads(await actions.download(session, "#dl", timeout_seconds=20))
+        await actions.navigate(session, site + "?candidate=2")
+        second = json.loads(await actions.download(session, "#dl", timeout_seconds=20))
+        return first, second
+
+    first, second = asyncio.run(_with_browser(site + "?candidate=1", body))
+    assert first["saved"] != second["saved"]
+    assert first["url"] != second["url"]
+    for out in (first, second):
+        assert out["from"] == "the browser's download"
+        assert open(out["saved"], "rb").read() == PDF
+
+
+def test_a_point_on_no_link_says_the_page_moved_and_where_the_links_are():
+    point = {"tag": "div", "cls": "css-1bs4oug", "text": "", "actionable": False}
+    links = [{"text": "Download resume", "selector": "[data-testid='dl-inline']",
+              "at": [1474, -185], "off_screen": True}]
+    said = "; ".join(actions._aim_advice(point, links, 1474.0, 126.0))
+    assert '(1474.0, 126.0) was on <div class="css-1bs4oug">, not a link or button' in said
+    assert "Download resume at [1474, -185] (off screen), selector [data-testid='dl-inline']" in said
+    assert actions._aim_advice({"tag": "a", "actionable": True}, [], 1, 2) == []
+
+
+async def _ready(session):
+    page = session.page()
+    for _ in range(100):
+        if await page.title() == "ready":
+            return page
+        await asyncio.sleep(0.05)
+    raise AssertionError("the moving page never made its blobs")
+
+
+@pytest.mark.e2e
+def test_a_click_where_the_link_used_to_be_says_where_it_is_now(site, root, monkeypatch):
+    """The snapshot's coordinates go stale when the page lays itself out
+    again; the answer names what the point hit and the link's selector, and
+    that selector then downloads."""
+    monkeypatch.setenv(actions.DOWNLOAD_DIRS_ENV, str(root))
+
+    async def body(session):
+        page = await _ready(session)
+        box = await page.evaluate("""() => { const r = document.querySelector(
+            "[data-testid='dl-inline']").getBoundingClientRect();
+            return [r.left + r.width / 2, r.top + r.height / 2]; }""")
+        await page.evaluate("""() => { document.getElementById('top').style.height = '400px'; }""")
+        with pytest.raises(RuntimeError) as failed:
+            await actions.download(session, x=box[0], y=box[1], timeout_seconds=3)
+        out = json.loads(await actions.download(session, "[data-testid='dl-inline']",
+                                                timeout_seconds=20))
+        return str(failed.value), out
+
+    message, out = asyncio.run(_with_browser(site + "moving", body))
+    assert "not a link or button: the page moved" in message
+    assert "selector [data-testid='dl-inline']" in message
+    assert out["from"] == "the browser's download" and open(out["saved"], "rb").read() == PDF
+
+
+@pytest.mark.e2e
+def test_a_selector_whose_first_match_is_hidden_names_the_visible_one(site, root, monkeypatch):
+    monkeypatch.setenv(actions.DOWNLOAD_DIRS_ENV, str(root))
+
+    async def body(session):
+        await _ready(session)
+        with pytest.raises(Exception) as failed:
+            await actions.download(session, "a[href^='blob:']", timeout_seconds=5)
+        return str(failed.value)
+
+    message = asyncio.run(_with_browser(site + "moving", body))
+    assert "download links on the page now: Download resume" in message
+    assert "selector [data-testid='dl-inline']" in message
+    assert "dl-more" not in message

@@ -2288,6 +2288,74 @@ async def _press_at(page, x: float, y: float) -> None:
     await page.mouse.click(x, y)
 
 
+# What a download click is aimed at, and what there is to aim at instead.
+# ⛔ A PAGE MOVES BETWEEN THE SNAPSHOT AND THE CLICK. Indeed's candidate view
+# lays itself out lazily after a PageDown, so the "Download resume" link its
+# snapshot put at [1474, 126] was 330 px higher by the time the click landed,
+# on a bare <div>. The click "worked", Firefox was handed nothing, and the
+# answer only said that nothing arrived - which read as a broken download
+# path and cost a fix round chasing one. Saying what the point was on, and
+# where the download links are NOW, makes the cause and the retry plain.
+_POINT_TARGET_JS = """([x, y]) => {
+    const e = document.elementFromPoint(x, y);
+    if (!e) return null;
+    const hit = e.closest('a[href], button, [role=button], [role=link], input[type=submit], input[type=button], [onclick]');
+    const text = s => (s || '').replace(/\\s+/g, ' ').trim().slice(0, 60);
+    return {tag: e.tagName.toLowerCase(), cls: String(e.className || '').slice(0, 60),
+            text: text(e.innerText), actionable: !!hit};
+}"""
+
+_DOWNLOAD_LINKS_JS = """() => {
+    const q = s => "'" + s.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'") + "'";
+    const out = [];
+    for (const a of document.querySelectorAll('a[download], a[href^="blob:"], a[href^="data:"]')) {
+        const r = a.getBoundingClientRect();
+        if (r.width < 1 || r.height < 1) continue;
+        const tid = a.getAttribute('data-testid');
+        const selector = tid ? `[data-testid=${q(tid)}]` : a.id ? `#${CSS.escape(a.id)}`
+                       : `a[href=${q(a.getAttribute('href') || '')}]`;
+        const at = [Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2)];
+        const off = at[1] < 0 || at[1] > innerHeight || at[0] < 0 || at[0] > innerWidth;
+        out.push({text: (a.innerText || a.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim().slice(0, 60),
+                  selector, at, off_screen: off});
+        if (out.length >= 5) break;
+    }
+    return out;
+}"""
+
+
+# Both probes are advice, never a reason to be late: a page that has not
+# answered in this long gets no advice, and the click or the failure goes on
+# within the caller's timeout.
+AIM_PROBE_S = 0.3
+
+
+async def _point_target(page, x: float, y: float):
+    with swallow("a page that will not say what is under the pointer is clicked anyway"):
+        return await asyncio.wait_for(page.evaluate(_POINT_TARGET_JS, [x, y]), AIM_PROBE_S)
+    return None
+
+
+async def _download_links(page) -> list:
+    with swallow("a page that will not list its links gets no suggestions"):
+        return await asyncio.wait_for(page.evaluate(_DOWNLOAD_LINKS_JS), AIM_PROBE_S) or []
+    return []
+
+
+def _aim_advice(point, links, x=None, y=None) -> list:
+    said = []
+    if point is not None and not point.get("actionable"):
+        what = "<" + point["tag"] + (f' class="{point["cls"]}"' if point.get("cls") else "") + ">"
+        said.append(f"({x}, {y}) was on {what}, not a link or button: the page moved after the "
+                    "snapshot that gave those coordinates")
+    if links:
+        said.append("download links on the page now: " + "; ".join(
+            f"{l['text'] or 'link'} at {l['at']}{' (off screen)' if l['off_screen'] else ''},"
+            f" selector {l['selector']}" for l in links)
+            + " - a selector stays right when the page moves")
+    return said
+
+
 async def _pdf_viewer_ready(page, deadline: float) -> bool:
     with swallow("a PDF viewer not ready or a tab that will not answer is polled again"):
         async with asyncio.timeout(min(0.5, max(0, deadline - time.monotonic()))):
@@ -2531,10 +2599,18 @@ async def download(session, selector=None, x=None, y=None,
 
     context = page.context
     context.on("response", on_response)
+    point = None
     try:
         if selector:
-            await click(session, selector)
+            try:
+                await click(session, selector)
+            except Exception as e:
+                advice = _aim_advice(None, await _download_links(page))
+                if not advice:
+                    raise
+                raise RuntimeError(f"{e}\n" + "; ".join(advice)) from e
         else:
+            point = await _point_target(page, float(x), float(y))
             await _press_at(page, float(x), float(y))
         how, got = await _arrival(session, landing, before, shown,
                                   time.monotonic() + float(timeout_seconds), failures,
@@ -2556,6 +2632,7 @@ async def download(session, selector=None, x=None, y=None,
             seen.append(f"a new tab is on {opened.url}" + (f" showing {kind}" if kind else ""))
         if failures:
             seen.append("the shown document's body could not be read: " + failures[-1])
+        seen += _aim_advice(point, await _download_links(page), x, y)
         raise RuntimeError(
             f"clicking {selector or f'({x}, {y})'} neither saved a file nor showed "
             f"one within {float(timeout_seconds):g} s; nothing was saved"
