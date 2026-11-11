@@ -766,7 +766,9 @@ async def browser_navigate(url: str, wait_until: str = "domcontentloaded",
     wait_until is "domcontentloaded" by default, which returns as soon as the
     markup is parsed. Use "load" when the page needs its images and stylesheets,
     or "networkidle" for a single-page app that fetches its content after
-    load."""
+    load.
+
+    An attachment url keeps the page and saves the file like browser_download."""
     return await _work().acting(actions.navigate, url, wait_until=wait_until,
                              role=browser)
 
@@ -1071,7 +1073,9 @@ async def browser_download(selector: str | None = None, x: float | None = None,
 
     Give `selector`, or `x` and `y` from browser_snapshot. Waits up to
     `timeout_seconds` for a completed download or a shown document, including
-    a `blob:` PDF in the browser's viewer. A fetch or XHR is not a download.
+    a `blob:` PDF in the browser's viewer, and a blob link the page makes
+    after the click (fetch, then a hidden anchor). A fetch or XHR is not a
+    download.
     A tab opened only for the file is closed again.
 
     `save_to` is an absolute directory, made if missing, inside

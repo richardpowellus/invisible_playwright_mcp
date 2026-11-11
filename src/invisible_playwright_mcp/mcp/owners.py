@@ -339,6 +339,17 @@ class OwnerWork(Work):
                 "Download refused. Use only your download dir: %s" % self.download_dir
                 + actions.remote_dir_lines(download_dir=self.download_dir).replace("\n", ". ")) from None
 
+    async def _navigate(self, session, *args, **kwargs) -> str:
+        # A url that answers with a file is kept in THIS owner's download dir.
+        # The directory is resolved only once a download is actually there.
+        try:
+            env = self._download_env()
+        except RuntimeError:
+            # Downloads off: navigation still works, and a file it meets is
+            # refused with "downloads are off" by download_target.
+            env = {actions.DOWNLOAD_DIRS_ENV: ""}
+        return await actions.navigate(session, *args, **kwargs, env=env)
+
     async def _print_pdf(self, session, *args, **kwargs) -> str:
         env = self._download_env()
         try:
@@ -357,6 +368,8 @@ class OwnerWork(Work):
             fn = self._download
         elif fn is actions.print_pdf:
             fn = self._print_pdf
+        elif fn is actions.navigate:
+            fn = self._navigate
         return await super()._act(at, fn, *args, **kwargs)
 
     async def _start(self, role: str, settings: dict) -> StealthSession:
