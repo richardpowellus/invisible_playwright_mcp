@@ -63,7 +63,8 @@ from ..quiet import swallow
 NAVIGATION_TIMEOUT_MS = 45_000
 
 
-async def navigate(session, url: str, wait_until: str = "domcontentloaded") -> str:
+async def navigate(session, url: str, wait_until: str = "domcontentloaded", *,
+                   env=None) -> str:
     """Go to a url, and say what came back.
 
     ⛔ IT USED TO ANSWER `navigated to {url}` WHATEVER HAPPENED, and both halves
@@ -88,9 +89,18 @@ async def navigate(session, url: str, wait_until: str = "domcontentloaded") -> s
     if not session.pages():
         await session.new_page()
     page = session.page()
+    downloads_from = _download_mark(session)
     try:
         response = await page.goto(url, wait_until=wait_until, timeout=NAVIGATION_TIMEOUT_MS)
     except Error as exc:
+        if DOWNLOAD_STARTING in str(exc) and downloads_from is not None:
+            # ⛔ A URL THAT ANSWERS WITH A FILE IS NOT A FAILED NAVIGATION. The
+            # engine ends it with "Download is starting" (as Playwright does)
+            # and takes the file itself; raising that left the file in the
+            # engine's directory, out of every caller's reach (Indeed's resume
+            # API, 2026-11-11). The page did not change, so say that, and keep
+            # the file where browser_download would have.
+            return await _navigation_download(session, downloads_from, url, env=env)
         if any(marker in str(exc) for marker in
                ("SEC_ERROR_", "SSL_ERROR_", "MOZILLA_PKIX_ERROR_")):
             try:
@@ -2329,17 +2339,113 @@ async def _pdf_viewer_data(page, deadline: float) -> tuple[bytes, str, str]:
     return body, name, url
 
 
+#: What the engine (and Playwright) says when a navigation turned into a download.
+DOWNLOAD_STARTING = "Download is starting"
+
+
+def _download_mark(session):
+    """Where the engine's downloads stand now, or None for a session that
+    does not hear them (an engine before 20f8a43, or a test double)."""
+    if not hasattr(session, "downloads_since"):
+        return None
+    return getattr(session, "download_count", 0)
+
+
+async def _finished_download(download, deadline: float, failures: list):
+    """(download, path) once the engine has finished writing it, or None when
+    it failed, came out empty, or did not finish by `deadline`."""
+    try:
+        async with asyncio.timeout(max(0, deadline - time.monotonic())):
+            path = await download.path()
+        failure = await download.failure()
+    except Exception as exc:
+        failures.append(f"{getattr(download, 'url', '')}: {exc}".splitlines()[0][:200])
+        return None
+    if failure:
+        failures.append(f"{download.url}: the download failed: {failure}"[:200])
+        return None
+    try:
+        st = os.stat(path)
+    except (OSError, TypeError) as exc:
+        failures.append(f"{download.url}: the downloaded file is gone: {exc}"[:200])
+        return None
+    if not stat.S_ISREG(st.st_mode) or st.st_size == 0:
+        failures.append(f"{download.url}: the download came out empty")
+        return None
+    return download, str(path)
+
+
+async def _keep_engine_download(directory: str, download, path: str, *, env=None):
+    """Copy a download the engine finished into `directory`, then let the
+    engine drop its own copy. Answers (saved, url)."""
+    name = safe_filename(getattr(download, "suggested_filename", "") or "", "download")
+    with closing(_read_chunks(path)) as chunks:
+        first = next(chunks, b"")
+        if not os.path.splitext(name)[1]:
+            name += mimetypes.guess_extension(sniff_mime(first[:16], name)) or ""
+
+        def all_chunks():
+            yield first
+            yield from chunks
+
+        saved = save_download(directory, name, all_chunks(), env=env)
+    with swallow("the engine's own copy goes with the browser either way"):
+        await download.delete()
+    return saved, getattr(download, "url", "") or ""
+
+
+async def _navigation_download(session, downloads_from, url: str, *, env=None) -> str:
+    """Keep the file a navigation turned into, and say the page stayed put."""
+    deadline = time.monotonic() + NAVIGATION_TIMEOUT_MS / 1000
+    failures: list = []
+    taken: set = set()
+    while time.monotonic() < deadline:
+        for candidate in session.downloads_since(downloads_from):
+            if id(candidate) in taken:
+                continue
+            taken.add(id(candidate))
+            got = await _finished_download(candidate, deadline, failures)
+            if got is not None:
+                directory = download_target(None, env=env)
+                saved, landed_url = await _keep_engine_download(directory, *got, env=env)
+                answer = {
+                    "saved": saved["path"], "filename": saved["filename"],
+                    "size": saved["size"],
+                    "mime": sniff_mime(saved["head"], saved["filename"]),
+                    "sha256": saved["sha256"], "from": "the browser's download",
+                    "url": landed_url or url, "notes": [], **remote_file(saved["path"])}
+                return (f"{url} answered with a file, not a page: the browser kept it and "
+                        f"stayed on {session.page().url}.\n"
+                        + json.dumps(answer, ensure_ascii=False))
+        await asyncio.sleep(_POLL_S)
+    raise RuntimeError(
+        f"{url} answered with a file, not a page, and the download did not finish within "
+        f"{NAVIGATION_TIMEOUT_MS // 1000} s; nothing was saved"
+        + (": " + failures[-1] if failures else ""))
+
+
 async def _arrival(session, landing: str, before: set, shown: list, deadline: float,
-                   failures: list, *, page, pages_before: set, env=None):
+                   failures: list, *, page, pages_before: set, env=None,
+                   downloads_from=None):
     """Wait for the file: ("download", path) once the browser has saved one
-    and its size has held for a poll, or ("page", (body, response)) once the
+    and its size has held for a poll, ("engine", (download, path)) once the
+    engine took and finished one, or ("page", (body, response)) once the
     click showed a document and no saved copy followed it, or
     ("viewer", (body, name, url)) from a PDF viewer without a response."""
     sizes: dict = {}
     shown_at = None
     viewer_at: dict = {}
     tries = 0
+    taken: set = set()
     while time.monotonic() < deadline:
+        if downloads_from is not None:
+            for candidate in session.downloads_since(downloads_from):
+                if id(candidate) in taken:
+                    continue
+                taken.add(id(candidate))
+                got = await _finished_download(candidate, deadline, failures)
+                if got is not None:
+                    return "engine", got
         for path, size in landed(landing, before, env=env):
             if sizes.get(path) == size:
                 return "download", path
@@ -2414,6 +2520,7 @@ async def download(session, selector=None, x=None, y=None,
         before = set(os.listdir(dir_fd if dir_fd is not None else landing))
     shown: list = []
     failures: list = []
+    downloads_from = _download_mark(session)
 
     def on_response(response) -> None:
         with swallow("a response whose headers cannot be read is not a document"):
@@ -2431,7 +2538,8 @@ async def download(session, selector=None, x=None, y=None,
             await _press_at(page, float(x), float(y))
         how, got = await _arrival(session, landing, before, shown,
                                   time.monotonic() + float(timeout_seconds), failures,
-                                  page=page, pages_before=pages_before, env=env)
+                                  page=page, pages_before=pages_before, env=env,
+                                  downloads_from=downloads_from)
     finally:
         with swallow("a context already gone has no listener to remove"):
             context.remove_listener("response", on_response)
@@ -2454,7 +2562,10 @@ async def download(session, selector=None, x=None, y=None,
             + (". " + "; ".join(seen) if seen else "")
             + ". browser_snapshot shows what the click did instead")
 
-    if how == "download":
+    if how == "engine":
+        saved, url = await _keep_engine_download(directory, *got, env=env)
+        declared = None
+    elif how == "download":
         with closing(_read_chunks(got, env=env)) as chunks:
             saved = save_download(directory, safe_filename(os.path.basename(got)), chunks, env=env)
         if env is not None:
@@ -2480,7 +2591,7 @@ async def download(session, selector=None, x=None, y=None,
     for opened in [p for p in session.pages() if id(p) not in pages_before]:
         # A tab the click opened only to show or start the file goes, so the
         # page a command drives is the one the click was made on again.
-        if opened.url in ("about:blank", url) or how == "download":
+        if opened.url in ("about:blank", url) or how in ("download", "engine"):
             with swallow("a tab the site already closed"):
                 await opened.close()
                 notes.append("closed the tab the file opened in")
@@ -2490,7 +2601,8 @@ async def download(session, selector=None, x=None, y=None,
         "saved": saved["path"], "filename": saved["filename"], "size": saved["size"],
         "mime": sniff_mime(saved["head"], saved["filename"], declared),
         "sha256": saved["sha256"],
-        "from": {"download": "the browser's download", "page": "the document the page showed",
+        "from": {"download": "the browser's download", "engine": "the browser's download",
+                 "page": "the document the page showed",
                  "viewer": "the PDF the browser's viewer showed"}[how],
         "url": url, "notes": notes, **remote_file(saved["path"])}, ensure_ascii=False)
 

@@ -63,6 +63,10 @@ class StealthSession:
         # Where Firefox's silent print writes `PRINT_FILE` (see print_prefs).
         self.prints: str | None = None
         self._download_root = download_root
+        # The engine's own downloads (Juggler's interceptor), newest last, each
+        # numbered so a tool can ask for those after a point; see _on_download.
+        self.download_events: deque = deque(maxlen=DOWNLOAD_EVENTS_KEPT)
+        self.download_count = 0
         self.network = network.Network(network_limits)
         # The identity's own content-area size, remembered by
         # `actions.set_viewport` the first time it changes it, so a call with
@@ -111,6 +115,7 @@ class StealthSession:
             await self._attach(await self._ipw.__aenter__())
             self.network.attach(self._context)
             self._arm_choosers()
+            self._arm_downloads()
             self._context.on("dialog", self._on_dialog)
         except BaseException:
             self._drop_downloads()
@@ -315,6 +320,38 @@ class StealthSession:
         for page in self.pages():
             _arm_page(page)
 
+    def _arm_downloads(self) -> None:
+        """Hear every download the engine takes, on every page, for the life
+        of the page.
+
+        ⛔ SINCE invisible-playwright 20f8a43 (2026-10-30) THE ENGINE TAKES
+        EVERY DOWNLOAD ITSELF. It sends `Browser.setDownloadOptions` at context
+        creation, so Juggler's interceptor saves each one into the engine's own
+        `invpw-downloads-*` directory under a uuid and raises a page
+        `download` event; Firefox's download manager, and with it the
+        `browser.download.dir` landing area download_prefs() sets, never sees
+        it. browser_download watched only that landing area, so from that pin
+        on every click that downloaded - an attachment, a blob link made after
+        the click (Indeed's "Download resume", 2026-11-11) - answered
+        "neither saved a file nor showed one" with the file sitting in the
+        engine's directory, and a browser_navigate to an attachment raised
+        "Download is starting" and saved nothing anywhere a caller could reach.
+        """
+        self._context.on("page", self._watch_page_downloads)
+        for page in self.pages():
+            self._watch_page_downloads(page)
+
+    def _watch_page_downloads(self, page) -> None:
+        page.on("download", self._on_download)
+
+    def _on_download(self, download) -> None:
+        self.download_count += 1
+        self.download_events.append((self.download_count, download))
+
+    def downloads_since(self, count: int) -> list:
+        """The engine's downloads numbered above `count`, oldest first."""
+        return [d for n, d in self.download_events if n > count]
+
     def page(self):
         """The page a command drives: the newest live one.
 
@@ -498,6 +535,7 @@ class StealthSession:
         self._dialog_unreported.clear()
         self._dialog_dropped = 0
         self._dialog_tasks.clear()
+        self.download_events.clear()
         if self._context is not None:
             with swallow("a context already gone may have dropped its dialog listener"):
                 self._context.remove_listener("dialog", self._on_dialog)
@@ -526,6 +564,11 @@ class StealthSession:
         for path in self._kept:
             shutil.rmtree(path, ignore_errors=True)
         self._kept.clear()
+
+
+#: How many of the engine's downloads a session remembers. Each is a handle to
+#: a file in the engine's directory, which goes with the browser either way.
+DOWNLOAD_EVENTS_KEPT = 64
 
 
 def _describe_dialog(event: dict) -> str:
