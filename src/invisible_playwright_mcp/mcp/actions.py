@@ -623,7 +623,16 @@ NEXT_MOVE = {
     "pointer_events_none": "it does not take pointer events at all, which is "
                            "usually deliberate: the page is refusing it for now.",
     "off_screen": "it is outside the window and could not be brought in.",
+    "missed": "the press and release were sent, and something other than "
+              "the element received them, so the press has already happened. "
+              "Look at the page (browser_snapshot or browser_take_screenshot) "
+              "before doing anything again; if what received it is part of "
+              "the control you meant, aim at that part with browser_click_at.",
 }
+
+#: The engine's words when an event went out and landed somewhere else
+#: (invisible-core's ActionMissed).
+_MISSED = "the action went out but did not reach the element"
 
 
 def next_move(why: dict) -> str:
@@ -719,6 +728,14 @@ async def _on_selector(session, selector: str, what: str, act):
     try:
         return await act()
     except Exception as exc:
+        # ⛔ A MISSED LANDING IS NOT A QUESTION ABOUT THE SELECTOR. The event
+        # went out, so the element was found and actionable; what the
+        # diagnosis would add is `matches: N` and "the page reports nothing
+        # wrong", which on Partner Center sent the reader after the selector
+        # when the press had already happened. Said as what it is instead.
+        if _MISSED in str(exc):
+            raise RuntimeError("%s\n\nwhat to do: %s"
+                               % (exc, NEXT_MOVE["missed"])) from exc
         try:
             why = await _diagnose(session.page(), selector)
         except Exception:

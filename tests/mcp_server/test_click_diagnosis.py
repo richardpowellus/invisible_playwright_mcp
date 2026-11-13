@@ -141,3 +141,31 @@ async def test_a_page_that_cannot_be_asked_is_not_called_a_bad_selector():
     """A navigation mid-diagnosis is not the caller's typo, and saying it was
     would send them to rewrite a selector that is fine."""
     assert await actions._diagnose(_Refusing("execution context was destroyed"), "#b") is None
+
+
+class _CountingPage:
+    """A page that would answer the diagnosis, and counts being asked."""
+
+    def __init__(self):
+        self.asked = 0
+
+    async def query_selector_all(self, selector):
+        self.asked += 1
+        return []
+
+
+async def test_a_missed_landing_says_the_press_happened_and_skips_the_diagnosis():
+    """Known-bad, 0.73.0 on Partner Center: "mousedown landed on path" came
+    back with `matches: 11` and "the page reports nothing wrong", which sends
+    the reader after the selector when the event had already been sent."""
+    page = _CountingPage()
+
+    async def act():
+        raise RuntimeError("Page.click: the action went out but did not reach "
+                           "the element: mousedown landed on path")
+
+    with pytest.raises(RuntimeError) as got:
+        await actions._on_selector(_Session(page), "he-button", "click", act)
+    assert page.asked == 0
+    assert "matches" not in str(got.value)
+    assert actions.NEXT_MOVE["missed"] in str(got.value)

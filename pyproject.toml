@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "invisible-playwright-mcp"
-version = "0.73.0"
+version = "0.73.1"
 description = "Anti detect browser and web browsing agent: undetected, no captchas, no blocks"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -154,6 +154,19 @@ dependencies = [
     # The tools of this package drive pages that can probe the canvas, so the
     # floor rises to the first wrapper sealed to firefox-51.
     "invisible-playwright>=0.41.0",
+    # ⛔ RICHARD'S FORK OF THE CORE, BY COMMIT, until the engine judges a
+    # landing by composed containment. invisible-core 63.68.0 as published
+    # judged a click on a web component's shadow `<button>` or icon as a miss
+    # of the component (`node.contains` stops at a shadow boundary), so every
+    # click and upload through Partner Center's `he-button` raised
+    # "the action went out but did not reach the element". The fork is
+    # v63.68.0 plus that fix and keeps the version string 63.68.0, because
+    # invisible-playwright pins `invisible-core==63.68.0` and the core's own
+    # pin check compares the string exactly. A git requirement is allowed
+    # here because this package is itself installed from git (uv resolves
+    # the URL dependencies of URL dependencies). Drop it once a published
+    # core carries the fix.
+    "invisible-core @ git+https://github.com/richardpowellus/invisible_core@3ebd859c52efc8b7d9bf3dd9ce8237a0231775ef",
     # HTML parsing for browser_read_html. Chosen over lxml by measurement: on
     # six real pages both found byte-identical sets of interactive elements,
     # so correctness did not separate them, and selectolax then parsed 3-5x
@@ -225,6 +238,11 @@ select = ["F"]
 
 [project.scripts]
 invisible-playwright-mcp = "invisible_playwright_mcp.cli:main"
+
+# The git requirement on the core (see dependencies) is a direct reference,
+# which hatchling refuses to write into the metadata unless told.
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/invisible_playwright_mcp"]
