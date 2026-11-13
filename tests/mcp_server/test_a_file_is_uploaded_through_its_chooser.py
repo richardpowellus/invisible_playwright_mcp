@@ -360,13 +360,29 @@ PAGE = b"""<!doctype html><html><body>
 <input id="behind" type="file" style="display:none">
 <button id="add" type="button" onclick="document.getElementById('hidden').click()">Add Document</button>
 <button id="inert" type="button">Nothing</button>
+<input id="shadowed" type="file" accept=".pdf" style="display:none">
+<x-add class="new-image-button"></x-add>
+<script>
+// A web component, the shape of Partner Center's he-button: its <button> and
+// its icon's <svg> live in shadow roots, so the pointer lands on a node
+// INSIDE them, and its click opens a hidden input with no label.
+customElements.define("x-icon", class extends HTMLElement { constructor() { super();
+  this.attachShadow({mode: "open"}).innerHTML =
+    '<span style="display:inline-block"><svg width="48" height="48" viewBox="0 0 10 10">' +
+    '<path d="M0 0H10V10H0Z" fill="teal"/></svg></span>'; }});
+customElements.define("x-add", class extends HTMLElement { constructor() { super();
+  this.attachShadow({mode: "open"}).innerHTML =
+    '<button type="button"><div><x-icon></x-icon></div></button>'; }});
+document.querySelector("x-add").addEventListener("click",
+  () => document.getElementById("shadowed").click());
+</script>
 <script>
 // What a page sees: the change event, whether it was trusted, and the names.
 window.seen = {};
 window.order = [];
 document.addEventListener("click", e => order.push(["click", e.target.id, e.isTrusted,
                                                     performance.now()]), true);
-for (const id of ["one", "many", "hidden", "behind"]) {
+for (const id of ["one", "many", "hidden", "behind", "shadowed"]) {
   document.getElementById(id).addEventListener("change", e => {
     window.seen[id] = {trusted: e.isTrusted, names: Array.from(e.target.files, f => f.name),
                        sizes: Array.from(e.target.files, f => f.size)};
@@ -428,6 +444,27 @@ def test_files_reach_the_page_with_a_trusted_change(url, env):
     assert seen["many"]["names"] == ["a.pdf", "b.pdf"]
     assert seen["hidden"]["names"] == ["b.pdf"]
     assert all(v["trusted"] for v in seen.values()), seen
+
+
+@pytest.mark.e2e
+def test_a_web_component_opens_its_hidden_input(url, env):
+    """The pointer lands on `path` inside the icon's shadow root, inside the
+    component's own shadow `<button>`. Known-bad, invisible-core 63.68.0 as
+    published: the engine judged the landing with `contains`, which stops at a
+    shadow boundary, so every click raised "the action went out but did not
+    reach the element: mousedown landed on path; mouseup landed on path" and
+    no file was ever attached (Partner Center's screenshot uploader)."""
+    async def body(session):
+        out = await actions.upload_files(session, "x-add.new-image-button",
+                                         [str(env / "a.pdf")])
+        return out, await session.page().evaluate("JSON.stringify(seen)")
+
+    out, seen = asyncio.run(_with_browser(url, body))
+    import json
+    seen = json.loads(seen)
+    assert out == ("attached 1 file to x-add.new-image-button "
+                   "(picked in the file chooser): a.pdf"), out
+    assert seen["shadowed"]["names"] == ["a.pdf"] and seen["shadowed"]["trusted"]
 
 
 @pytest.mark.e2e
