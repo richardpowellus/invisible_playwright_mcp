@@ -180,7 +180,8 @@ async def test_failed_upload_cleanup_keeps_owner_record_for_retry(owners, monkey
 async def test_support_first_allocates_the_owners_upload_directory(owners):
     opened = await call("A", "browser_open", {"browser": "support"})
     directory = upload_dir(opened)
-    assert "fill handle:" not in success(opened)
+    # Support's own handle is the last line, as main's is.
+    assert success(opened).splitlines()[-1].startswith("fill handle: bh_")
     assert upload_dir(await call("A", "browser_open")) == directory
 
 

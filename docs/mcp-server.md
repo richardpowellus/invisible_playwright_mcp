@@ -725,12 +725,17 @@ Only files staged in that caller's upload directory may use upstream's chooser
 upload; `save_to` is confined to that caller's download directory. Files survive
 browser reopen, then disappear on owner expiry, session end or process exit.
 
-The main browser's final `fill handle` line is a secret generation-bound
-capability. A trusted filler passes it in `_meta["stealthfox/browser_handle"]`;
-it permits only main's status, reads, screenshot, type, press-key, select-option and click
+Each browser's final `fill handle` line (`main` and `support` each have their
+own) is a secret generation-bound capability. A trusted filler passes it in
+`_meta["stealthfox/browser_handle"]`; the handle, not the arguments, chooses the
+browser: a delegated call that names no `browser` is pointed at the handle's
+own, and one naming the other browser is refused. It permits only that
+browser's status, reads, screenshot, type, press-key, select-option and click
 tools (the last two choose a card expiry for 1Password and leave a filled card
 field, so a tokenizer that encrypts on blur sees it). It cannot open,
-close, navigate, upload or download. Closing/reopening main revokes it; delegated
+close, navigate, upload or download. Closing/reopening its browser revokes it
+(the other browser's handle is untouched); a support handle never exports
+cookies; delegated
 status omits both directory paths. Initialize advertises
 `stealthfox/owner-isolation: {"version": 1}`.
 

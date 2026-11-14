@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -199,12 +200,19 @@ async def test_revoked_handle_never_exports_by_delegation(opened, monkeypatch):
 
 async def test_support_browser_cannot_be_selected_or_supply_a_handle(opened, owners):
     support = success(await call("A", "browser_open", {"browser": "support"}))
-    assert "fill handle:" not in support
+    support_handle = re.search(r"fill handle: (bh_[A-Za-z0-9_-]{43})", support)[1]
     other = owners.entries["A"].work._open["support"]
     other._context = SimpleNamespace(cookies=AsyncMock(return_value=[cookie(value="support-secret")]))
     for browser in ("main", "support", None):
         result = await export(opened, browser=browser)
         assert result.isError
+    # Support's own handle exports nothing, directly or by delegation.
+    result = await export(opened, browser_handle=support_handle)
+    assert result.isError and text(result) == HANDLE_ERROR
+    result = await call("filler", cookies.TOOL, {
+        "browser_handle": support_handle, "origins": [ORIGIN]},
+        meta={**identity("filler"), HANDLE_KEY: support_handle})
+    assert result.isError and support_handle not in text(result)
     assert CANARY in success(await export(opened))
     other._context.cookies.assert_not_awaited()
 
