@@ -167,8 +167,12 @@ class BrowserMCP(FastMCP):
                     metadata = meta.model_dump() if meta else {}
                     windows.append(owners.redaction_windows(metadata))
                     _result_windows.set(tuple(windows))
+                    # target() may fill in the browser a fill handle selects,
+                    # so it must be handed the dict the tool will be called with.
+                    if request.params.arguments is None:
+                        request.params.arguments = {}
                     async with owners.target(metadata, request.params.name,
-                                             request.params.arguments or {}) as selected:
+                                             request.params.arguments) as selected:
                         result = await dispatch(selected)
             except Exception as exc:
                 result = self._mcp_server._make_error_result(str(exc))
@@ -431,8 +435,9 @@ OWNER_INSTRUCTIONS = """This is a trusted mcpd owner-isolated server. Only your 
 main/support browsers are visible. Profiles are ephemeral: profile arguments
 and file: navigation are refused, and reopening does not restore cookies.
 Open a browser with browser_open before using it; no other tool opens one.
-browser_open and browser_status disclose a fill handle for your main browser;
-pass it only to a trusted credential filler. Closing/reopening revokes it.
+browser_open and browser_status disclose a fill handle for each browser, main
+and support; each selects only its own browser. Pass it only to a trusted
+credential filler. Closing/reopening that browser revokes its handle.
 The process-wide browser cap includes other sessions; a refusal evicts nobody.
 For uploads, copy files into your private `upload dir` shown by browser_open
 or browser_status. Shared staging roots and other owners' files are refused.
@@ -655,7 +660,8 @@ async def browser_status(browser: Browser = None) -> str:
 
 def _cookie_export_arguments(arguments: dict[str, Any]) -> cookies.ExportArguments:
     try:
-        if owners is None or owners.resolve_handle(arguments.get("browser_handle")) is not _work():
+        if owners is None or owners.resolve_handle(arguments.get("browser_handle"),
+                                                   DEFAULT_BROWSER_ID) is not _work():
             raise ValueError(HANDLE_ERROR)
     except ValueError:
         raise cookies.ExportError(HANDLE_ERROR) from None

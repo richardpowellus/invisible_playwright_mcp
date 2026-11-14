@@ -170,8 +170,9 @@ observes stdin hangup and SIGTERM even if teardown blocks the event loop; after
 mcpd remains responsible for terminating the browser process group.
 
 The owner's `browser_open` and `browser_status` disclose a generation-bound
-**fill handle** for `main`, for delegation to a trusted credential filler.
-Treat it as a secret; closing/reopening revokes it. See
+**fill handle** for each browser (`main` and `support` get distinct ones), for
+delegation to a trusted credential filler. A handle selects only its own
+browser. Treat it as a secret; closing/reopening that browser revokes it. See
 [owner-mode configuration and the transport trust boundary](docs/mcp-server.md#shared-mcpd-owner-mode).
 
 ### CAPTCHA solving

@@ -716,17 +716,74 @@ async def test_wrong_handle_does_not_echo_or_fall_back(owners, wrong):
     assert result.isError and text(result) == "Invalid or revoked browser fill handle."
 
 
-async def test_handle_rotates_only_for_main_and_is_revoked_on_close(owners):
+async def test_handle_rotates_per_browser_and_is_revoked_on_close(owners):
     old = handle(await call("A", "browser_open"))
     assert handle(await call("A", "browser_status")) == old
-    assert "fill handle" not in success(await call("A", "browser_open", {"browser": "support"}))
-    assert "fill handle" not in success(await call("A", "browser_status", {"browser": "support"}))
+    support = handle(await call("A", "browser_open", {"browser": "support"}))
+    assert support != old
+    assert handle(await call("A", "browser_status", {"browser": "support"})) == support
+    # main's status shows only main's handle, support's only support's.
+    assert handle(await call("A", "browser_status")) == old
     new = handle(await call("A", "browser_open"))
     assert new != old
     assert (await call("B", "browser_status", meta={**identity("B"), HANDLE_KEY: old})).isError
+    # Reopening main leaves support's handle alone.
+    success(await call("B", "browser_status", meta={**identity("B"), HANDLE_KEY: support}))
     success(await call("A", "browser_close"))
     assert (await call("B", "browser_status", meta={**identity("B"), HANDLE_KEY: new})).isError
+    success(await call("A", "browser_close", {"browser": "support"}))
+    assert (await call("B", "browser_status", meta={**identity("B"), HANDLE_KEY: support})).isError
     assert len(owners.handles) == 0
+
+
+async def test_support_handle_status_attests_support_for_a_filler_naming_no_browser(owners):
+    main = handle(await call("A", "browser_open"))
+    support = handle(await call("A", "browser_open", {"browser": "support"}))
+    meta = {**identity("filler"), HANDLE_KEY: support}
+    status = success(await call("filler", "browser_status", meta=meta))
+    assert status.splitlines()[-1] == "fill handle: " + support
+    assert main not in status
+    assert "filler" not in owners.entries
+
+
+@pytest.mark.parametrize("name,args", [(n, a) for n, a in EVERY_TOOL if n in HANDLE_TOOLS])
+async def test_support_handle_reaches_only_support(owners, monkeypatch, name, args):
+    main = handle(await call("A", "browser_open"))
+    support = handle(await call("A", "browser_open", {"browser": "support"}))
+    b = owners.entries["A"].work._open["support"]
+    touched = []
+
+    async def record(session, *args, **kwargs):
+        touched.append(session)
+        return "read or typed"
+
+    for action in ("evaluate", "snapshot", "read_html", "read_text", "type_text", "press_key",
+                   "select_option", "click"):
+        monkeypatch.setattr(actions, action, record)
+    async def screenshot(session):
+        touched.append(session)
+        return b"png"
+    monkeypatch.setattr(actions, "screenshot_png", screenshot)
+    plain = {key: value for key, value in args.items() if key != "browser"}
+    meta = {**identity("B"), HANDLE_KEY: support}
+    if name == "browser_cookies_export":
+        # Cookie export reads main only; a support handle never reaches it.
+        result = await call("B", name, dict(plain, browser_handle=support), meta=meta)
+        assert result.isError and support not in text(result) and main not in text(result)
+        return
+    for browser in (None, "support"):
+        arguments = plain if browser is None else dict(plain, browser=browser)
+        result = await call("B", name, arguments, meta=meta)
+        assert not result.isError, text(result)
+        if name == "browser_status":
+            assert text(result).splitlines()[-1] == "fill handle: " + support
+            assert main not in text(result)
+    if name != "browser_status":
+        assert touched == [b, b]
+    # A support handle can never be pointed at main.
+    result = await call("B", name, dict(plain, browser="main"), meta=meta)
+    assert result.isError and support not in text(result)
+    assert touched.count(owners.entries["A"].work._open["main"]) == 0
 
 
 async def test_handle_requires_caller_identity_too(owners):

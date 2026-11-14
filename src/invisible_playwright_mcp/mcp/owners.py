@@ -161,7 +161,9 @@ class OwnerWork(Work):
         #: Why a browser was last removed, by role. Persists until the role
         #: is reopened or the reason is consumed by session()/listing().
         self._removal_reasons: dict[str, str] = {}
-        self.fill_handle: str | None = None
+        #: One fill handle per open browser role (main and support), each bound
+        #: to that role's generation: closing or reopening the role revokes it.
+        self.fill_handles: dict[str, str] = {}
         self.upload_dir: Path | None = None
         self.download_dir: Path | None = None
         self.owner = ""
@@ -200,12 +202,18 @@ class OwnerWork(Work):
         if self.download_dir is not None:
             result += "\ndownload dir: " + str(self.download_dir)
         result += actions.remote_dir_lines(self.upload_dir, self.download_dir)
-        if role == DEFAULT_BROWSER_ID and role in self._open:
-            if self.fill_handle is None:
-                self.fill_handle = "bh_" + secrets.token_urlsafe(32)
-                self.registry.handles[self.registry.handle_hash(self.fill_handle)] = self
-            result += "\nfill handle: " + self.fill_handle
+        if role in self._open:
+            if role not in self.fill_handles:
+                fill_handle = "bh_" + secrets.token_urlsafe(32)
+                self.fill_handles[role] = fill_handle
+                self.registry.handles[self.registry.handle_hash(fill_handle)] = (self, role)
+            result += "\nfill handle: " + self.fill_handles[role]
         return result
+
+    @property
+    def fill_handle(self) -> str | None:
+        """The main browser's handle (the one cookie export accepts)."""
+        return self.fill_handles.get(DEFAULT_BROWSER_ID)
 
     def _check_cert_profile(self, settings: dict) -> None:
         # _start allocates the private owner profile before StealthSession.start.
@@ -401,10 +409,12 @@ class OwnerWork(Work):
             raise
         return session
 
-    def revoke(self) -> None:
-        if self.fill_handle is not None:
-            self.registry.handles.pop(self.registry.handle_hash(self.fill_handle), None)
-            self.fill_handle = None
+    def revoke(self, role: str | None = None) -> None:
+        """Revoke one role's fill handle, or every role's when role is None."""
+        for each in ([role] if role is not None else list(self.fill_handles)):
+            fill_handle = self.fill_handles.pop(each, None)
+            if fill_handle is not None:
+                self.registry.handles.pop(self.registry.handle_hash(fill_handle), None)
 
     async def _drop(self, role: str, *, reason: str = "") -> None:
         if reason and (role in self._open or role in self.profiles):
@@ -420,8 +430,7 @@ class OwnerWork(Work):
                 logger.exception("Background typing failed while its owner browser was closing")
         self.dead.add(role)
         self.lost.discard(role)
-        if role == DEFAULT_BROWSER_ID:
-            self.revoke()
+        self.revoke(role)
         session = self._open.get(role)
         if session is not None:
             await session.close()
@@ -440,8 +449,7 @@ class OwnerWork(Work):
         self.report_gone(role, cause)
         self.dead.add(role)
         self._removal_reasons[role] = "it closed or crashed"
-        if role == DEFAULT_BROWSER_ID:
-            self.revoke()
+        self.revoke(role)
         return RuntimeError(GONE % role)
 
     def session(self, role: str) -> StealthSession:
@@ -504,8 +512,8 @@ class OwnerWork(Work):
             result += "\ndownload dir: " + str(self.download_dir)
         if not _delegated_call.get():
             result += actions.remote_dir_lines(self.upload_dir, self.download_dir)
-        if role == DEFAULT_BROWSER_ID and self.fill_handle is not None:
-            result += "\nfill handle: " + self.fill_handle
+        if role in self.fill_handles:
+            result += "\nfill handle: " + self.fill_handles[role]
         return result
 
     async def listing(self) -> dict:
@@ -556,7 +564,8 @@ class Owners:
                 "Owner mode refuses download roots containing the profile temp directory; "
                 "configure a separate download directory.")
         self.entries: dict[str, Owner] = {}
-        self.handles: dict[bytes, OwnerWork] = {}
+        #: sha256(handle) -> (owner work, browser role the handle selects).
+        self.handles: dict[bytes, tuple[OwnerWork, str]] = {}
         self.ended: OrderedDict[str, None] = OrderedDict()
         #: Removal reasons from recently reaped entries, carried forward to the
         #: next incarnation of that identity so the caller hears WHY it is gone.
@@ -597,11 +606,22 @@ class Owners:
     def handle_hash(handle: str) -> bytes:
         return hashlib.sha256(handle.encode("ascii")).digest()
 
-    def resolve_handle(self, handle: object) -> OwnerWork:
+    def resolve(self, handle: object) -> tuple[OwnerWork, str]:
+        """The owner work and the browser role a current fill handle selects."""
         if not isinstance(handle, str) or _HANDLE.fullmatch(handle) is None:
             raise ValueError(HANDLE_ERROR)
-        work = self.handles.get(self.handle_hash(handle))
-        if work is None or not hmac.compare_digest(work.fill_handle or "", handle):
+        found = self.handles.get(self.handle_hash(handle))
+        if found is None:
+            raise ValueError(HANDLE_ERROR)
+        work, role = found
+        if not hmac.compare_digest(work.fill_handles.get(role, ""), handle):
+            raise ValueError(HANDLE_ERROR)
+        return work, role
+
+    def resolve_handle(self, handle: object, role: str | None = None) -> OwnerWork:
+        """The owner work of a current handle; with role, only that role's handle."""
+        work, resolved = self.resolve(handle)
+        if role is not None and resolved != role:
             raise ValueError(HANDLE_ERROR)
         return work
 
@@ -639,9 +659,19 @@ class Owners:
         identity = owner_id(meta)
         handle = meta.get(HANDLE_KEY)
         if HANDLE_KEY in meta:
-            if tool not in HANDLE_TOOLS or arguments.get("browser") not in (None, "main"):
+            if tool not in HANDLE_TOOLS:
                 raise ValueError("This tool or browser is not permitted with a fill handle.")
-            work = self.resolve_handle(handle)
+            work, role = self.resolve(handle)
+            # The handle, not the caller, chooses the browser. A filler that
+            # names one must name the handle's own; one that names none gets
+            # it filled in. Cookie export takes no browser and reads main only.
+            if tool == "browser_cookies_export":
+                if role != DEFAULT_BROWSER_ID:
+                    raise ValueError("This tool or browser is not permitted with a fill handle.")
+            elif arguments.get("browser") not in (None, role):
+                raise ValueError("This tool or browser is not permitted with a fill handle.")
+            else:
+                arguments["browser"] = role
             target = next(entry for entry in self.entries.values() if entry.work is work)
         else:
             target = self.caller(identity)
@@ -659,7 +689,7 @@ class Owners:
                 if self.stopping.is_set() or target.ended or identity in self.ended:
                     raise ValueError("This browser owner session has ended.")
                 # Closing/reopening may have happened while this call queued.
-                if HANDLE_KEY in meta and self.resolve_handle(handle) is not target.work:
+                if HANDLE_KEY in meta and self.resolve(handle) != (target.work, role):
                     raise ValueError(HANDLE_ERROR)
                 target.last_used = self.clock()
                 if tool == "browser_navigate":

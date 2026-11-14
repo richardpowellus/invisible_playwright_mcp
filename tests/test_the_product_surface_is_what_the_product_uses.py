@@ -295,7 +295,8 @@ def test_the_gate_is_looking_at_the_whole_package():
     # 136 methods now meet the same exclusions. Printing adds Work.print_news: 137.
     # Hearing the engine's downloads adds StealthSession._arm_downloads,
     # _watch_page_downloads, _on_download and downloads_since: 141.
-    assert methods <= 141, "%d methods judged; the exclusions have stopped applying" % methods
+    # A fill handle per browser role adds Owners.resolve: 142.
+    assert methods <= 142, "%d methods judged; the exclusions have stopped applying" % methods
     reached = set()
     for text in sources.values():
         reached.update(_on_an_object(ast.parse(text), known))
