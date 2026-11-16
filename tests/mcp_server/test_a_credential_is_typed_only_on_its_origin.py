@@ -318,11 +318,37 @@ def test_a_field_that_masks_its_own_display_is_kept_and_says_so(monkeypatch):
     assert len(s._page.calls) == 1
 
 
+def test_a_masking_field_still_showing_its_last_character_is_awaited(monkeypatch):
+    s = _Session()
+    settling = {"kept": False, "empty": False, "exact": False, "settling": True}
+    masked = {"kept": True, "empty": False, "exact": False, "masked": True}
+    reads = iter([settling, settling, masked])
+
+    async def read(*args, **kwargs):
+        return next(reads, masked)
+
+    monkeypatch.setattr(s._page, "eval_on_selector", read)
+    answer = asyncio.run(actions.type_text(s, "#n", "4111111111111111", "https://login.example.com", "text"))
+    assert answer.endswith("the page masked it, showing one bullet for each character typed and none of the characters")
+    assert len(s._page.calls) == 1
+
+
+def test_a_field_that_never_finishes_masking_is_an_unknown_outcome(monkeypatch):
+    s = _Session()
+    monkeypatch.setattr(actions, "MASK_SETTLE_S", 0.3)
+    _masked_reads(monkeypatch, s, {"kept": False, "empty": False, "exact": False, "settling": True})
+    with pytest.raises(RuntimeError, match="outcome is unknown"):
+        asyncio.run(actions.type_text(s, "#n", "4111111111111111", "https://login.example.com", "text"))
+    assert len(s._page.calls) == 1
+
+
 @pytest.mark.parametrize("state", [
     {"kept": False, "empty": False, "masked": True},
     {"kept": True, "empty": False, "exact": True, "masked": True},
     {"kept": True, "empty": False, "exact": False, "masked": False},
     {"kept": True, "empty": True, "exact": False, "masked": True},
+    {"kept": False, "empty": False, "settling": True},
+    {"kept": True, "empty": False, "exact": False, "settling": True},
 ])
 def test_a_malformed_masked_state_is_an_unknown_outcome(monkeypatch, state):
     s = _Session()
@@ -383,15 +409,24 @@ def login_page():
     });
     </script><x-sealed id=sealed></x-sealed><x-open id=host></x-open></body></html>"""
     # A card input that keeps the digits in page state and shows one bullet
-    # per digit in 4-groups (One Inc PortalOne, 2026-11-16).
+    # per digit in 4-groups, the last digit for a second first: One Inc
+    # PortalOne's updateValueFromHideInputContent, as published 2026-11-16.
     self_masking = r"""<html><body><input id=n type=text inputmode=numeric maxlength=19><script>
     window.kept = '';
     const field = document.querySelector('#n');
+    const group = s => s.replace(/(.{4})(?=.)/g, '$1 ');
+    let timer;
     field.addEventListener('input', () => {
-        const typed = field.value.replace(/[^0-9]/g, '');
-        const bullets = field.value.replace(/[^\u2022]/g, '').length;
-        window.kept = window.kept.slice(0, bullets) + typed;
-        field.value = '\u2022'.repeat(window.kept.length).replace(/(.{4})(?=.)/g, '$1 ');
+        const size = (field.value.match(/\u2022|\d/g) || []).length;
+        let digits = field.value.replace(/\u2022|\D/g, '');
+        if (!digits) { window.kept = ''; field.value = ''; return; }
+        if (window.kept.length === digits.length && window.kept !== digits && digits.length > 2 ||
+            window.kept.length === 0 && digits.length > 2) window.kept = digits;
+        window.kept = window.kept.substring(0, size - 1) + digits.slice(-1);
+        field.value = group('\u2022'.repeat(size - 1) + digits.slice(-1));
+        timer = timer || setTimeout(() => {
+            field.value = group('\u2022'.repeat(window.kept.length)); timer = undefined;
+        }, 1000);
     });
     </script></body></html>""".encode()
     pages = {"/vuetify": vuetify, "/wipes-first-input": wipes_input, "/closed-twin": closed_twin,
@@ -577,6 +612,11 @@ async def test_a_card_field_that_masks_its_own_display_keeps_the_number(login_pa
                           "character typed and none of the characters")
         assert await page.input_value("#n") == "\u2022\u2022\u2022\u2022 " * 3 + "\u2022" * 4
         assert await page.evaluate("window.kept") == "4111111111111111"
+        # A second write replaces the first, as the filler's number replaces
+        # its canary, and is kept the same way.
+        answer = await actions.type_text(_S(), "#n", "5500000000000004", login_page, "text")
+        assert answer.endswith("the page masked it, showing one bullet for each character typed and none of the characters")
+        assert await page.evaluate("window.kept") == "5500000000000004"
         # A glyph count other than the typed length is not this value, masked.
         assert await page.eval_on_selector(
             "#n", actions._GUARDED_STATE_JS, {"origin": login_page, "text": "411111111111111"}
