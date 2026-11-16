@@ -1302,6 +1302,9 @@ async def type_text(session, selector: str, text: str,
 GUARD_SETTLE_S = 0.75
 GUARD_SINCE_START_S = 2.0
 GUARD_ATTEMPTS = 3
+#: How long after the write began a self-masking field may keep showing its
+#: last character (PortalOne masks it after one second).
+MASK_SETTLE_S = 5.0
 #: ⛔ A FIELD THAT FORMATS ITS VALUE STILL KEPT IT. A card number typed as 16
 #: digits reads back as "NNNN NNNN NNNN NNNN"; an exact comparison called that
 #: "did not keep the value ... the write outcome is unknown" (Helcim,
@@ -1317,16 +1320,29 @@ GUARD_ATTEMPTS = 3
 #: value must be mask glyphs and separators only, with exactly one glyph for
 #: each character typed, and the answer says the page masked it. A caller
 #: that cannot accept that evidence treats the answer as unconfirmed.
+#:
+#: ⛔ A MASKING PAGE MAY SHOW THE LAST CHARACTER BRIEFLY. PortalOne's
+#: hide-input component shows "•••• •••• •••• •••1" for one second, then
+#: masks that too. The first read-back landed inside that second and called
+#: the write unknown (bug 20261116-172854-9fbd). That state - every glyph but
+#: the last, which is the last character typed - is "settling": the read-back
+#: keeps polling, for at most MASK_SETTLE_S after the write began, and only a
+#: fully masked field is kept.
 _GUARDED_STATE_JS = r"""(el, expected) => {
     if (el.ownerDocument.location.origin !== expected.origin ||
         !('value' in el)) return null;
     const bare = (s) => s.replace(/[\s.\/\-\u2010-\u2015\u2212]/g, '');
     const exact = el.value === expected.text;
     const kept = exact || (bare(el.value) !== '' && bare(el.value) === bare(expected.text));
-    if (!kept && expected.text !== '' && /^[\u2022\u25CF*]+$/.test(bare(el.value)) &&
-        Array.from(bare(el.value)).length === Array.from(bare(expected.text)).length &&
-        !/[\u2022\u25CF*]/.test(expected.text)) {
-        return {kept: true, empty: false, exact: false, masked: true};
+    const glyph = (c) => c === '\u2022' || c === '\u25CF' || c === '*';
+    const shown = Array.from(bare(el.value)), want = Array.from(bare(expected.text));
+    if (!kept && want.length > 0 && shown.length === want.length && !want.some(glyph)) {
+        if (shown.every(glyph)) return {kept: true, empty: false, exact: false, masked: true};
+        // One Inc's PortalOne shows the last character typed for a second
+        // before masking it too: still settling, not yet an outcome.
+        if (shown.slice(0, -1).every(glyph) && shown[shown.length - 1] === want[want.length - 1]) {
+            return {kept: false, empty: false, exact: false, settling: true};
+        }
     }
     return {kept: kept, empty: el.value === '', exact: exact};
 }"""
@@ -1335,8 +1351,10 @@ _GUARDED_STATE_JS = r"""(el, expected) => {
 def _guarded_state_valid(state, text: str) -> bool:
     """Kept (and empty exactly when nothing was to be typed), or positively
     empty; anything else - null, a wrong shape - is an unknown outcome."""
-    if not isinstance(state, dict) or set(state) - {"kept", "empty", "exact", "masked"}:
+    if not isinstance(state, dict) or set(state) - {"kept", "empty", "exact", "masked", "settling"}:
         return False
+    if "settling" in state:
+        return state == {"kept": False, "empty": False, "exact": False, "settling": True}
     if "masked" in state and (state["masked"] is not True or state.get("kept") is not True
                               or state.get("exact") is not False):
         return False
@@ -1398,6 +1416,13 @@ async def _type_on_origin(page, selector, text, expect_origin, expect_input_type
                 raise RuntimeError(
                     "the origin-locked field did not keep the value or could not be read back; "
                     "the write outcome is unknown. Read the page before typing again")
+            if state.get("settling"):
+                if time.monotonic() - began >= MASK_SETTLE_S:
+                    raise RuntimeError(
+                        "the origin-locked field did not keep the value or could not be read back; "
+                        "the write outcome is unknown. Read the page before typing again")
+                await asyncio.sleep(0.1)
+                continue
             if not state["kept"]:
                 # A first-focus model render can erase an autofill. Only a
                 # positively empty field permits another origin/type-locked write.
