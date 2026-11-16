@@ -1308,12 +1308,26 @@ GUARD_ATTEMPTS = 3
 #: 2026-10-26), and a caller told the outcome is unknown types again. A value
 #: that differs only by the separators `masked.SEPARATORS` names is kept, and
 #: the answer says the page reformatted it.
+#:
+#: ⛔ A FIELD THAT MASKS ITS OWN DISPLAY STILL KEPT IT. Some card forms
+#: (One Inc PortalOne, 2026-11-16) keep the number in their own state and put
+#: one bullet per digit into the input, so `el.value` reads
+#: "•••• •••• •••• ••••". Nothing the page exposes can show WHICH digits it
+#: kept, so this is weaker evidence than a match and is named as such: the
+#: value must be mask glyphs and separators only, with exactly one glyph for
+#: each character typed, and the answer says the page masked it. A caller
+#: that cannot accept that evidence treats the answer as unconfirmed.
 _GUARDED_STATE_JS = r"""(el, expected) => {
     if (el.ownerDocument.location.origin !== expected.origin ||
         !('value' in el)) return null;
     const bare = (s) => s.replace(/[\s.\/\-\u2010-\u2015\u2212]/g, '');
     const exact = el.value === expected.text;
     const kept = exact || (bare(el.value) !== '' && bare(el.value) === bare(expected.text));
+    if (!kept && expected.text !== '' && /^[\u2022\u25CF*]+$/.test(bare(el.value)) &&
+        Array.from(bare(el.value)).length === Array.from(bare(expected.text)).length &&
+        !/[\u2022\u25CF*]/.test(expected.text)) {
+        return {kept: true, empty: false, exact: false, masked: true};
+    }
     return {kept: kept, empty: el.value === '', exact: exact};
 }"""
 
@@ -1321,7 +1335,10 @@ _GUARDED_STATE_JS = r"""(el, expected) => {
 def _guarded_state_valid(state, text: str) -> bool:
     """Kept (and empty exactly when nothing was to be typed), or positively
     empty; anything else - null, a wrong shape - is an unknown outcome."""
-    if not isinstance(state, dict) or set(state) - {"kept", "empty", "exact"}:
+    if not isinstance(state, dict) or set(state) - {"kept", "empty", "exact", "masked"}:
+        return False
+    if "masked" in state and (state["masked"] is not True or state.get("kept") is not True
+                              or state.get("exact") is not False):
         return False
     kept, empty = state.get("kept"), state.get("empty")
     if not isinstance(kept, bool) or not isinstance(empty, bool):
@@ -1390,6 +1407,9 @@ async def _type_on_origin(page, selector, text, expect_origin, expect_input_type
                     "the page emptied the origin-locked field after each of three writes; "
                     "nothing is held there now; do not retry automatically")
             if time.monotonic() >= until:
+                if state.get("masked") is True:
+                    return (f"typed into {selector}; the page masked it, showing one "
+                            "bullet for each character typed and none of the characters")
                 if state.get("exact") is False:
                     return (f"typed into {selector}; the page reformatted it, adding or "
                             "removing only spaces, dashes, dots or slashes")
