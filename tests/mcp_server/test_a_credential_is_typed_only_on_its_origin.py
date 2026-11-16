@@ -302,6 +302,36 @@ async def test_origin_refusal_is_an_mcp_error_with_the_fillers_no_write_contract
     assert not page.read
 
 
+def _masked_reads(monkeypatch, s, state):
+    async def read(*args, **kwargs):
+        return state
+
+    monkeypatch.setattr(s._page, "eval_on_selector", read)
+
+
+def test_a_field_that_masks_its_own_display_is_kept_and_says_so(monkeypatch):
+    s = _Session()
+    _masked_reads(monkeypatch, s, {"kept": True, "empty": False, "exact": False, "masked": True})
+    answer = asyncio.run(actions.type_text(s, "#n", "4111111111111111", "https://login.example.com", "text"))
+    assert answer == ("typed into #n; the page masked it, showing one bullet for each "
+                      "character typed and none of the characters")
+    assert len(s._page.calls) == 1
+
+
+@pytest.mark.parametrize("state", [
+    {"kept": False, "empty": False, "masked": True},
+    {"kept": True, "empty": False, "exact": True, "masked": True},
+    {"kept": True, "empty": False, "exact": False, "masked": False},
+    {"kept": True, "empty": True, "exact": False, "masked": True},
+])
+def test_a_malformed_masked_state_is_an_unknown_outcome(monkeypatch, state):
+    s = _Session()
+    _masked_reads(monkeypatch, s, state)
+    with pytest.raises(RuntimeError, match="outcome is unknown"):
+        asyncio.run(actions.type_text(s, "#n", "4111111111111111", "https://login.example.com", "text"))
+    assert len(s._page.calls) == 1
+
+
 # --- through the real engine -------------------------------------------------
 
 
@@ -352,7 +382,20 @@ def login_page():
         }
     });
     </script><x-sealed id=sealed></x-sealed><x-open id=host></x-open></body></html>"""
-    pages = {"/vuetify": vuetify, "/wipes-first-input": wipes_input, "/closed-twin": closed_twin}
+    # A card input that keeps the digits in page state and shows one bullet
+    # per digit in 4-groups (One Inc PortalOne, 2026-11-16).
+    self_masking = r"""<html><body><input id=n type=text inputmode=numeric maxlength=19><script>
+    window.kept = '';
+    const field = document.querySelector('#n');
+    field.addEventListener('input', () => {
+        const typed = field.value.replace(/[^0-9]/g, '');
+        const bullets = field.value.replace(/[^\u2022]/g, '').length;
+        window.kept = window.kept.slice(0, bullets) + typed;
+        field.value = '\u2022'.repeat(window.kept.length).replace(/(.{4})(?=.)/g, '$1 ');
+    });
+    </script></body></html>""".encode()
+    pages = {"/vuetify": vuetify, "/wipes-first-input": wipes_input, "/closed-twin": closed_twin,
+             "/self-masking": self_masking}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -387,7 +430,7 @@ async def test_the_engine_writes_on_the_expected_origin_and_nowhere_else(login_p
         await page.goto(login_page + "/login")
         assert await page.eval_on_selector(
             "#p", actions._GUARDED_STATE_JS, {"origin": login_page, "text": "hunter2"}
-        ) == {"kept": False, "empty": True}
+        ) == {"kept": False, "empty": True, "exact": False}
         with pytest.raises(Exception) as refused:
             await actions.type_text(s, "#p", "hunter2", "https://login.example.com")
         assert "hunter2" not in str(refused.value)
@@ -513,4 +556,29 @@ async def test_strict_refuses_a_twin_in_a_closed_shadow_root(login_page):
         await page.goto(login_page + "/closed-twin")
         assert await actions.type_text(s, pinned, "hunter2", login_page, "password") == "typed into " + pinned
         assert await page.evaluate(values) == {"sealed": "hunter2", "open": ""}
+        await ctx.close()
+
+
+@pytest.mark.e2e
+async def test_a_card_field_that_masks_its_own_display_keeps_the_number(login_page):
+    from invisible_playwright.async_api import InvisiblePlaywright
+
+    async with InvisiblePlaywright(seed=1, headless=True) as browser:
+        ctx = await browser.new_context()
+        page = await ctx.new_page()
+
+        class _S:
+            def page(self):
+                return page
+
+        await page.goto(login_page + "/self-masking")
+        answer = await actions.type_text(_S(), "#n", "4111111111111111", login_page, "text")
+        assert answer == ("typed into #n; the page masked it, showing one bullet for each "
+                          "character typed and none of the characters")
+        assert await page.input_value("#n") == "\u2022\u2022\u2022\u2022 " * 3 + "\u2022" * 4
+        assert await page.evaluate("window.kept") == "4111111111111111"
+        # A glyph count other than the typed length is not this value, masked.
+        assert await page.eval_on_selector(
+            "#n", actions._GUARDED_STATE_JS, {"origin": login_page, "text": "411111111111111"}
+        ) == {"kept": False, "empty": False, "exact": False}
         await ctx.close()
