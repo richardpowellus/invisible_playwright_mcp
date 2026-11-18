@@ -277,11 +277,11 @@ PRESENCE_JS = """(element) => {
     function read(root) {
         if (root.nodeType === 9) {
             if (!root.body) throw new Error('No readable body');
-            values.push(root.body.innerText);
+            values.push({text: root.body.innerText});
         }
         for (const el of root.querySelectorAll('*')) {
             if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') values.push(el.value);
-            if (root.nodeType === 11 && typeof el.innerText === 'string') values.push(el.innerText);
+            if (root.nodeType === 11 && typeof el.innerText === 'string') values.push({text: el.innerText});
             if (el.shadowRoot) read(el.shadowRoot);
             if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
                 const doc = el.contentDocument;
@@ -319,16 +319,33 @@ async def guard_pixels(session) -> None:
         frames = list(getattr(page, "frames", None) or [page])
         answers = await asyncio.wait_for(asyncio.gather(
             *(frame.eval_on_selector("html", PRESENCE_JS) for frame in frames)), 5)
-        fields = []
+        fields, texts = [], []
         for answer in answers:
             if not isinstance(answer, list):
                 raise MaskRefusal(SCREENSHOT_REFUSED)
-            fields.extend(answer)
-        if not all(isinstance(v, str) for v in fields):
-            raise MaskRefusal(SCREENSHOT_REFUSED)
+            for entry in answer:
+                if isinstance(entry, str):
+                    fields.append(entry)
+                elif (isinstance(entry, dict) and set(entry) == {"text"}
+                        and isinstance(entry["text"], str)):
+                    texts.append(entry["text"])
+                else:
+                    raise MaskRefusal(SCREENSHOT_REFUSED)
+        # ⛔ A SHORT VALUE IN PAGE TEXT IS ORDINARY TEXT, NOT A CVC. A 3-7 digit
+        # value (CVC, expiry) matches any whole digit run joined by separators:
+        # "Version: 3.02" for 302, a price "$9.47" for 947, "10/29" for an
+        # expiry. The registry lives as long as the browser, so after one card
+        # fill on 2026-11-18 every Costco page and then EyeMed refused pixels
+        # for the rest of the session. A short value is therefore looked for
+        # only in form fields, where it was typed and where it stays; page
+        # text is checked for values of eight characters or more. Readers
+        # still redact short values everywhere.
+        long_only = {w for w in values.raw if not isinstance(w, _ShortPattern)}
         # The same matcher as the result boundary, so a value the page shows
         # reformatted (spaced card digits) is present here too.
         if any(redact_text(field, values.raw) != field for field in fields):
+            raise MaskRefusal(SCREENSHOT_REFUSED)
+        if any(redact_text(text, long_only) != text for text in texts):
             raise MaskRefusal(SCREENSHOT_REFUSED)
     except Exception:
         # A failed presence read is never permission to capture, and its

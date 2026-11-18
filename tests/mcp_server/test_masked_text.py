@@ -838,3 +838,98 @@ async def test_real_short_masked_field(login_page, owners, monkeypatch, value, s
         result = await call("A", "browser_take_screenshot")
         assert result.isError and text(result) == REFUSAL
         await owner.work.close_all()
+
+
+class _TextFrame:
+    def __init__(self, answer):
+        self.answer = answer
+
+    async def eval_on_selector(self, selector, expression):
+        return self.answer
+
+
+def _session_reading(*answers):
+    class Page:
+        frames = [_TextFrame(answer) for answer in answers]
+
+    class Session:
+        def page(self):
+            return Page()
+
+    return Session()
+
+
+@pytest.mark.parametrize("value,shown", [
+    ("302", "Version: 3.02"), ("947", "Total $9.47"), ("1029", "Delivered 10/29")])
+async def test_a_short_value_in_page_text_does_not_refuse_pixels(value, shown):
+    """2026-11-18: after a card fill, a CVC or expiry matched prices and
+    version numbers on every later page, and screenshots were refused for the
+    rest of the browser's life."""
+    from invisible_playwright_mcp.mcp import masked
+
+    session = _session_reading([{"text": shown}, ""])
+    masked.registry(session).register(value)
+    await masked.guard_pixels(session)
+
+
+@pytest.mark.parametrize("value,shown", [("302", "302"), ("0729", "07 / 29")])
+async def test_a_short_value_in_a_field_still_refuses_pixels(value, shown):
+    from invisible_playwright_mcp.mcp import masked
+
+    session = _session_reading([{"text": "nothing"}], [shown])
+    masked.registry(session).register(value)
+    with pytest.raises(masked.MaskRefusal):
+        await masked.guard_pixels(session)
+
+
+async def test_a_long_value_in_page_text_still_refuses_pixels():
+    from invisible_playwright_mcp.mcp import masked
+
+    session = _session_reading([{"text": "echo: Pw-0123456789-secret"}, ""])
+    masked.registry(session).register("Pw-0123456789-secret")
+    with pytest.raises(masked.MaskRefusal):
+        await masked.guard_pixels(session)
+
+
+@pytest.mark.parametrize("entry", [{"text": 1}, {"text": "x", "more": "y"}, {"value": "x"}, 7, None])
+async def test_a_malformed_presence_entry_refuses_pixels(entry):
+    from invisible_playwright_mcp.mcp import masked
+
+    session = _session_reading([entry])
+    masked.registry(session).register("302")
+    with pytest.raises(masked.MaskRefusal):
+        await masked.guard_pixels(session)
+
+
+@pytest.mark.e2e
+async def test_real_short_value_is_found_in_its_field_not_in_page_text(login_page, owners, monkeypatch):
+    from invisible_playwright.async_api import InvisiblePlaywright
+    from invisible_playwright_mcp.mcp.session import StealthSession
+
+    async with InvisiblePlaywright(seed=1, headless=True) as browser:
+        ctx = await browser.new_context()
+        page = await ctx.new_page()
+        await page.goto(login_page)
+        await page.evaluate("""() => {
+            const p = document.querySelector('#p');
+            p.type = 'text';
+            const note = document.createElement('p');
+            note.textContent = 'Version: 3.02 - total $3.02';
+            document.body.appendChild(note);
+        }""")
+        session = StealthSession()
+        session._context = ctx
+        owner = owners.caller("A")
+        owner.work._open["main"] = session
+        monkeypatch.setattr(actions, "GUARD_SETTLE_S", 0)
+        monkeypatch.setattr(actions, "GUARD_SINCE_START_S", 0)
+        success(await call("A", "browser_type", {
+            "selector": "#p", "text": "302", "expect_origin": login_page, "mask_value": True}))
+        refused = await call("A", "browser_take_screenshot")
+        assert refused.isError and text(refused) == REFUSAL
+        success(await call("A", "browser_type", {
+            "selector": "#p", "text": "", "expect_origin": login_page}))
+        shot = await call("A", "browser_take_screenshot")
+        assert not shot.isError
+        assert "3.02" not in success(await call("A", "browser_read_text"))
+        await owner.work.close_all()
