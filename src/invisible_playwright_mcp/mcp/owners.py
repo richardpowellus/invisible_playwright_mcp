@@ -190,9 +190,16 @@ class OwnerWork(Work):
     async def open(self, role: str, *, seed: int | None = None,
                    proxy: str | None = None, profile: str | None = None,
                    accept_lan_certs: list[str] | None = None) -> str:
-        if profile is not None:
+        # ⛔ "" IS ACCEPTED: it is the tool's own word for "no profile", which
+        # is exactly what owner mode gives every open. Refusing it sent a
+        # caller following the accept_lan_certs line ("needs a profile") into
+        # a dead end on 2026-11-18: profile="" was refused here, and nothing
+        # else could be passed. Like proxy="", it still counts as asking for a
+        # new identity. Only a NAMED profile, which could be shared, is refused.
+        if profile:
             raise ValueError("Persistent profile arguments are refused in owner mode; "
-                             "leave profile out for an ephemeral browser.")
+                             "leave profile out for an ephemeral browser (accept_lan_certs "
+                             "pins into that browser's own profile).")
         self.lost.discard(role)
         self._removal_reasons.pop(role, None)
         result = await super().open(role, seed=seed, proxy=proxy, profile=profile,
