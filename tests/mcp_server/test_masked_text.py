@@ -7,8 +7,6 @@ import html
 import inspect
 import json
 import logging
-import shutil
-import subprocess
 from pathlib import Path
 from urllib.parse import quote, quote_plus
 
@@ -16,7 +14,9 @@ import pytest
 
 from invisible_playwright_mcp.mcp import actions, clean, server
 from test_owners import call, handle, owners as owners, success, text
-from test_a_credential_is_typed_only_on_its_origin import login_page as login_page
+from test_a_credential_is_typed_only_on_its_origin import (
+    guarded_readback_in_node as guarded_readback_in_node, login_page as login_page,
+)
 
 VALUE = 'Q7secret<&"\'\\\u00e9 X9answer-' * 4
 ORIGIN = "https://login.example.com"
@@ -232,9 +232,8 @@ async def test_short_value_in_snapshot_is_exactly_eight_bullets(
     assert snapshot["interactive_elements"][0]["text"] == clean.MASKED_PASSWORD
 
 
-@pytest.mark.skipif(not shutil.which("node"), reason="needs node to execute the guarded readback")
 @pytest.mark.parametrize("value,shown", [("0729", "07 / 29"), ("123456789012", "1234/5678/9012")])
-async def test_slash_readback_reports_reformatting(owners, monkeypatch, value, shown):
+async def test_slash_readback_reports_reformatting(owners, monkeypatch, guarded_readback_in_node, value, shown):
     class ExpiryPage(Page):
         async def fill(self, selector, value, **kwargs):
             self.value = shown
@@ -242,15 +241,7 @@ async def test_slash_readback_reports_reformatting(owners, monkeypatch, value, s
         async def eval_on_selector(self, selector, expression, arg=None, **kwargs):
             if arg is None:
                 return [self.value]
-            script = (
-                "const read = " + expression + ";\n"
-                "const el = {value: " + json.dumps(self.value)
-                + ", ownerDocument: {location: {origin: " + json.dumps(ORIGIN) + "}}};\n"
-                "process.stdout.write(JSON.stringify(read(el, " + json.dumps(arg) + ")));"
-            )
-            result = subprocess.run([shutil.which("node"), "-e", script], capture_output=True,
-                                    text=True, timeout=30, check=True)
-            return json.loads(result.stdout)
+            return guarded_readback_in_node(expression, self.value, arg, ORIGIN)
 
     monkeypatch.setattr(actions, "GUARD_SETTLE_S", 0)
     monkeypatch.setattr(actions, "GUARD_SINCE_START_S", 0)

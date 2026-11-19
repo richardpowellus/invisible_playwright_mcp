@@ -193,9 +193,12 @@ to delegated credential-fill handles.
 `browser_type` accepts `expect_origin` and, with it, `expect_input_type`.
 The engine checks both at every write. A first-focus model render can empty a
 credential field; only an observed empty field permits a repeat, up to three
-guarded writes. An unreadable or changed nonempty value fails without retry.
-Success requires a stable equality readback and is exactly `typed into <selector>`,
-never background progress or another typing's news. Plain typing retains
+guarded writes. An exact readback returns `typed into <selector>`. If the page
+only changes separators or masks each character, the reply says so. A masked
+value of at least 12 non-separator characters can show its last four matching
+ASCII digits; the reply describes the display without quoting them. Guarded
+typing returns a terminal answer, never background progress. Other changed
+nonempty values and unreadable fields fail without retry. Plain typing retains
 upstream's no-retry behavior. Credential values never appear in diagnostics.
 This requires the companion fork engine's guard API; the ordinary upstream
 engine cannot perform guarded writes.

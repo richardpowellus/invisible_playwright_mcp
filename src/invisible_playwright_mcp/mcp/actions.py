@@ -1326,8 +1326,12 @@ MASK_SETTLE_S = 5.0
 #: masks that too. The first read-back landed inside that second and called
 #: the write unknown (bug 20261116-172854-9fbd). That state - every glyph but
 #: the last, which is the last character typed - is "settling": the read-back
-#: keeps polling, for at most MASK_SETTLE_S after the write began, and only a
-#: fully masked field is kept.
+#: keeps polling, for at most MASK_SETTLE_S after the write began.
+#:
+#: Fiserv CommerceHub (Home Depot, 2026-11-19, onepassword bug
+#: 20261119-204326-1ae8) permanently shows the last four digits instead.
+#: On a value of at least 12 characters, four matching digits after one
+#: glyph per hidden character are a final masked display, not "settling".
 _GUARDED_STATE_JS = r"""(el, expected) => {
     if (el.ownerDocument.location.origin !== expected.origin ||
         !('value' in el)) return null;
@@ -1338,6 +1342,11 @@ _GUARDED_STATE_JS = r"""(el, expected) => {
     const shown = Array.from(bare(el.value)), want = Array.from(bare(expected.text));
     if (!kept && want.length > 0 && shown.length === want.length && !want.some(glyph)) {
         if (shown.every(glyph)) return {kept: true, empty: false, exact: false, masked: true};
+        const tail = want.slice(-4).join('');
+        if (want.length >= 12 && /^[0-9]{4}$/.test(tail) && shown.slice(-4).join('') === tail &&
+            shown.slice(0, -4).every(glyph)) {
+            return {kept: true, empty: false, exact: false, masked: true, tail: 4};
+        }
         // One Inc's PortalOne shows the last character typed for a second
         // before masking it too: still settling, not yet an outcome.
         if (shown.slice(0, -1).every(glyph) && shown[shown.length - 1] === want[want.length - 1]) {
@@ -1351,7 +1360,10 @@ _GUARDED_STATE_JS = r"""(el, expected) => {
 def _guarded_state_valid(state, text: str) -> bool:
     """Kept (and empty exactly when nothing was to be typed), or positively
     empty; anything else - null, a wrong shape - is an unknown outcome."""
-    if not isinstance(state, dict) or set(state) - {"kept", "empty", "exact", "masked", "settling"}:
+    if not isinstance(state, dict) or set(state) - {"kept", "empty", "exact", "masked", "settling", "tail"}:
+        return False
+    if "tail" in state and (state.get("masked") is not True or state.get("empty") is not False
+                            or type(state["tail"]) is not int or state["tail"] != 4):
         return False
     if "settling" in state:
         return state == {"kept": False, "empty": False, "exact": False, "settling": True}
@@ -1433,6 +1445,9 @@ async def _type_on_origin(page, selector, text, expect_origin, expect_input_type
                     "nothing is held there now; do not retry automatically")
             if time.monotonic() >= until:
                 if state.get("masked") is True:
+                    if state.get("tail") == 4:
+                        return (f"typed into {selector}; the page masked it, showing one bullet "
+                                "for each character typed except the last 4, which it shows")
                     return (f"typed into {selector}; the page masked it, showing one "
                             "bullet for each character typed and none of the characters")
                 if state.get("exact") is False:
