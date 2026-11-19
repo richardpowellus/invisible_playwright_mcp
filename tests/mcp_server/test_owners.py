@@ -150,6 +150,28 @@ async def test_owner_certificate_pins_keep_the_private_profile_and_isolation(own
     assert "profile_dir" in work._open["main"].kwargs
 
 
+async def test_owner_certificate_pins_accept_the_empty_profile_the_tool_documents(
+        owners, certificate_fetch):
+    # 2026-11-18: the accept_lan_certs line said "needs a profile", a caller
+    # passed profile="" (the description's "none"), and owner mode refused it,
+    # leaving no way to open a LAN host with a self-signed certificate.
+    opened = await call("A", "browser_open",
+                        {"accept_lan_certs": ["https://192.168.0.20:8123"], "profile": ""})
+    assert "certificate pinned at this open: 192.168.0.20:8123" in success(opened)
+    work = owners.entries["A"].work
+    assert work._open["main"].kwargs["profile_dir"] == str(work.profiles["main"])
+    refused = await call("A", "browser_open",
+                         {"accept_lan_certs": ["192.168.0.20:8123"], "profile": "/tmp/shared"})
+    assert refused.isError and "Persistent profile" in text(refused)
+    assert "accept_lan_certs" in text(refused)
+
+
+async def test_open_description_does_not_send_owner_callers_to_a_profile():
+    from invisible_playwright_mcp.mcp import server
+    line = [l for l in server.browser_open.__doc__.splitlines() if "accept_lan_certs" in l][0]
+    assert "unless owner-isolated" in line
+
+
 async def test_owner_pin_refusal_does_not_drop_browser_or_allocate_profile(owners, certificate_fetch):
     opened = await call("A", "browser_open")
     work = owners.entries["A"].work
@@ -804,7 +826,7 @@ async def test_handle_revalidated_after_waiting_on_owner_lock(owners):
     assert result.isError and old not in text(result)
 
 
-@pytest.mark.parametrize("profile", ["", "named-profile", "/tmp/persistent"])
+@pytest.mark.parametrize("profile", ["named-profile", "/tmp/persistent"])
 async def test_persistent_profile_arguments_refused_without_replacing(owners, profile):
     old = handle(await call("A", "browser_open"))
     a = owners.entries["A"].work._open["main"]

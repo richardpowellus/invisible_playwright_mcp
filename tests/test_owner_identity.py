@@ -67,7 +67,7 @@ async def test_owner_reopens_same_drawn_seed_without_persisting_it(
 
 
 async def test_memory_is_per_owner_role_and_explicit_proxy_still_draws(registry, monkeypatch):
-    draws = iter([101, 202, 303, 404, 505])
+    draws = iter([101, 202, 303, 808, 404, 505])
     monkeypatch.setattr(identity.random, "randrange", lambda *a: next(draws))
     a = registry.caller("A").work
     await a.open("main")
@@ -83,7 +83,11 @@ async def test_memory_is_per_owner_role_and_explicit_proxy_still_draws(registry,
     await a.open("main")
     assert a._open["main"].seed == 777
     with pytest.raises(ValueError, match="Persistent profile"):
-        await a.open("main", profile="")
+        await a.open("main", profile="/some/shared/profile")
+    # "" is the tool's own word for no profile: accepted, and like proxy=""
+    # it asks for a new identity.
+    await a.open("main", profile="")
+    assert a._open["main"].seed == 808
     b = registry.caller("B").work
     await b.open("main")
     assert b._open["main"].seed == 404

@@ -584,7 +584,7 @@ async def browser_open(browser: Browser = None, seed: int | None = None,
              shares the exit `main` has. A profile does NOT pin its exit, and
              a login arriving from a new country is as visible as one arriving
              on new hardware.
-    accept_lan_certs  LAN HTTPS URLs or host[:port] list to pin; needs a profile.
+    accept_lan_certs  LAN HTTPS URLs or host[:port] to pin; needs a profile unless owner-isolated.
     """
     # ⛔ THE DESCRIPTION ABOVE IS WHAT THE MODEL READS, AND IT IS CUT AT 1024
     # CHARACTERS BY THE API. The version before this one was 1996: the model
