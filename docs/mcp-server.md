@@ -548,12 +548,22 @@ owner-scoped tool, not a delegated fill-handle capability.
 
 The fork adds optional `expect_origin` and `expect_input_type` to `browser_type`.
 The companion engine checks these at the instant of writing; an input type
-requires an origin. It writes without keystrokes and reports kept only after a
-read-only equality check remains true. A field emptied by a first-focus model
-render is rewritten at most twice, with both guards checked again on each
-write. A changed nonempty or unreadable value fails without a retry. Success
-is `typed into <selector>`, with dialog news prepended when present; guarded
-calls wait for their terminal answer and leave ordinary background-typing news for status or the next plain
+requires an origin. It writes without keystrokes and checks what the field
+kept. A field emptied by a first-focus model render is rewritten at most twice,
+with both guards checked again on each write. An exact match returns `typed
+into <selector>`. A separator-only change or one mask glyph per character is
+reported as reformatted or masked. For values of at least 12 non-separator
+characters, a glyph per hidden character and four matching final ASCII digits
+give this reply:
+
+```text
+typed into <selector>; the page masked it, showing one bullet for each character typed except the last 4, which it shows
+```
+
+A masked display is not proof of which characters the page stored.
+Other changed nonempty values and unreadable fields fail without a retry.
+Dialog news is prepended when present; guarded calls wait for their terminal
+answer and leave ordinary background-typing news for status or the next plain
 action. Plain typing never automatically retries. Credential diagnostics
 contain no field value; a refusal after a previous write never claims that
 the whole call wrote nothing.
@@ -575,8 +585,7 @@ errors and structured content, crosses one result scrubber.
 It merges overlapping or adjacent eight-character matches in the raw,
 HTML-escaped (with and without quotes), JSON-escaped (ASCII and Unicode), and
 URL-quoted (`quote` and `quote_plus`) forms into one eight-bullet mask.
-Truncated values are therefore masked too. A successful guarded reply remains
-exactly `typed into <selector>`.
+Truncated values containing a matching window are therefore masked too.
 
 `browser_take_screenshot`, `browser_watch`, and the screenshot returned by
 `browser_click_at` refuse with this exact tool error while a raw eight-character
@@ -587,8 +596,11 @@ screenshot refused: a masked value is on the page; nothing was captured
 ```
 
 The presence reader uses the engine's utility world, reads input/textarea values
-and body text through open shadow roots and same-origin frames, and compares
-in Python. An incomplete or failed check refuses. Clearing the field and removing
+and body text in each frame, including through open shadow roots, and compares
+in Python. A card displayed as bullets plus four digits has no matching
+eight-character fragment: that display alone is not scrubbed and does not
+refuse capture. A matching fragment elsewhere still refuses capture, as does an
+incomplete or failed check. Clearing the field and removing
 mirrored text allows capture again. Existing live watches stop before a masked
 write; subsequent allowed watches capture fresh frames and stop rather than
 retaining a continuous stream. Fill handles may call `browser_take_screenshot`

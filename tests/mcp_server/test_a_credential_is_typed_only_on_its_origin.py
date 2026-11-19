@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import shutil
+import subprocess
 
 import pytest
 
@@ -318,6 +320,57 @@ def test_a_field_that_masks_its_own_display_is_kept_and_says_so(monkeypatch):
     assert len(s._page.calls) == 1
 
 
+@pytest.fixture
+def guarded_readback_in_node():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("needs node to execute the guarded readback")
+
+    def read(expression, shown, expected, origin):
+        el = {"value": shown, "ownerDocument": {"location": {"origin": origin}}}
+        script = (f"const read = {expression};\n"
+                  f"console.log(JSON.stringify(read({json.dumps(el)}, {json.dumps(expected)})));")
+        return json.loads(subprocess.run([node, "-e", script], capture_output=True,
+                                         text=True, timeout=30, check=True).stdout)
+
+    return read
+
+
+@pytest.mark.parametrize("value,shown,accepted", [
+    ("4111111111111111", "•••• •••• •••• 1111", True),
+    ("1234-5678-9012", "•••• •••• 9012", True),
+    ("123456789012", "•••• •••• 9013", False),
+    ("123456789012", "•••• ••• 9012", False),
+    ("1234-567-8901", "•••• •••8 901", False),
+    ("123456789012", "•••• •••• •012", False),
+    ("123456789012", "•••• •••8 9012", False),
+    ("12345678901X", "•••• •••• 901X", False),
+    ("12345678901\uff12", "•••• •••• 901\uff12", False),
+    ("*23456789012", "•••• •••• 9012", False),
+], ids=["fiserv", "twelve", "wrong-tail", "missing-glyph", "eleven", "three-visible", "five-visible",
+        "letter", "non-ascii-digit", "typed-glyph"])
+async def test_last_four_requires_card_length_and_matching_digits(
+        monkeypatch, guarded_readback_in_node, value, shown, accepted):
+    s = _Session()
+    origin = "https://login.example.com"
+
+    async def read(selector, expression, arg):
+        return guarded_readback_in_node(expression, shown, arg, origin)
+
+    monkeypatch.setattr(s._page, "eval_on_selector", read)
+    monkeypatch.setattr(actions, "GUARD_SETTLE_S", 0)
+    monkeypatch.setattr(actions, "GUARD_SINCE_START_S", 0)
+    monkeypatch.setattr(actions, "MASK_SETTLE_S", 0)
+    typing = actions.type_text(s, "#n", value, origin, "tel", mask_value=True)
+    if accepted:
+        assert await typing == ("typed into #n; the page masked it, showing one bullet for each "
+                                "character typed except the last 4, which it shows")
+    else:
+        with pytest.raises(RuntimeError, match="the write outcome is unknown"):
+            await typing
+    assert len(s._page.calls) == 1
+
+
 def test_a_masking_field_still_showing_its_last_character_is_awaited(monkeypatch):
     s = _Session()
     settling = {"kept": False, "empty": False, "exact": False, "settling": True}
@@ -347,6 +400,9 @@ def test_a_field_that_never_finishes_masking_is_an_unknown_outcome(monkeypatch):
     {"kept": True, "empty": False, "exact": True, "masked": True},
     {"kept": True, "empty": False, "exact": False, "masked": False},
     {"kept": True, "empty": True, "exact": False, "masked": True},
+    {"kept": True, "empty": False, "exact": False, "tail": 4},
+    *({"kept": True, "empty": False, "exact": False, "masked": True, "tail": tail}
+      for tail in (3, 5, True, 4.0, "4", None)),
     {"kept": False, "empty": False, "settling": True},
     {"kept": True, "empty": False, "exact": False, "settling": True},
 ])
@@ -429,8 +485,16 @@ def login_page():
         }, 1000);
     });
     </script></body></html>""".encode()
+    last_four = rb"""<input id=cardNumber type=tel autocomplete=cc-number maxlength=22><script>
+    const field = document.querySelector('#cardNumber');
+    field.addEventListener('input', () => {
+        const digits = field.value;
+        const shown = '\u2022'.repeat(Math.max(0, digits.length - 4)) + digits.slice(-4);
+        field.value = shown.replace(/(.{4})(?=.)/g, '$1 ');
+    });
+    </script>"""
     pages = {"/vuetify": vuetify, "/wipes-first-input": wipes_input, "/closed-twin": closed_twin,
-             "/self-masking": self_masking}
+             "/self-masking": self_masking, "/last-four": last_four}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -621,4 +685,25 @@ async def test_a_card_field_that_masks_its_own_display_keeps_the_number(login_pa
         assert await page.eval_on_selector(
             "#n", actions._GUARDED_STATE_JS, {"origin": login_page, "text": "411111111111111"}
         ) == {"kept": False, "empty": False, "exact": False}
+        await ctx.close()
+
+
+@pytest.mark.e2e
+async def test_a_card_field_that_shows_only_the_last_four_is_kept(login_page):
+    from invisible_playwright.async_api import InvisiblePlaywright
+
+    async with InvisiblePlaywright(seed=1, headless=True) as browser:
+        ctx = await browser.new_context()
+        page = await ctx.new_page()
+        await page.goto(login_page + "/last-four")
+
+        class _S:
+            def page(self):
+                return page
+
+        answer = await actions.type_text(_S(), "#cardNumber", "4111111111111111", login_page,
+                                         "tel", mask_value=True)
+        assert answer == ("typed into #cardNumber; the page masked it, showing one bullet "
+                          "for each character typed except the last 4, which it shows")
+        assert await page.input_value("#cardNumber") == "•••• •••• •••• 1111"
         await ctx.close()
