@@ -560,6 +560,15 @@ give this reply:
 typed into <selector>; the page masked it, showing one bullet for each character typed except the last 4, which it shows
 ```
 
+A value of exactly 3 or 4 ASCII digits (a card security code) that still
+shows one glyph per hidden digit followed by its own last digit when the
+mask settle time runs out gives this reply. Fiserv shows that until the field
+loses focus:
+
+```text
+typed into <selector>; the page masked it, showing one bullet for each character typed except the last 1, which it shows
+```
+
 A masked display is not proof of which characters the page stored.
 Other changed nonempty values and unreadable fields fail without a retry.
 Dialog news is prepended when present; guarded calls wait for their terminal
