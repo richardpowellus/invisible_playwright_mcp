@@ -395,6 +395,51 @@ def test_a_field_that_never_finishes_masking_is_an_unknown_outcome(monkeypatch):
     assert len(s._page.calls) == 1
 
 
+LAST_ONE = "the page masked it, showing one bullet for each character typed except the last 1, which it shows"
+
+
+@pytest.mark.parametrize("value,accepted", [
+    ("737", True), ("1234", True), ("12", False), ("12345", False), ("73a", False),
+    ("7\uff13\uff17", False), ("4111111111111111", False), ("12-3", False),
+], ids=["cvc", "amex-cid", "two", "five", "letter", "non-ascii", "card-number", "separator"])
+def test_a_security_code_that_keeps_showing_its_last_digit(monkeypatch, value, accepted):
+    # Fiserv shows "••7" for as long as the field has focus (onepassword bug
+    # 20261119-222456-686e). Only a 3- or 4-digit code may end that way.
+    s = _Session()
+    monkeypatch.setattr(actions, "MASK_SETTLE_S", 0.3)
+    _masked_reads(monkeypatch, s, {"kept": False, "empty": False, "exact": False, "settling": True})
+    typing = actions.type_text(s, "#c", value, "https://login.example.com", "tel")
+    if accepted:
+        assert asyncio.run(typing) == "typed into #c; " + LAST_ONE
+    else:
+        with pytest.raises(RuntimeError, match="outcome is unknown"):
+            asyncio.run(typing)
+    assert len(s._page.calls) == 1
+
+
+def test_a_security_code_that_finishes_masking_is_fully_masked(monkeypatch):
+    s = _Session()
+    settling = {"kept": False, "empty": False, "exact": False, "settling": True}
+    masked = {"kept": True, "empty": False, "exact": False, "masked": True}
+    reads = iter([settling, settling, masked])
+
+    async def read(*args, **kwargs):
+        return next(reads, masked)
+
+    monkeypatch.setattr(s._page, "eval_on_selector", read)
+    answer = asyncio.run(actions.type_text(s, "#c", "737", "https://login.example.com", "tel"))
+    assert answer.endswith("none of the characters")
+
+
+@pytest.mark.parametrize("value,shown,settling", [
+    ("737", "••7", True), ("737", "••8", False), ("737", "•7", False), ("737", "•77", False),
+], ids=["last-digit", "wrong-digit", "short", "two-visible"])
+def test_only_the_typed_last_digit_is_settling(guarded_readback_in_node, value, shown, settling):
+    origin = "https://login.example.com"
+    state = guarded_readback_in_node(actions._GUARDED_STATE_JS, shown, {"origin": origin, "text": value}, origin)
+    assert bool(state.get("settling")) is settling
+
+
 @pytest.mark.parametrize("state", [
     {"kept": False, "empty": False, "masked": True},
     {"kept": True, "empty": False, "exact": True, "masked": True},

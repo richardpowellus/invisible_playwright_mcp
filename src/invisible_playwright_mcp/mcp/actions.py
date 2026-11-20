@@ -1332,6 +1332,13 @@ MASK_SETTLE_S = 5.0
 #: 20261119-204326-1ae8) permanently shows the last four digits instead.
 #: On a value of at least 12 characters, four matching digits after one
 #: glyph per hidden character are a final masked display, not "settling".
+#: Fiserv's security code field (Home Depot, 2026-11-19, onepassword bug
+#: 20261119-222456-686e) shows the last digit typed for as long as the field
+#: has focus, and masks it only on blur. On a value of exactly 3 or 4 ASCII
+#: digits, a display still settling when MASK_SETTLE_S runs out is that final
+#: display: one glyph per hidden digit, then the last digit typed.
+_SHORT_CODE = re.compile(r"[0-9]{3,4}")
+
 _GUARDED_STATE_JS = r"""(el, expected) => {
     if (el.ownerDocument.location.origin !== expected.origin ||
         !('value' in el)) return null;
@@ -1430,6 +1437,9 @@ async def _type_on_origin(page, selector, text, expect_origin, expect_input_type
                     "the write outcome is unknown. Read the page before typing again")
             if state.get("settling"):
                 if time.monotonic() - began >= MASK_SETTLE_S:
+                    if _SHORT_CODE.fullmatch(text):
+                        return (f"typed into {selector}; the page masked it, showing one bullet "
+                                "for each character typed except the last 1, which it shows")
                     raise RuntimeError(
                         "the origin-locked field did not keep the value or could not be read back; "
                         "the write outcome is unknown. Read the page before typing again")
