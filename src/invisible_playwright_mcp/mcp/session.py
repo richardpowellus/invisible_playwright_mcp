@@ -106,7 +106,8 @@ class StealthSession:
         kwargs = dict(self._kwargs)
         kwargs["extra_prefs"] = {**(kwargs.get("extra_prefs") or {}),
                                  **download_prefs(self.downloads),
-                                 **print_prefs(self.prints)}
+                                 **print_prefs(self.prints),
+                                 **webauthn_prefs()}
         try:
             if self.cert_pins:
                 await asyncio.to_thread(
@@ -604,6 +605,30 @@ def download_prefs(directory: str) -> dict:
         "browser.download.useDownloadDir": True,
         "browser.download.always_ask_before_handling_new_types": False,
         "browser.download.alwaysOpenPanel": False,
+    }
+
+
+def webauthn_prefs() -> dict:
+    """Make a WebAuthn request fail at once with NotAllowedError.
+
+    ⛔ WITHOUT THESE, A PASSKEY OR SECURITY-KEY REQUEST NEVER ANSWERS. Firefox
+    hands navigator.credentials.get()/create() to its USB token manager and
+    shows a "use your security key" doorhanger, which is browser chrome: no
+    screenshot, snapshot, click or key press here can see or dismiss it, and
+    no key will ever be plugged in, so the promise stays pending and the site
+    never offers its password or code fallback (Meta Business Suite's
+    "confirm it's you" passkey modal spun forever, 2026-11-25).
+
+    With no authenticator transport enabled, Firefox's authrs bridge refuses
+    the request and WebAuthnTransactionParent rejects it with
+    NotAllowedError, which is exactly what a person cancelling the prompt
+    produces. PublicKeyCredential and navigator.credentials stay as stock
+    Firefox has them, so the API surface a page fingerprints is unchanged.
+    The soft token stays off: it is Mozilla's test authenticator and would
+    answer with a credential instead of refusing."""
+    return {
+        "security.webauth.webauthn_enable_usbtoken": False,
+        "security.webauth.webauthn_enable_softtoken": False,
     }
 
 
