@@ -116,9 +116,17 @@ async def test_network_read_and_clear_are_owner_and_browser_isolated(owners):
         assert missing.isError and NOT_OPEN % "main" in text(missing)
         assert (await call(None, tool, arguments, meta={})).isError
     capability = handle(await call("A", "browser_status"))
-    for tool, arguments in (("browser_network", {}), ("browser_network_clear", {})):
-        refused = await call("B", tool, arguments, meta={**identity("B"), HANDLE_KEY: capability})
-        assert refused.isError
+    # A fill handle reads its own browser's capture (a credential capture of an
+    # XHR response body), never another browser's, and can never clear it.
+    delegated = success(await call("B", "browser_network", {}, meta={**identity("B"), HANDLE_KEY: capability}))
+    assert "A-main.invalid" in delegated
+    assert "A-support.invalid" not in delegated and "B-main.invalid" not in delegated
+    other = await call("B", "browser_network", {"browser": "support"},
+                       meta={**identity("B"), HANDLE_KEY: capability})
+    assert other.isError
+    refused = await call("B", "browser_network_clear", {}, meta={**identity("B"), HANDLE_KEY: capability})
+    assert refused.isError
+    assert "A-main.invalid" in success(await call("A", "browser_network"))
 
 
 async def test_owner_status_keeps_the_no_page_marker_and_final_fill_handle(owners):
@@ -677,7 +685,9 @@ async def test_allowed_handle_tools_reach_only_main(owners, monkeypatch, name, a
     if name == "browser_status":
         assert [line for line in text(result).splitlines() if line.startswith("fill handle:")] == [
             "fill handle: " + old]
-    else:
+    elif name != "browser_network":
+        # browser_network reads the session's own capture, not an action; its
+        # browser isolation is pinned in the network isolation test above.
         assert touched == [a]
     result = await call("B", name, dict(args, browser="support"),
                         meta={**identity("B"), HANDLE_KEY: old})
@@ -800,7 +810,7 @@ async def test_support_handle_reaches_only_support(owners, monkeypatch, name, ar
         if name == "browser_status":
             assert text(result).splitlines()[-1] == "fill handle: " + support
             assert main not in text(result)
-    if name != "browser_status":
+    if name not in ("browser_status", "browser_network"):
         assert touched == [b, b]
     # A support handle can never be pointed at main.
     result = await call("B", name, dict(plain, browser="main"), meta=meta)

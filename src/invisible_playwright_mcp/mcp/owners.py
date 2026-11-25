@@ -42,6 +42,10 @@ HANDLE_TOOLS = frozenset({
     # Delegated cookie export reads only STEALTHFOX_COOKIE_EXPORT_DELEGATED_DOMAINS
     # (cookies.allowed_origins), and is refused while that list is unset.
     "browser_cookies_export",
+    # A credential capture reads a secret a page fetched by XHR but never puts
+    # in the DOM (Helcim's API token) from the recorded response body. Reading
+    # only; browser_network_clear stays refused with a handle.
+    "browser_network",
 })
 _HANDLE = re.compile(r"bh_[A-Za-z0-9_-]{43}")
 IDENTITY_ERROR = "Owner mode requires a valid mcpd/identity sessionId."
