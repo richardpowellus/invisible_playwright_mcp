@@ -1161,6 +1161,53 @@ async def drag_path(session, strokes: list) -> bytes:
     return await screenshot_png(session)
 
 
+#: The text an editor holds, in the shape it was typed: one line per block and
+#: per `<br>`, joined by "\n".
+#:
+#: ⛔ NOT `innerText`, WHICH NEVER MATCHED A MULTI-LINE TYPE IN AN EDITOR.
+#: Typing "a\nb" into Lexical makes `<p>a</p><p>b</p>`, and `innerText` reads
+#: "a\n\nb" (a paragraph's margins); Draft.js's empty block reads as an extra
+#: "\n". So every multi-line text typed into an editor was "not kept", and the
+#: answer said "the page shows it as ..." for success and failure alike: on
+#: 2026-11-26 a Meta post that lost every newline, an apostrophe and four other
+#: characters was answered the same way as one that was typed perfectly. A
+#: block's trailing `<br>` (an empty block's placeholder, or the padding after
+#: its last line) adds no line, a non-breaking space an editor uses to keep a
+#: trailing space visible is a space, and zero-width spacers are dropped.
+EDITABLE_TEXT_JS = r"""
+    const BLOCK = /^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|DD|DIV|DL|DT|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HR|LI|MAIN|NAV|OL|P|PRE|SECTION|TABLE|TBODY|TD|TFOOT|TH|THEAD|TR|UL)$/;
+    function editableText(host) {
+        const out = []; let line = null;
+        const open = () => { if (line === null) line = ''; };
+        const close = () => { if (line !== null) { out.push(line); line = null; } };
+        const content = (n) => n.nodeType === 1 ||
+            (n.nodeType === 3 && n.data.replace(/[​﻿]/g, '') !== '');
+        // A <br> with nothing after it up to the end of its block.
+        const trailing = (br) => {
+            for (let n = br; ; n = n.parentNode) {
+                for (let s = n.nextSibling; s; s = s.nextSibling) if (content(s)) return false;
+                const up = n.parentNode;
+                if (!up || up === host || BLOCK.test(up.tagName)) return true;
+            }
+        };
+        const walk = (node) => {
+            for (const c of node.childNodes) {
+                if (c.nodeType === 3) { open(); line += c.data; continue; }
+                if (c.nodeType !== 1) continue;
+                if (c.tagName === 'BR') {
+                    if (trailing(c) && line !== null && line !== '') continue;
+                    open(); close(); continue;
+                }
+                if (BLOCK.test(c.tagName)) { close(); walk(c); close(); continue; }
+                walk(c);
+            }
+        };
+        walk(host); close();
+        return out.join('\n').replace(/ /g, ' ').replace(/[​﻿]/g, '');
+    }
+"""
+
+
 #: What the page is asked about a field, before typing and after: what it holds,
 #: whether it still has the focus, and whether it is a secret. One read, so the
 #: three answers describe the same moment. `value` is None for anything that is
@@ -1168,11 +1215,13 @@ async def drag_path(session, strokes: list) -> bytes:
 #:
 #: The focus is asked of the element's own root, because a document answers
 #: with the shadow HOST for anything inside a shadow root.
-FIELD_STATE_JS = """(el) => {""" + clean.SECRET_FIELD_JS + """
+FIELD_STATE_JS = """(el) => {""" + clean.SECRET_FIELD_JS + EDITABLE_TEXT_JS + """
     const root = el.getRootNode ? el.getRootNode() : document;
     const text = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA';
-    return {value: text ? el.value : (el.isContentEditable ? el.innerText : null),
-            focused: root.activeElement === el,
+    const active = root.activeElement;
+    return {value: text ? el.value : (el.isContentEditable ? editableText(el) : null),
+            focused: active === el || (el.isContentEditable && !!active &&
+                                       (el.contains(active) || (active.isContentEditable && active.contains(el)))),
             secret: secretField(el)};
 }"""
 
@@ -1242,7 +1291,41 @@ def what_the_field_kept(selector: str, text: str, before: dict, after: dict) -> 
                 "field while it was being typed, as a page that rewrites a field "
                 "from its own state does when it answers the focus or another "
                 "field's change. %s" % (selector, len(value), len(text), caution))
-    return "typed into %s; the page shows it as %s" % (selector, _shown(value, secret))
+    return ("%s does not hold the text as typed: %s. It holds %s. Read the page "
+            "before typing again." % (selector, _differences(text, value, secret),
+                                      _shown(value, secret)))
+
+
+def _differences(typed: str, held: str, secret: bool) -> str:
+    """Where the field differs from what was typed, as the caller can act on it.
+
+    ⛔ SAID, NOT LEFT TO BE NOTICED. This sentence used to be "typed into X;
+    the page shows it as '...'" - which reads as success - and a caller had to
+    compare 356 characters by eye to find that every newline, an apostrophe
+    and a "W" were gone (Meta Business Suite, 2026-11-26). A secret is
+    described by counts only."""
+    import difflib
+
+    ops = [op for op in difflib.SequenceMatcher(None, typed, held, autojunk=False).get_opcodes()
+           if op[0] != "equal"]
+    missing = sum(i2 - i1 for tag, i1, i2, _j1, _j2 in ops if tag in ("delete", "replace"))
+    added = sum(j2 - j1 for tag, _i1, _i2, j1, j2 in ops if tag in ("insert", "replace"))
+    counts = "%d of the %d characters typed %s missing or changed, and %d %s not from the text" % (
+        missing, len(typed), "is" if missing == 1 else "are",
+        added, "character is" if added == 1 else "characters are")
+    if secret:
+        return counts
+    said = []
+    for tag, i1, i2, j1, j2 in ops[:8]:
+        where = "after %r" % typed[max(0, i1 - 12):i1] if i1 else "at the start"
+        if tag == "delete":
+            said.append("%r missing %s" % (typed[i1:i2], where))
+        elif tag == "insert":
+            said.append("%r added %s" % (held[j1:j2], where))
+        else:
+            said.append("%r became %r %s" % (typed[i1:i2], held[j1:j2], where))
+    more = "; and %d more differences" % (len(ops) - 8) if len(ops) > 8 else ""
+    return "%s (%s%s)" % (counts, "; ".join(said), more)
 
 
 async def type_text(session, selector: str, text: str,
@@ -1294,8 +1377,28 @@ async def type_text(session, selector: str, text: str,
         return await _type_on_origin(page, selector, text, expect_origin, expect_input_type, strict)
     before = await _on_selector(session, selector, "typing",
                                 lambda: _field_state(page, selector), on=page)
-    await _on_selector(session, selector, "typing",
-                       lambda: page.fill(selector, text, timeout=ACTION_TIMEOUT_MS), on=page)
+    try:
+        await _on_selector(session, selector, "typing",
+                           lambda: page.fill(selector, text, timeout=ACTION_TIMEOUT_MS), on=page)
+    except Exception as exc:
+        # The engine stops typing when the field loses the focus and does not
+        # get it back, rather than send the rest to whatever has it (Meta
+        # Business Suite's shortcuts navigated away on 2026-11-26). Say how
+        # much of the text the field holds, so the caller can finish or redo.
+        if "typing stopped after" not in str(exc):
+            raise
+        try:
+            state = await _field_state(page, selector)
+            held = state.get("value")
+            secret = bool(before.get("secret") or state.get("secret"))
+            holds = (" %s holds %s." % (selector, _shown(held, secret))
+                     if held is not None else "")
+        except Exception:
+            holds = " What the field holds could not be read."
+        raise RuntimeError("%s.%s Nothing was typed after that point; read the page "
+                           "before typing again." % (
+                               str(exc).split("fill: ", 1)[-1].strip().rstrip("."),
+                               holds)) from exc
     return what_the_field_kept(selector, text, before, await _field_state(page, selector))
 
 
