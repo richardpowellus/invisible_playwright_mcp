@@ -45,7 +45,10 @@ def test_a_field_that_kept_the_text_is_typed_into():
 
 
 def test_a_field_the_page_reformatted_says_how_it_shows_it():
-    assert _kept("12ab34", "1234") == "typed into #f; the page shows it as '1234'"
+    said = _kept("12ab34", "1234")
+    assert said.startswith("#f does not hold the text as typed:"), said
+    assert "'ab' missing after '12'" in said and "It holds '1234'" in said
+    assert "typed into" not in said
 
 
 def test_a_long_value_the_page_reformatted_is_quoted_whole():
@@ -54,7 +57,7 @@ def test_a_long_value_the_page_reformatted_is_quoted_whole():
     had not changed. Known-bad: cap the quote again."""
     typed = "a" * 150 + "1234"
     shown = "a" * 150 + "12-34"
-    assert _kept(typed, shown) == "typed into #f; the page shows it as %r" % shown
+    assert ("It holds %r." % shown) in _kept(typed, shown)
 
 
 def test_a_maxlength_is_said_as_a_cut_not_as_a_success():
@@ -96,6 +99,26 @@ def test_a_target_with_no_readable_text_says_it_cannot_be_read_back():
     assert "cannot be read back" in said or "can be read back" in said
 
 
+def test_a_post_that_lost_characters_says_each_one_and_never_typed_into():
+    """2026-11-26, Meta Business Suite: every newline, an apostrophe and a "W"
+    were gone, and the answer read "typed into ...; the page shows it as" - a
+    success sentence. Known-bad: that sentence."""
+    typed = "at Brett's Rowlett!\n\nWhile stocks last."
+    held = "at Bretts Rowlett!hile stocks last."
+    said = _kept(typed, held)
+    assert said.startswith("#f does not hold the text as typed:"), said
+    assert "typed into" not in said
+    assert "\"'\" missing after 'at Brett'" in said
+    assert "'\\n\\nW' missing after \"t's Rowlett!\"" in said
+    assert "4 of the 39 characters typed are missing or changed" in said
+
+
+def test_a_secret_mismatch_says_counts_only():
+    said = _kept("hunter2", "hXnter2", secret=True)
+    assert "hunter" not in said and "hXnter" not in said
+    assert "1 of the 7 characters typed is missing or changed" in said
+
+
 # --- the pause --------------------------------------------------------------
 
 def test_the_server_adds_no_pause_of_its_own_in_front_of_fill(monkeypatch):
@@ -132,6 +155,48 @@ def test_the_server_adds_no_pause_of_its_own_in_front_of_fill(monkeypatch):
     monkeypatch.setattr(actions.asyncio, "sleep", slept)
     asyncio.run(actions.type_text(_Session(), "#f", "30"))
     assert calls == ["read", "fill", "read"], calls
+
+
+def test_typing_the_engine_stopped_says_how_far_it_got_and_what_the_field_holds():
+    """The engine stops a `fill` when the field loses the focus and does not get
+    it back (Meta Business Suite, 2026-11-26: the keys went to the page's
+    shortcuts). The answer is an error naming the stop and what the field holds,
+    never a "typed into"."""
+    reads = iter([{"value": "", "focused": True, "secret": False},
+                  {"value": "Black Fr", "focused": False, "secret": False}])
+
+    class _First:
+        async def evaluate(self, js, timeout=None):
+            return next(reads)
+
+    class _Page:
+        def locator(self, selector):
+            return type("L", (), {"first": _First()})()
+
+        async def fill(self, selector, text, timeout=None):
+            raise RuntimeError(
+                "fill: typing stopped after 8 of 20 characters: the field lost the focus "
+                "to the page itself and did not get it back within 2 s, so the rest was "
+                "not typed anywhere")
+
+    class _Session:
+        def page(self):
+            return _Page()
+
+    async def no_diagnosis(*a, **kw):
+        return None
+
+    import pytest as _pytest
+    actions_diag = actions._diagnose
+    actions._diagnose = no_diagnosis
+    try:
+        with _pytest.raises(RuntimeError) as err:
+            asyncio.run(actions.type_text(_Session(), "#f", "Black Friday at the store"))
+    finally:
+        actions._diagnose = actions_diag
+    said = str(err.value)
+    assert said.startswith("typing stopped after 8 of 20 characters"), said
+    assert "#f holds 'Black Fr'." in said and "read the page" in said
 
 
 # --- against a real engine -------------------------------------------------
@@ -246,7 +311,8 @@ def test_an_ordinary_field_is_typed_into_after_a_pause_a_person_takes(url):
 def test_a_digits_only_field_is_said_as_the_page_shows_it(url):
     said, got = _type(url, "#digits", "12ab34")
     assert got["value"] == "1234"
-    assert said == "typed into #digits; the page shows it as '1234'"
+    assert said.startswith("#digits does not hold the text as typed:"), said
+    assert "It holds '1234'" in said
 
 
 @pytest.mark.e2e
